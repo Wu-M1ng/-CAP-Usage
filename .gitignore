@@ -1,0 +1,18 @@
+# 构建产物
+*.so
+*.dylib
+*.dll
+*.h
+/go/cpa-usage-plugin
+
+# 临时文件
+*.backup.*
+.DS_Store
+temp/
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
