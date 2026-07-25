@@ -126,10 +126,6 @@ type RequestStatistics struct {
 	modelsDevETag          string
 	modelsDevStop          chan struct{}
 	modelsDevDone          chan struct{}
-	modelPricesPayloadJSON []byte
-	modelPricesPayloadETag string
-	modelPricesScopedCache map[string]modelPricesPayloadCacheEntry
-	modelPricesScopedOrder []string
 
 	lastImportResult *ImportResponse
 	evictedTotal     int64
@@ -437,11 +433,6 @@ type dashboardEventCacheKey struct {
 	clientAPI  string
 }
 
-type modelPricesPayloadCacheEntry struct {
-	JSON []byte
-	ETag string
-}
-
 // apiKeySalt produces stable grouping IDs for raw client API keys. Users can
 // override it with api_key_hash_salt when they need instance-specific hashes.
 const defaultAPIKeyHashSalt = "cpa-usage-plugin-client-api-v2"
@@ -462,7 +453,6 @@ const (
 	dashboardEventCacheMax         = 16
 	dashboardSummaryRangeCacheMax  = 16
 	dashboardSummaryRangeCacheStep = time.Minute
-	modelPricesScopedCacheMax      = 16
 	storageWriteSampleMax          = 256
 )
 
@@ -679,7 +669,6 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	s.configureModelsDevPriceWorkerLocked()
 	s.configureStorageLocked()
 	s.loadModelPricesLocked()
-	s.invalidateModelPricesPayloadLocked()
 	s.rebuildCostSeriesLocked()
 	s.pruneLocked(time.Now(), true)
 	s.rebuildSeenLocked(time.Now())
@@ -3026,7 +3015,6 @@ func (s *RequestStatistics) refreshModelsDevPricesOnceWithStop(stop <-chan struc
 		s.modelsDevLastAttempt = attemptAt
 		s.modelsDevLastSuccess = attemptAt
 		s.modelsDevLastError = ""
-		s.invalidateModelPricesPayloadLocked()
 		s.mu.Unlock()
 		return
 	}
@@ -3055,7 +3043,6 @@ func (s *RequestStatistics) refreshModelsDevPricesOnceWithStop(stop <-chan struc
 	s.modelsDevLastSuccess = attemptAt
 	s.modelsDevLastError = ""
 	s.modelsDevETag = resp.Header.Get("ETag")
-	s.invalidateModelPricesPayloadLocked()
 	s.rebuildCostSeriesLocked()
 	s.invalidateSummaryLocked()
 	s.mu.Unlock()
@@ -3071,7 +3058,6 @@ func (s *RequestStatistics) recordModelsDevPriceFetchError(attemptAt time.Time, 
 	if err != nil {
 		s.modelsDevLastError = err.Error()
 	}
-	s.invalidateModelPricesPayloadLocked()
 }
 
 func parseModelsDevPrices(raw []byte) (map[string]ModelPrice, time.Time, error) {
@@ -3346,131 +3332,6 @@ func (s *RequestStatistics) ModelPrices() ModelPricesResponse {
 	return s.modelPricesResponseLocked()
 }
 
-// ModelPricesPayload returns a serialized price response and its ETag. Full
-// responses are cached until price data or response metadata changes. A
-// non-nil keys slice returns a small dashboard-scoped response instead.
-func (s *RequestStatistics) ModelPricesPayload(keys []string) ([]byte, string, error) {
-	if s == nil {
-		raw, err := json.Marshal(ModelPricesResponse{Prices: map[string]ModelPrice{}})
-		if err != nil {
-			return nil, "", err
-		}
-		return raw, dashboardWeakETag("model-prices", string(raw)), nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.loadModelPricesLocked()
-	if keys == nil && len(s.modelPricesPayloadJSON) > 0 && s.modelPricesPayloadETag != "" {
-		return s.modelPricesPayloadJSON, s.modelPricesPayloadETag, nil
-	}
-	scopedCacheKey := ""
-	if keys != nil {
-		scopedCacheKey = modelPricesPayloadCacheKey(keys)
-		if cached, ok := s.modelPricesScopedCache[scopedCacheKey]; ok && len(cached.JSON) > 0 && cached.ETag != "" {
-			return cached.JSON, cached.ETag, nil
-		}
-	}
-	response := s.modelPricesResponseMetadataLocked()
-	if keys == nil {
-		response.Prices = effectiveModelPrices(s.modelsDevPrices, s.modelPrices)
-	} else {
-		response.Prices = filteredEffectiveModelPrices(s.modelsDevPrices, s.modelPrices, keys)
-		response.ManualPrices = filteredModelPrices(s.modelPrices, keys)
-	}
-	raw, err := json.Marshal(response)
-	if err != nil {
-		return nil, "", err
-	}
-	etag := dashboardWeakETag("model-prices", string(raw))
-	if keys == nil {
-		s.modelPricesPayloadJSON = raw
-		s.modelPricesPayloadETag = etag
-	} else {
-		s.cacheScopedModelPricesPayloadLocked(scopedCacheKey, raw, etag)
-	}
-	return raw, etag, nil
-}
-
-func modelPricesPayloadCacheKey(keys []string) string {
-	normalized := make([]string, 0, len(keys))
-	seen := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		key = normalizeModelPriceKey(key)
-		if key == "" {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		normalized = append(normalized, key)
-	}
-	sort.Strings(normalized)
-	return strings.Join(normalized, "\x00")
-}
-
-func (s *RequestStatistics) cacheScopedModelPricesPayloadLocked(key string, raw []byte, etag string) {
-	if s.modelPricesScopedCache == nil {
-		s.modelPricesScopedCache = make(map[string]modelPricesPayloadCacheEntry)
-	}
-	if _, exists := s.modelPricesScopedCache[key]; !exists {
-		s.modelPricesScopedOrder = append(s.modelPricesScopedOrder, key)
-	}
-	s.modelPricesScopedCache[key] = modelPricesPayloadCacheEntry{JSON: raw, ETag: etag}
-	for len(s.modelPricesScopedOrder) > modelPricesScopedCacheMax {
-		oldest := s.modelPricesScopedOrder[0]
-		s.modelPricesScopedOrder = s.modelPricesScopedOrder[1:]
-		delete(s.modelPricesScopedCache, oldest)
-	}
-}
-
-func filteredModelPrices(prices map[string]ModelPrice, keys []string) map[string]ModelPrice {
-	wanted := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		if normalized := normalizeModelPriceKey(key); normalized != "" {
-			wanted[normalized] = struct{}{}
-		}
-	}
-	result := make(map[string]ModelPrice, len(wanted))
-	for model, price := range prices {
-		if _, ok := wanted[normalizeModelPriceKey(model)]; ok {
-			setModelPriceCaseInsensitive(result, model, price)
-		}
-	}
-	return result
-}
-
-func filteredEffectiveModelPrices(modelsDevPrices, manualPrices map[string]ModelPrice, keys []string) map[string]ModelPrice {
-	wanted := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		if normalized := normalizeModelPriceKey(key); normalized != "" {
-			wanted[normalized] = struct{}{}
-		}
-	}
-	result := make(map[string]ModelPrice, len(wanted))
-	for model, price := range modelsDevPrices {
-		if _, ok := wanted[normalizeModelPriceKey(model)]; ok {
-			setModelPriceCaseInsensitive(result, model, price)
-		}
-	}
-	for model, price := range manualPrices {
-		if _, ok := wanted[normalizeModelPriceKey(model)]; ok {
-			setModelPriceCaseInsensitive(result, model, price)
-		}
-	}
-	return result
-}
-
-func (s *RequestStatistics) invalidateModelPricesPayloadLocked() {
-	if s == nil {
-		return
-	}
-	s.modelPricesPayloadJSON = nil
-	s.modelPricesPayloadETag = ""
-	s.modelPricesScopedCache = nil
-	s.modelPricesScopedOrder = nil
-}
-
 func (s *RequestStatistics) modelsDevPriceStatusLocked() ModelsDevPriceStatus {
 	status := ModelsDevPriceStatus{
 		Enabled:        s.modelsDevPricesEnabled,
@@ -3510,7 +3371,6 @@ func (s *RequestStatistics) UpsertModelPrice(model string, price ModelPrice) (Mo
 		s.modelPrices = make(map[string]ModelPrice)
 	}
 	setModelPriceCaseInsensitive(s.modelPrices, model, price)
-	s.invalidateModelPricesPayloadLocked()
 	if err := s.saveModelPricesLocked(); err != nil {
 		return ModelPricesResponse{}, err
 	}
@@ -3534,7 +3394,6 @@ func (s *RequestStatistics) DeleteModelPrice(model string) (ModelPricesResponse,
 		s.modelPrices = make(map[string]ModelPrice)
 	}
 	deleteModelPriceCaseInsensitive(s.modelPrices, model)
-	s.invalidateModelPricesPayloadLocked()
 	if err := s.saveModelPricesLocked(); err != nil {
 		return ModelPricesResponse{}, err
 	}
@@ -3544,13 +3403,8 @@ func (s *RequestStatistics) DeleteModelPrice(model string) (ModelPricesResponse,
 }
 
 func (s *RequestStatistics) modelPricesResponseLocked() ModelPricesResponse {
-	response := s.modelPricesResponseMetadataLocked()
-	response.Prices = effectiveModelPrices(s.modelsDevPrices, s.modelPrices)
-	return response
-}
-
-func (s *RequestStatistics) modelPricesResponseMetadataLocked() ModelPricesResponse {
 	response := ModelPricesResponse{
+		Prices:       effectiveModelPrices(s.modelsDevPrices, s.modelPrices),
 		ManualPrices: copyModelPrices(s.modelPrices),
 		Storage: ModelPriceStorageStatus{
 			Path:       s.priceStoragePath,
@@ -4818,30 +4672,21 @@ func (s *RequestStatistics) SummaryWithoutDetailsAt(now time.Time) DashboardSumm
 	healthWindow := summaryHealthWindow(now)
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.summaryCacheValid && s.summaryCacheVersion == s.summaryVersion && s.summaryCacheWindow.Equal(healthWindow) {
 		s.summaryCacheHits++
 		s.lastSummaryDuration = time.Since(startedAt)
-		cached := s.summaryCache
-		s.mu.Unlock()
-		return cloneDashboardSummary(cached)
+		return cloneDashboardSummary(s.summaryCache)
 	}
+
 	s.summaryCacheMisses++
-	s.mu.Unlock()
-
-	s.mu.RLock()
-	buildVersion := s.summaryVersion
 	summary := s.buildSummaryWithoutDetailsLocked(now, healthWindow)
-	s.mu.RUnlock()
-
-	s.mu.Lock()
-	if s.summaryVersion == buildVersion {
-		s.summaryCache = cloneDashboardSummary(summary)
-		s.summaryCacheValid = true
-		s.summaryCacheVersion = buildVersion
-		s.summaryCacheWindow = healthWindow
-	}
+	s.summaryCache = cloneDashboardSummary(summary)
+	s.summaryCacheValid = true
+	s.summaryCacheVersion = s.summaryVersion
+	s.summaryCacheWindow = healthWindow
 	s.lastSummaryDuration = time.Since(startedAt)
-	s.mu.Unlock()
 	return summary
 }
 
@@ -4875,36 +4720,28 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.summaryRangeCache == nil {
+		s.summaryRangeCache = make(map[string]DashboardSummary)
+		s.summaryRangeCacheWindow = make(map[string]time.Time)
+	}
 	cacheKey := summaryRangeClientAPICacheKey(rangeKey, clientAPI, now)
 	cached, ok := s.summaryRangeCache[cacheKey]
 	if ok && s.summaryRangeCacheWindow != nil {
 		if window, hasWindow := s.summaryRangeCacheWindow[cacheKey]; hasWindow && window.Equal(healthWindow) {
 			s.summaryCacheHits++
 			s.lastSummaryDuration = time.Since(startedAt)
-			s.mu.Unlock()
 			return cloneDashboardSummary(cached)
 		}
 	}
+
 	s.summaryCacheMisses++
-	s.mu.Unlock()
-
-	s.mu.RLock()
-	buildVersion := s.summaryVersion
 	summary := s.buildSummaryWithoutDetailsForRangeLocked(now, healthWindow, cutoff, clientAPI)
-	s.mu.RUnlock()
-
-	s.mu.Lock()
-	if s.summaryVersion == buildVersion {
-		if s.summaryRangeCache == nil {
-			s.summaryRangeCache = make(map[string]DashboardSummary)
-			s.summaryRangeCacheWindow = make(map[string]time.Time)
-		}
-		s.summaryRangeCache[cacheKey] = cloneDashboardSummary(summary)
-		s.summaryRangeCacheWindow[cacheKey] = healthWindow
-		s.pruneSummaryRangeCacheLocked(cacheKey)
-	}
+	s.summaryRangeCache[cacheKey] = cloneDashboardSummary(summary)
+	s.summaryRangeCacheWindow[cacheKey] = healthWindow
+	s.pruneSummaryRangeCacheLocked(cacheKey)
 	s.lastSummaryDuration = time.Since(startedAt)
-	s.mu.Unlock()
 	return summary
 }
 
@@ -5229,7 +5066,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 }
 
 // buildSummaryWithoutDetailsForRangeLocked scans all events within the cutoff window
-// and builds a fresh DashboardSummary. Caller must hold s.mu for reading or writing.
+// and builds a fresh DashboardSummary. Caller must hold s.mu.
 func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Time, healthWindow time.Time, cutoff time.Time, clientAPI string) DashboardSummary {
 	summary := DashboardSummary{}
 

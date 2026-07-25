@@ -4481,6 +4481,31 @@ func TestModelPricesUseModelsDevDefaultsWithManualOverride(t *testing.T) {
 	}
 }
 
+func TestManualModelPricesUseProviderScopeBeforeBareFallback(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{PriceStoragePath: filepath.Join(t.TempDir(), "prices.json")})
+	t.Cleanup(func() { stats.Close() })
+
+	if _, err := stats.UpsertModelPrice("same-model", ModelPrice{Prompt: 3, Completion: 6, Cache: 0.3}); err != nil {
+		t.Fatalf("UpsertModelPrice(bare) error = %v", err)
+	}
+	if _, err := stats.UpsertModelPrice("openrouter/same-model", ModelPrice{Prompt: 7, Completion: 14, Cache: 0.7}); err != nil {
+		t.Fatalf("UpsertModelPrice(scoped) error = %v", err)
+	}
+
+	stats.mu.RLock()
+	openAI, openAIOK := stats.priceForDetailLocked("same-model", "openai")
+	openRouter, openRouterOK := stats.priceForDetailLocked("same-model", "OpenRouter")
+	stats.mu.RUnlock()
+
+	if !openAIOK || openAI.Prompt != 3 || openAI.Completion != 6 || openAI.Cache != 0.3 {
+		t.Fatalf("bare fallback price = %#v ok=%v", openAI, openAIOK)
+	}
+	if !openRouterOK || openRouter.Prompt != 7 || openRouter.Completion != 14 || openRouter.Cache != 0.7 {
+		t.Fatalf("provider-scoped price = %#v ok=%v", openRouter, openRouterOK)
+	}
+}
+
 func TestModelsDevPriceWorkerReconfiguresURL(t *testing.T) {
 	stats := NewRequestStatistics()
 	t.Cleanup(func() { stats.Close() })
@@ -4588,11 +4613,8 @@ func priceForModelCaseInsensitive(prices map[string]ModelPrice, model string) Mo
 func TestDashboardManagementEndpointsReturnNotModifiedForMatchingETag(t *testing.T) {
 	previousStats := stats
 	stats = NewRequestStatistics()
-	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, PriceStoragePath: filepath.Join(t.TempDir(), "prices.json")})
-	t.Cleanup(func() {
-		stats.Close()
-		stats = previousStats
-	})
+	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0})
+	t.Cleanup(func() { stats = previousStats })
 
 	stats.Record(UsageRecord{
 		Provider: "openai",
@@ -4602,9 +4624,7 @@ func TestDashboardManagementEndpointsReturnNotModifiedForMatchingETag(t *testing
 	})
 
 	tests := []ManagementRequest{
-		{Method: "GET", Path: "/v0/management/plugins/usage-dashboard-zduu/dashboard"},
 		{Method: "GET", Path: "/v0/management/plugins/usage-dashboard-zduu/dashboard-summary"},
-		{Method: "GET", Path: "/v0/management/plugins/usage-dashboard-zduu/model-prices"},
 		{
 			Method: "GET",
 			Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events",
@@ -4631,9 +4651,6 @@ func TestDashboardManagementEndpointsReturnNotModifiedForMatchingETag(t *testing
 		if len(etag) != 1 || etag[0] == "" {
 			t.Fatalf("%s missing ETag header: %#v", req.Path, first.Headers)
 		}
-		if got := first.Headers["Cache-Control"]; len(got) != 1 || got[0] != "private, no-cache" {
-			t.Fatalf("%s Cache-Control = %#v, want private, no-cache", req.Path, got)
-		}
 
 		req.Headers = map[string][]string{"if-none-match": {`W/"stale"`}}
 		stale := decodeManagementResponse(t, invokeManagement(t, req), nil)
@@ -4655,179 +4672,11 @@ func TestDashboardManagementEndpointsReturnNotModifiedForMatchingETag(t *testing
 	}
 
 	runtime := stats.RuntimeStatus()
-	for _, endpoint := range []string{"dashboard", "dashboard-summary", "model-prices", "dashboard-events", "dashboard-events-export", "dashboard-api-detail"} {
+	for _, endpoint := range []string{"dashboard-summary", "dashboard-events", "dashboard-events-export", "dashboard-api-detail"} {
 		conditional := runtime.ConditionalRequests[endpoint]
 		if conditional.Requests != 2 || conditional.NotModified != 1 || conditional.Misses != 1 || conditional.HitRate != 0.5 {
 			t.Fatalf("%s conditional metrics = %#v, want requests=2 not_modified=1 misses=1 hit_rate=0.5", endpoint, conditional)
 		}
-	}
-}
-
-func TestModelPriceETagChangesAfterManualUpdate(t *testing.T) {
-	previousStats := stats
-	stats = NewRequestStatistics()
-	stats.Configure(runtimeConfig{PriceStoragePath: filepath.Join(t.TempDir(), "prices.json")})
-	t.Cleanup(func() {
-		stats.Close()
-		stats = previousStats
-	})
-
-	path := "/v0/management/plugins/usage-dashboard-zduu/model-prices"
-	first := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{Method: "GET", Path: path}), nil)
-	firstETag := first.Headers["ETag"]
-	if len(firstETag) != 1 || firstETag[0] == "" {
-		t.Fatalf("initial ETag = %#v, want one value", firstETag)
-	}
-
-	invokeManagement(t, ManagementRequest{
-		Method: "PUT",
-		Path:   path,
-		Body:   []byte(`{"model":"gpt-5","price":{"prompt":1.25,"completion":10,"cache":0.5,"cache_write":2}}`),
-	})
-
-	var updated ModelPricesResponse
-	second := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method:  "GET",
-		Path:    path,
-		Headers: map[string][]string{"If-None-Match": {firstETag[0]}},
-	}), &updated)
-	if second.StatusCode != http.StatusOK {
-		t.Fatalf("updated conditional status = %d, want 200", second.StatusCode)
-	}
-	secondETag := second.Headers["ETag"]
-	if len(secondETag) != 1 || secondETag[0] == firstETag[0] {
-		t.Fatalf("updated ETag = %#v, want value different from %q", secondETag, firstETag[0])
-	}
-	if got := updated.Prices["gpt-5"]; got.Prompt != 1.25 || got.Completion != 10 || got.CacheWrite != 2 {
-		t.Fatalf("updated price = %#v", got)
-	}
-}
-
-func TestDashboardModelPricesOnlyReturnsModelsUsedBySummary(t *testing.T) {
-	previousStats := stats
-	stats = NewRequestStatistics()
-	stats.Configure(runtimeConfig{PriceStoragePath: filepath.Join(t.TempDir(), "prices.json"), DedupWindowMinutes: 0})
-	t.Cleanup(func() {
-		stats.Close()
-		stats = previousStats
-	})
-
-	stats.mu.Lock()
-	stats.modelsDevPrices = map[string]ModelPrice{
-		"gpt-4.1":        {Prompt: 2, Completion: 8},
-		"openai/gpt-4.1": {Prompt: 3, Completion: 9},
-		"claude-sonnet":  {Prompt: 4, Completion: 12},
-	}
-	stats.invalidateModelPricesPayloadLocked()
-	stats.mu.Unlock()
-	if _, err := stats.UpsertModelPrice("manual-unused", ModelPrice{Prompt: 1, Completion: 2}); err != nil {
-		t.Fatalf("UpsertModelPrice() error = %v", err)
-	}
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-4.1",
-		RequestedAt: time.Now(),
-		Detail:      UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
-	})
-
-	path := "/v0/management/plugins/usage-dashboard-zduu/model-prices"
-	var scoped ModelPricesResponse
-	scopedResponse := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method: "GET",
-		Path:   path,
-		Query:  map[string][]string{"scope": {"dashboard"}, "range": {"24h"}},
-	}), &scoped)
-	if _, ok := scoped.Prices["gpt-4.1"]; !ok {
-		t.Fatalf("dashboard prices missing bare model: %#v", scoped.Prices)
-	}
-	if _, ok := scoped.Prices["openai/gpt-4.1"]; !ok {
-		t.Fatalf("dashboard prices missing provider model: %#v", scoped.Prices)
-	}
-	if _, ok := scoped.Prices["claude-sonnet"]; ok {
-		t.Fatalf("dashboard prices include unrelated model: %#v", scoped.Prices)
-	}
-	if _, ok := scoped.Prices["manual-unused"]; ok {
-		t.Fatalf("effective dashboard prices include unrelated manual model: %#v", scoped.Prices)
-	}
-	if _, ok := scoped.ManualPrices["manual-unused"]; ok {
-		t.Fatalf("dashboard manual prices include unrelated override: %#v", scoped.ManualPrices)
-	}
-	scopedETag := scopedResponse.Headers["ETag"]
-	if len(scopedETag) != 1 || scopedETag[0] == "" {
-		t.Fatalf("dashboard scoped ETag = %#v, want one value", scopedETag)
-	}
-	notModified := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method:  "GET",
-		Path:    path,
-		Query:   map[string][]string{"scope": {"dashboard"}, "range": {"24h"}},
-		Headers: map[string][]string{"If-None-Match": {scopedETag[0]}},
-	}), nil)
-	if notModified.StatusCode != http.StatusNotModified || len(notModified.Body) != 0 {
-		t.Fatalf("dashboard scoped conditional response = status %d body %q, want 304 without body", notModified.StatusCode, notModified.Body)
-	}
-
-	var full ModelPricesResponse
-	fullResponse := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{Method: "GET", Path: path}), &full)
-	if _, ok := full.Prices["claude-sonnet"]; !ok {
-		t.Fatalf("full prices missing unrelated model: %#v", full.Prices)
-	}
-	if _, ok := full.ManualPrices["manual-unused"]; !ok {
-		t.Fatalf("full manual prices missing editable override: %#v", full.ManualPrices)
-	}
-	if len(scopedResponse.Body) >= len(fullResponse.Body) {
-		t.Fatalf("scoped response bytes = %d, full = %d; want scoped smaller", len(scopedResponse.Body), len(fullResponse.Body))
-	}
-}
-
-func TestModelPricesPayloadCachesFullSerializationUntilMutation(t *testing.T) {
-	stats := NewRequestStatistics()
-	stats.Configure(runtimeConfig{PriceStoragePath: filepath.Join(t.TempDir(), "prices.json")})
-	t.Cleanup(stats.Close)
-
-	stats.mu.Lock()
-	stats.modelsDevPrices = map[string]ModelPrice{"gpt-4.1": {Prompt: 2, Completion: 8}}
-	stats.invalidateModelPricesPayloadLocked()
-	stats.mu.Unlock()
-
-	first, firstETag, err := stats.ModelPricesPayload(nil)
-	if err != nil {
-		t.Fatalf("ModelPricesPayload() error = %v", err)
-	}
-	second, secondETag, err := stats.ModelPricesPayload(nil)
-	if err != nil {
-		t.Fatalf("second ModelPricesPayload() error = %v", err)
-	}
-	if firstETag != secondETag || len(first) == 0 || len(second) == 0 || &first[0] != &second[0] {
-		t.Fatalf("full payload was not reused: etags %q/%q pointers %p/%p", firstETag, secondETag, &first[0], &second[0])
-	}
-	scopedFirst, scopedFirstETag, err := stats.ModelPricesPayload([]string{"gpt-4.1"})
-	if err != nil {
-		t.Fatalf("scoped ModelPricesPayload() error = %v", err)
-	}
-	scopedSecond, scopedSecondETag, err := stats.ModelPricesPayload([]string{"GPT-4.1", "gpt-4.1"})
-	if err != nil {
-		t.Fatalf("second scoped ModelPricesPayload() error = %v", err)
-	}
-	if scopedFirstETag != scopedSecondETag || len(scopedFirst) == 0 || len(scopedSecond) == 0 || &scopedFirst[0] != &scopedSecond[0] {
-		t.Fatalf("scoped payload was not reused: etags %q/%q pointers %p/%p", scopedFirstETag, scopedSecondETag, &scopedFirst[0], &scopedSecond[0])
-	}
-
-	if _, err := stats.UpsertModelPrice("gpt-5", ModelPrice{Prompt: 1.25, Completion: 10}); err != nil {
-		t.Fatalf("UpsertModelPrice() error = %v", err)
-	}
-	third, thirdETag, err := stats.ModelPricesPayload(nil)
-	if err != nil {
-		t.Fatalf("updated ModelPricesPayload() error = %v", err)
-	}
-	if thirdETag == firstETag || &third[0] == &first[0] {
-		t.Fatalf("mutation did not invalidate payload cache: etags %q/%q pointers %p/%p", firstETag, thirdETag, &first[0], &third[0])
-	}
-	scopedThird, scopedThirdETag, err := stats.ModelPricesPayload([]string{"gpt-4.1"})
-	if err != nil {
-		t.Fatalf("updated scoped ModelPricesPayload() error = %v", err)
-	}
-	if scopedThirdETag == scopedFirstETag || &scopedThird[0] == &scopedFirst[0] {
-		t.Fatalf("mutation did not invalidate scoped payload cache: etags %q/%q pointers %p/%p", scopedFirstETag, scopedThirdETag, &scopedFirst[0], &scopedThird[0])
 	}
 }
 
@@ -6128,29 +5977,6 @@ func BenchmarkSummaryWithoutDetailsRebuild100k(b *testing.B) {
 		stats.invalidateSummaryLocked()
 		stats.mu.Unlock()
 		_ = stats.SummaryWithoutDetails()
-	}
-}
-
-func BenchmarkSummaryWithoutDetailsForRange100k(b *testing.B) {
-	stats := buildBenchmarkStats(100000)
-	now := time.Now()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		stats.mu.Lock()
-		stats.summaryRangeCache = nil
-		stats.summaryRangeCacheWindow = nil
-		stats.mu.Unlock()
-		_ = stats.SummaryWithoutDetailsForRangeAndClientAPIAt("24h", "", now)
-	}
-}
-
-func BenchmarkSummaryWithoutDetailsForRangeCached100k(b *testing.B) {
-	stats := buildBenchmarkStats(100000)
-	now := time.Now()
-	_ = stats.SummaryWithoutDetailsForRangeAndClientAPIAt("24h", "", now)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = stats.SummaryWithoutDetailsForRangeAndClientAPIAt("24h", "", now)
 	}
 }
 

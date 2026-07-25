@@ -7,16 +7,9 @@ let eventsData = null;          // EventsResult from /dashboard-events
 let eventsDataUrl = '';
 let modelPrices = {};
 let manualModelPrices = {};
-let modelPricesReady = false;
-let modelPricesRequest = null;
-let modelPricesRequestMode = '';
-let modelPricesRequestCacheKey = '';
-let modelPricesRequestSeq = 0;
-let modelPricesRevision = 0;
-let modelPricesCoverage = '';
-let modelPricesFullReady = false;
-let priceSettingsOpen = false;
-let renderCostCache = new WeakMap();
+let selectedPriceReferenceModel = '';
+let priceReferenceVisibleOptions = [];
+let priceReferenceActiveIndex = -1;
 let selectedApi = '';
 let clientApiSort = 'requests';
 let clientApiSelectMode = false;
@@ -29,6 +22,7 @@ let pollTimer = null, pollFailures = 0;
 let currentRange = '';
 const eventsLimit = 500;
 const apiDetailRecentLimit = 120;
+const priceReferenceResultLimit = 100;
 const visiblePollDelayMs = 30000;
 const hiddenPollDelayMs = 300000;
 let apiDetailSeq = 0;
@@ -338,127 +332,11 @@ function pluginFetchOptions(options) {
   return managementFetchOptions(options);
 }
 
-function clearModelPriceConditionalCaches() {
-  for (const key of conditionalPayloadCache.keys()) {
-    if (String(key).startsWith('model-prices:')) conditionalPayloadCache.delete(key);
-  }
-}
-
-function dashboardPriceCoverageKey(data) {
-  const keys = [];
-  (data && data.model_stats || []).forEach((model) => {
-    const name = String(model && model.model || '').trim();
-    if (!name) return;
-    keys.push(name.toLowerCase());
-    (model.providers || []).forEach((provider) => {
-      const providerName = String(provider && provider.provider || '').trim();
-      if (providerName) keys.push((providerName + '/' + name).toLowerCase());
-    });
-  });
-  return [...new Set(keys)].sort().join('|');
-}
-
-function startModelPricesRequest(url, cacheKey, mode, coverage) {
-  if (modelPricesRequest && modelPricesRequestMode === 'full') return modelPricesRequest;
-  if (modelPricesRequest && modelPricesRequestMode === mode && modelPricesRequestCacheKey === cacheKey) return modelPricesRequest;
-  const revision = modelPricesRevision;
-  const seq = ++modelPricesRequestSeq;
-  if (mode !== 'full' && coverage !== modelPricesCoverage) modelPricesReady = false;
-  const request = fetchConditionalJsonPayload(cacheKey, url, pluginFetchOptions({ cache: 'no-cache' }))
-    .then(function(data) {
-      // A GET started before a successful PUT/DELETE, or superseded by a
-      // request for another range, must not overwrite the newer price state.
-      if (revision !== modelPricesRevision) {
-        clearModelPriceConditionalCaches();
-        return modelPrices;
-      }
-      if (seq !== modelPricesRequestSeq) return modelPrices;
-      modelPrices = (data && data.prices) || {};
-      manualModelPrices = manualPricesFromResponse(data);
-      modelPricesReady = true;
-      if (mode === 'full') {
-        modelPricesFullReady = true;
-        modelPricesCoverage = 'full';
-      } else {
-        modelPricesCoverage = coverage;
-      }
-      return modelPrices;
-    });
-  const tracked = request.finally(function() {
-    if (modelPricesRequest === tracked) {
-      modelPricesRequest = null;
-      modelPricesRequestMode = '';
-      modelPricesRequestCacheKey = '';
-    }
-  });
-  modelPricesRequest = tracked;
-  modelPricesRequestMode = mode;
-  modelPricesRequestCacheKey = cacheKey;
-  return tracked;
-}
-
-function refreshModelPricesInBackground(data, range) {
-  if (modelPricesFullReady) {
-    modelPricesReady = true;
-    return Promise.resolve(modelPrices);
-  }
-  if (modelPricesRequest && modelPricesRequestMode === 'full') return modelPricesRequest;
-  const params = new URLSearchParams();
-  params.set('scope', 'dashboard');
-  params.set('range', range || '24h');
-  const url = pluginEndpoint('model-prices') + '?' + params.toString();
-  const coverage = dashboardPriceCoverageKey(data);
-  return startModelPricesRequest(url, 'model-prices:dashboard:' + url + ':' + coverage, 'dashboard', coverage)
-    .then(function(prices) {
-      if (summaryData) renderPriceDependentSections();
-      return prices;
-    })
-    .catch(function() { return modelPrices; });
-}
-
-function loadFullModelPrices() {
-  if (modelPricesFullReady) return Promise.resolve(modelPrices);
-  const url = pluginEndpoint('model-prices');
-  return startModelPricesRequest(url, 'model-prices:full', 'full', 'full')
-    .then(function(prices) {
-      if (summaryData) renderPriceDependentSections();
-      return prices;
-    });
-}
-
-function setPriceSettingsOpen(open) {
-  priceSettingsOpen = !!open;
-  const body = $('priceSettingsBody');
-  const button = $('togglePriceSettings');
-  body.hidden = !priceSettingsOpen;
-  button.setAttribute('aria-expanded', priceSettingsOpen ? 'true' : 'false');
-  const key = priceSettingsOpen ? 'price_collapse' : 'price_expand';
-  button.dataset.i18n = key;
-  button.textContent = t(key);
-  if (priceSettingsOpen && modelPricesReady) renderPrices();
-}
-
-async function togglePriceSettings() {
-  if (priceSettingsOpen) {
-    setPriceSettingsOpen(false);
-    return;
-  }
-  setPriceSettingsOpen(true);
-  const button = $('togglePriceSettings');
-  button.disabled = true;
-  button.dataset.i18n = 'price_loading_full';
-  button.textContent = t('price_loading_full');
-  try {
-    await loadFullModelPrices();
-    renderPrices();
-  } catch (error) {
-    // Keep the already-loaded slim/manual prices usable. A later open or
-    // dashboard refresh can retry without blocking the rest of the page.
-    if (summaryData) await refreshModelPricesInBackground(summaryData, $('range').value);
-  } finally {
-    button.disabled = false;
-    setPriceSettingsOpen(true);
-  }
+async function loadModelPrices() {
+  const data = await fetchJsonPayload(pluginEndpoint('model-prices'), pluginFetchOptions({ cache: 'no-store' }));
+  modelPrices = (data && data.prices) || {};
+  manualModelPrices = manualPricesFromResponse(data);
+  return modelPrices;
 }
 
 async function saveModelPrice(model, price) {
@@ -469,12 +347,6 @@ async function saveModelPrice(model, price) {
   });
   modelPrices = (data && data.prices) || {};
   manualModelPrices = manualPricesFromResponse(data);
-  modelPricesRevision++;
-  modelPricesRequestSeq++;
-  modelPricesReady = true;
-  modelPricesFullReady = true;
-  modelPricesCoverage = 'full';
-  clearModelPriceConditionalCaches();
   return modelPrices;
 }
 
@@ -484,25 +356,7 @@ async function deleteModelPrice(model) {
   const data = await fetchManagementJsonPayload('model-prices?' + params.toString(), { method: 'DELETE' });
   modelPrices = (data && data.prices) || {};
   manualModelPrices = manualPricesFromResponse(data);
-  modelPricesRevision++;
-  modelPricesRequestSeq++;
-  modelPricesReady = true;
-  modelPricesFullReady = true;
-  modelPricesCoverage = 'full';
-  clearModelPriceConditionalCaches();
   return modelPrices;
-}
-
-function displayAggregateCost(row) {
-  if (!modelPricesReady) return Number.NaN;
-  if (row && typeof row === 'object' && renderCostCache.has(row)) return renderCostCache.get(row);
-  const cost = aggregateCost(row, modelPrices, manualModelPrices);
-  if (row && typeof row === 'object') renderCostCache.set(row, cost);
-  return cost;
-}
-
-function displayDetailCost(detail) {
-  return modelPricesReady ? detailCost(detail, modelPrices, manualModelPrices) : Number.NaN;
 }
 
 function drawSpark(id, values, color) {
@@ -531,7 +385,7 @@ function renderStats() {
   const recentReq = recentHours.length ? recentHours[0] : 0;
   setText('rpm', (recentReq / 60).toFixed(2));
   setText('rpmMeta', withLabel('recent_requests_label', formatInteger(recentReq)));
-  const cost = modelPricesReady ? (summaryData.model_stats || []).reduce((s, m) => s + displayAggregateCost(m), 0) : Number.NaN;
+  const cost = (summaryData.model_stats || []).reduce((s, m) => s + aggregateCost(m, modelPrices, manualModelPrices), 0);
   setText('totalCost', formatUsd(cost));
   setText('costMeta', withLabel('total_tokens_label', compact(u.total_tokens)));
   // Sparklines from hourly data
@@ -711,39 +565,274 @@ function modelNames() {
   return [];
 }
 
+function normalizedPriceKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function uniquePriceKeys(values) {
+  const keys = [];
+  const seen = new Set();
+  (values || []).forEach((value) => {
+    const key = String(value || '').trim();
+    const normalized = normalizedPriceKey(key);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    keys.push(key);
+  });
+  return keys;
+}
+
+function sortPriceKeys(values) {
+  return values.sort((a, b) => {
+    const aScoped = String(a).includes('/');
+    const bScoped = String(b).includes('/');
+    if (aScoped !== bScoped) return aScoped ? 1 : -1;
+    return String(a).localeCompare(String(b));
+  });
+}
+
+function providerModelPriceKey(model, provider) {
+  const modelKey = String(model || '').trim();
+  const providerKey = String(provider || '').trim();
+  if (!modelKey || !providerKey) return '';
+  const slash = modelKey.indexOf('/');
+  if (slash > 0 && normalizedPriceKey(modelKey.slice(0, slash)) === normalizedPriceKey(providerKey)) return modelKey;
+  return providerKey + '/' + modelKey;
+}
+
+function addProviderModelOptions(target, row, fallbackModel) {
+  if (!row) return;
+  const model = String(row.model || fallbackModel || '').trim();
+  if (!model) return;
+  const add = (provider) => {
+    const key = providerModelPriceKey(model, provider);
+    if (key) target.push(key);
+  };
+  add(row.provider);
+  (Array.isArray(row.providers) ? row.providers : []).forEach((provider) => add(provider && provider.provider));
+}
+
+function upstreamPriceModelOptions() {
+  const values = [];
+  const addSummary = (summary) => {
+    if (!summary || typeof summary !== 'object') return;
+    (Array.isArray(summary.model_stats) ? summary.model_stats : []).forEach((row) => addProviderModelOptions(values, row));
+    const apis = summary.usage && summary.usage.apis;
+    Object.values(apis && typeof apis === 'object' ? apis : {}).forEach((api) => {
+      const models = api && api.models;
+      Object.entries(models && typeof models === 'object' ? models : {}).forEach(([model, row]) => addProviderModelOptions(values, row, model));
+    });
+    (Array.isArray(summary.client_api_stats) ? summary.client_api_stats : []).forEach((client) => {
+      (Array.isArray(client && client.models) ? client.models : []).forEach((row) => addProviderModelOptions(values, row));
+    });
+  };
+  addSummary(summaryData);
+  if (filteredSummaryData && filteredSummaryData !== summaryData) addSummary(filteredSummaryData);
+  (eventsData && Array.isArray(eventsData.events) ? eventsData.events : []).forEach((event) => addProviderModelOptions(values, event));
+  return sortPriceKeys(uniquePriceKeys(values));
+}
+
 function priceModelOptions() {
-  return [...new Set([...modelNames(), ...Object.keys(modelPrices || {}), ...Object.keys(manualModelPrices || {})])].filter(Boolean).sort((a, b) => a.localeCompare(b));
+  // The picker lists actual provider/model pairs seen in usage plus saved
+  // provider-scoped manual keys. Bare keys remain a deliberate free-text
+  // fallback so they are not accidentally applied to every upstream.
+  const savedScoped = Object.keys(manualModelPrices || {}).filter((key) => String(key).includes('/'));
+  return sortPriceKeys(uniquePriceKeys([...upstreamPriceModelOptions(), ...savedScoped]));
+}
+
+function priceReferenceOptions() {
+  // Prefer the spelling of a manual key when an effective entry differs only
+  // by case, then append source-only prices for read-only lookup.
+  return sortPriceKeys(uniquePriceKeys([...Object.keys(manualModelPrices || {}), ...Object.keys(modelPrices || {})]));
+}
+
+function priceReferenceLookupKeys(model) {
+  const keys = priceLookupKeys(model, '');
+  const value = String(model || '').trim();
+  const slash = value.indexOf('/');
+  if (slash > 0 && slash < value.length - 1) {
+    // A catalogue key can be provider/model where model itself contains a
+    // slash (for example openrouter/openai/gpt-4.1). Re-run the normal lookup
+    // with the first segment as provider so bare fallback prices behave like
+    // the backend resolver.
+    const provider = value.slice(0, slash);
+    const modelName = value.slice(slash + 1);
+    keys.push(...priceLookupKeys(modelName, provider));
+  }
+  return uniquePriceKeys(keys);
+}
+
+function priceMatchForReference(model) {
+  const keys = priceReferenceLookupKeys(model);
+  for (const key of keys) {
+    const price = directPriceForModel(key, manualModelPrices);
+    if (price) return { price, key, source: 'manual' };
+  }
+  for (const key of keys) {
+    const price = directPriceForModel(key, modelPrices);
+    if (price) return { price, key, source: 'default' };
+  }
+  return null;
+}
+
+function filterPriceReferenceOptions(options, query) {
+  const normalized = normalizedPriceKey(query);
+  if (!normalized) return (options || []).slice();
+  return (options || []).filter((model) => normalizedPriceKey(model).includes(normalized));
+}
+
+function closePriceReferenceOptions() {
+  const input = $('priceReferenceModel');
+  const list = $('priceReferenceOptions');
+  priceReferenceActiveIndex = -1;
+  priceReferenceVisibleOptions = [];
+  if (list) list.hidden = true;
+  if (input) {
+    input.setAttribute('aria-expanded', 'false');
+    input.setAttribute('aria-activedescendant', '');
+  }
+}
+
+function renderPriceReferenceOptions(query, open) {
+  const input = $('priceReferenceModel');
+  const list = $('priceReferenceOptions');
+  if (!input || !list) return;
+  const options = priceReferenceOptions();
+  const matches = filterPriceReferenceOptions(options, query);
+  priceReferenceVisibleOptions = matches.slice(0, priceReferenceResultLimit);
+  if (priceReferenceActiveIndex >= priceReferenceVisibleOptions.length) priceReferenceActiveIndex = priceReferenceVisibleOptions.length - 1;
+  const optionHtml = priceReferenceVisibleOptions.map((model, index) => {
+    const active = index === priceReferenceActiveIndex;
+    return '<button type="button" id="priceReferenceOption' + index + '" class="searchComboOption' + (active ? ' active' : '') + '" role="option" aria-selected="' + (active ? 'true' : 'false') + '" data-price-reference-option="' + esc(model) + '">' + esc(model) + '</button>';
+  }).join('');
+  const emptyHtml = optionHtml ? '' : '<div class="searchComboEmpty">' + esc(t(options.length ? 'price_reference_no_match' : 'price_reference_none')) + '</div>';
+  const limitHtml = matches.length > priceReferenceResultLimit ? '<div class="searchComboStatus">' + esc(t('price_reference_result_limit', priceReferenceResultLimit, matches.length)) + '</div>' : '';
+  list.innerHTML = optionHtml + emptyHtml + limitHtml;
+  list.hidden = !open;
+  input.setAttribute('aria-expanded', open ? 'true' : 'false');
+  input.setAttribute('aria-activedescendant', open && priceReferenceActiveIndex >= 0 ? 'priceReferenceOption' + priceReferenceActiveIndex : '');
+}
+
+function renderPriceReferenceInfo(options) {
+  const info = $('priceReferenceInfo');
+  if (!info) return;
+  options = options || priceReferenceOptions();
+  if (!selectedPriceReferenceModel) {
+    info.innerHTML = '<div class="empty">' + esc(options.length ? t('price_reference_empty') : t('price_reference_none')) + '</div>';
+    return;
+  }
+  const match = priceMatchForReference(selectedPriceReferenceModel);
+  if (!match) {
+    info.innerHTML = '<div class="empty">' + esc(t('price_reference_missing')) + '</div>';
+    return;
+  }
+  const sourceName = match.source === 'manual' ? t('price_source_manual') : t('price_source_default');
+  const source = normalizedPriceKey(match.key) === normalizedPriceKey(selectedPriceReferenceModel) ? sourceName : sourceName + ' · ' + t('price_match_key', match.key);
+  const fields = [
+    ['input_price', 'prompt'],
+    ['output_price', 'completion'],
+    ['cache_price', 'cache'],
+    ['cache_write_price', 'cache_write'],
+  ];
+  info.innerHTML = '<div class="priceReferenceCard"><div class="priceReferenceHead"><span class="priceReferenceModel">' + esc(selectedPriceReferenceModel) + '</span><span class="priceReferenceSource">' + esc(source) + '</span></div><div class="priceReferenceGrid">' + fields.map(([label, key]) => '<div class="priceReferenceValue"><span class="priceReferenceValueLabel">' + esc(t(label)) + '</span><span class="priceReferenceValueNumber">' + num(match.price[key]).toFixed(4) + '</span></div>').join('') + '</div></div>';
+}
+
+function selectPriceReferenceModel(model) {
+  const input = $('priceReferenceModel');
+  const options = priceReferenceOptions();
+  selectedPriceReferenceModel = options.find((key) => normalizedPriceKey(key) === normalizedPriceKey(model)) || '';
+  if (input) input.value = selectedPriceReferenceModel;
+  renderPriceReferenceInfo(options);
+  closePriceReferenceOptions();
+}
+
+function renderPriceReference() {
+  const input = $('priceReferenceModel');
+  if (!input) return;
+  const options = priceReferenceOptions();
+  selectedPriceReferenceModel = options.find((key) => normalizedPriceKey(key) === normalizedPriceKey(selectedPriceReferenceModel)) || '';
+  input.value = selectedPriceReferenceModel;
+  input.disabled = !options.length;
+  renderPriceReferenceInfo(options);
+  renderPriceReferenceOptions(input.value, false);
+}
+
+function movePriceReferenceOption(delta) {
+  const input = $('priceReferenceModel');
+  const list = $('priceReferenceOptions');
+  if (!input || !list || input.disabled) return;
+  if (list.hidden) {
+    priceReferenceActiveIndex = -1;
+    renderPriceReferenceOptions(input.value, true);
+  }
+  if (!priceReferenceVisibleOptions.length) return;
+  if (delta > 0) priceReferenceActiveIndex = priceReferenceActiveIndex < priceReferenceVisibleOptions.length - 1 ? priceReferenceActiveIndex + 1 : 0;
+  else priceReferenceActiveIndex = priceReferenceActiveIndex > 0 ? priceReferenceActiveIndex - 1 : priceReferenceVisibleOptions.length - 1;
+  renderPriceReferenceOptions(input.value, true);
+}
+
+function handlePriceReferenceKeydown(event) {
+  const input = $('priceReferenceModel');
+  if (!input) return;
+  const key = event && event.key;
+  if (key === 'ArrowDown' || key === 'ArrowUp') {
+    if (event && event.preventDefault) event.preventDefault();
+    movePriceReferenceOption(key === 'ArrowDown' ? 1 : -1);
+    return;
+  }
+  if (key === 'Enter') {
+    const options = priceReferenceOptions();
+    const exact = options.find((model) => normalizedPriceKey(model) === normalizedPriceKey(input.value));
+    const selected = priceReferenceActiveIndex >= 0 ? priceReferenceVisibleOptions[priceReferenceActiveIndex] : exact || (priceReferenceVisibleOptions.length === 1 ? priceReferenceVisibleOptions[0] : '');
+    if (selected) {
+      if (event && event.preventDefault) event.preventDefault();
+      selectPriceReferenceModel(selected);
+    }
+    return;
+  }
+  if (key === 'Escape') {
+    if (event && event.preventDefault) event.preventDefault();
+    input.value = selectedPriceReferenceModel;
+    closePriceReferenceOptions();
+    return;
+  }
+  if (key === 'Tab') closePriceReferenceOptions();
+}
+
+function elementContains(root, node) {
+  while (node) {
+    if (node === root) return true;
+    node = node.parentNode;
+  }
+  return false;
 }
 
 function fillPriceForm(model) {
-  $('priceModel').value = model || '';
-  const p = priceForModel($('priceModel').value, modelPrices, '', manualModelPrices) || {};
-  $('pricePrompt').value = p.prompt ?? '';
-  $('priceCompletion').value = p.completion ?? '';
-  $('priceCache').value = p.cache ?? '';
-  $('priceCacheWrite').value = p.cache_write ?? '';
+  const value = String(model || '').trim();
+  $('priceModel').value = value;
+  const p = value ? priceForModel(value, modelPrices, '', manualModelPrices) : null;
+  $('pricePrompt').value = p ? (p.prompt ?? '') : '';
+  $('priceCompletion').value = p ? (p.completion ?? '') : '';
+  $('priceCache').value = p ? (p.cache ?? '') : '';
+  $('priceCacheWrite').value = p ? (p.cache_write ?? '') : '';
 }
 
 function syncPriceFormForModel(model) {
-  if (!model) {
-    fillPriceForm('');
-    return;
-  }
-  if (priceForModel(model, modelPrices, '', manualModelPrices)) fillPriceForm(model);
+  fillPriceForm(model);
 }
 
 function renderPrices() {
-  if (!priceSettingsOpen) return;
   const selected = $('priceModel').value;
   $('priceModelOptions').innerHTML = priceModelOptions().map((m) => '<option value="' + esc(m) + '"></option>').join('');
   $('priceModel').value = selected;
+  renderPriceReference();
   const entries = Object.entries(manualModelPrices).sort(([a], [b]) => a.localeCompare(b));
   $('priceList').innerHTML = entries.length ? entries.map(([m, p]) => '<div class="priceItem"><div><strong>' + esc(m) + '</strong><div class="priceMeta"><span>' + t('input_price') + ' ' + num(p.prompt).toFixed(4) + '</span><span>' + t('output_price') + ' ' + num(p.completion).toFixed(4) + '</span><span>' + t('cache_price') + ' ' + num(p.cache).toFixed(4) + '</span><span>' + t('cache_write_price') + ' ' + num(p.cache_write).toFixed(4) + '</span></div></div><div class="priceActions"><button class="btn" data-edit-price="' + esc(m) + '">' + t('edit') + '</button><button class="btn danger" data-del-price="' + esc(m) + '">' + t('delete') + '</button></div></div>').join('') : '<div class="empty">' + t('no_prices') + '</div>';
   document.querySelectorAll('[data-edit-price]').forEach((btn) => btn.onclick = () => fillPriceForm(btn.dataset.editPrice));
   document.querySelectorAll('[data-del-price]').forEach((btn) => btn.onclick = async () => {
     try {
       await deleteModelPrice(btn.dataset.delPrice);
-      if ($('priceModel').value === btn.dataset.delPrice) fillPriceForm('');
+      if (normalizedPriceKey($('priceModel').value) === normalizedPriceKey(btn.dataset.delPrice)) fillPriceForm('');
       await rerender({ refreshEvents: false, refreshApiDetail: true });
     } catch (e) {
       alert(t('price_delete_failed') + (e && e.message ? e.message : t('unknown_error')));
@@ -777,7 +866,7 @@ function renderClientApiStats() {
     success: r.success_count,
     failure: r.failure_count,
     tokens: r.total_tokens,
-    cost: modelPricesReady ? (r.models || []).reduce((s, m) => s + displayAggregateCost(m), 0) : Number.NaN
+    cost: (r.models || []).reduce((s, m) => s + aggregateCost(m, modelPrices, manualModelPrices), 0)
   }));
   if (clientApiSort === 'tokens') rows.sort((a, b) => b.tokens - a.tokens);
   else if (clientApiSort === 'cost') rows.sort((a, b) => b.cost - a.cost);
@@ -893,7 +982,7 @@ function normalizeApiDetailEvent(d) {
     cached_tokens: cacheTokenTotal(tokens),
     cache_write_tokens: num(tokens.cache_write_tokens),
     reasoning_tokens: num(tokens.reasoning_tokens),
-    cost: displayDetailCost(d)
+    cost: detailCost(d, modelPrices, manualModelPrices)
   });
 }
 
@@ -955,7 +1044,7 @@ function renderApiDetailContent(apiData, detailState) {
   const knownFailureCount = num(apiData && apiData.failure_count);
   const rate = requests ? success / requests * 100 : 100;
   const models = detail ? (detail.model_stats || []).map((m) => ({ name: m.model || 'unknown', requests: num(m.total_requests), success: num(m.success_count), failure: num(m.failure_count), tokens: num(m.total_tokens), total_tokens: num(m.total_tokens), input_tokens: num(m.input_tokens), output_tokens: num(m.output_tokens), cached_tokens: num(m.cached_tokens), cache_write_tokens: num(m.cache_write_tokens), reasoning_tokens: num(m.reasoning_tokens), providers: m.providers || [], avgLatency: num(m.avg_latency_ms) })) : Object.entries(apiData.models || {}).map(([name, m]) => ({ name, requests: num(m.total_requests), success: num(m.success_count), failure: num(m.failure_count), tokens: num(m.total_tokens), total_tokens: num(m.total_tokens), input_tokens: num(m.input_tokens), output_tokens: num(m.output_tokens), cached_tokens: num(m.cached_tokens), cache_write_tokens: num(m.cache_write_tokens), reasoning_tokens: num(m.reasoning_tokens), providers: m.providers || [], avgLatency: num(m.avg_latency_ms) }));
-  models.forEach((m) => { m.cost = displayAggregateCost({ model: m.name, total_tokens: m.total_tokens, input_tokens: m.input_tokens, output_tokens: m.output_tokens, cached_tokens: m.cached_tokens, cache_write_tokens: m.cache_write_tokens, reasoning_tokens: m.reasoning_tokens, providers: m.providers }) });
+  models.forEach((m) => { m.cost = aggregateCost({ model: m.name, total_tokens: m.total_tokens, input_tokens: m.input_tokens, output_tokens: m.output_tokens, cached_tokens: m.cached_tokens, cache_write_tokens: m.cache_write_tokens, reasoning_tokens: m.reasoning_tokens, providers: m.providers }, modelPrices, manualModelPrices) });
   models.sort((a, b) => b.requests - a.requests);
   const sources = detail ? (detail.source_stats || []).map((s) => ({ name: sourceLabel({ api: detail.api, source: s.source, provider: s.provider }), requests: num(s.total_requests), success: num(s.success_count), failure: num(s.failure_count), tokens: num(s.total_tokens) })) : [];
   const errorRows = (detail && detail.error_stats) || [];
@@ -1024,9 +1113,9 @@ function renderModelStats() {
   const rows = panelData.model_stats;
   $('modelStats').innerHTML = rows.length ? '<table><thead><tr><th>' + t('col_model') + '</th><th>' + t('col_requests') + '</th><th>' + t('col_tokens') + '</th><th>' + t('col_avg_latency') + '</th><th>' + t('col_success_rate') + '</th><th>' + t('col_cache_rate') + '</th><th>' + t('col_cost') + '</th><th>' + t('col_cost_per_m') + '</th></tr></thead><tbody>' + rows.map((r) => {
     const rate = r.total_requests ? r.success_count / r.total_requests * 100 : 100;
-    const cost = displayAggregateCost(r);
+    const cost = aggregateCost(r, modelPrices, manualModelPrices);
     const cRate = cacheRate(r);
-    const cpM = modelPricesReady ? costPerMillion(r, modelPrices, manualModelPrices) : Number.NaN;
+    const cpM = costPerMillion(r, modelPrices, manualModelPrices);
     return '<tr><td class="nameCell">' + esc(r.model) + '</td><td>' + formatInteger(r.total_requests) + ' <span class="ok">(' + formatInteger(r.success_count) + '</span> <span class="bad">' + formatInteger(r.failure_count) + ')</span></td><td>' + compact(r.total_tokens) + '</td><td>' + formatMs(r.avg_latency_ms) + '</td><td class="' + (rate >= 95 ? 'ok' : rate >= 80 ? 'neutral' : 'bad') + '">' + pct(rate) + '</td><td class="' + (cRate >= 50 ? 'ok' : cRate >= 20 ? 'neutral' : '') + '">' + pct(cRate) + '</td><td>' + formatUsd(cost) + '</td><td>' + (cpM ? formatUsd(cpM) + ' ' + t('cost_per_m_unit') : '-') + '</td></tr>';
   }).join('') + '</tbody></table>' : '<div class="empty">' + t('no_model_data') + '</div>';
 }
@@ -1035,7 +1124,6 @@ function renderTrendChart() {
   var panelData = dashboardPanelData();
   var usage = panelData && panelData.usage;
   if (!usage) { $('trendChart').innerHTML = '<text x="50%" y="50%" text-anchor="middle" class="trendAxisText">' + (filteredSummaryError ? t('client_api_filter_failed') : t('no_trend_data')) + '</text>'; clearAnomalyBar(); return }
-  if (trendMetric === 'cost' && !modelPricesReady) { $('trendChart').innerHTML = '<text x="50%" y="50%" text-anchor="middle" class="trendAxisText">' + t('loading') + '</text>'; clearAnomalyBar(); return }
 
   var range = $('range').value;
   var useHourly = (range === '7h' || range === '24h');
@@ -1059,7 +1147,7 @@ function renderTrendChart() {
     var totalCost = 0, totalToks = 0;
     (panelData.model_stats || []).forEach(function(r) {
       var t = num(r.total_tokens); if (t > 0) totalToks += t;
-      var c = displayAggregateCost(r); if (Number.isFinite(c)) totalCost += c;
+      var c = aggregateCost(r, modelPrices, manualModelPrices); if (Number.isFinite(c)) totalCost += c;
     });
     var blendedPrice = totalToks > 0 ? totalCost / totalToks * 1e6 : 0;
 
@@ -1090,7 +1178,7 @@ function renderTrendChart() {
   var totalCost = 0, totalToks = 0;
   (panelData.model_stats || []).forEach(function(r) {
     var t = num(r.total_tokens); if (t > 0) totalToks += t;
-    var c = displayAggregateCost(r); if (Number.isFinite(c)) totalCost += c;
+    var c = aggregateCost(r, modelPrices, manualModelPrices); if (Number.isFinite(c)) totalCost += c;
   });
   var blendedPrice = totalToks > 0 ? totalCost / totalToks * 1e6 : 0;
 
@@ -1782,29 +1870,9 @@ function shouldRefreshDetails(previousSummary, nextSummary, forceDetails) {
   return nextKey !== summaryRecordKey(previousSummary);
 }
 
-function renderPriceDependentSections() {
-  if (!summaryData || !modelPricesReady) return;
-  renderCostCache = new WeakMap();
-  renderStats();
-  renderPrices();
-  renderClientApiStats();
-  // Do not repaint linked panels with a filtered summary from an older range
-  // while the current filter context is still loading. Global price panels
-  // above remain safe to update.
-  if (selectedClientApi && filteredSummaryContext !== clientApiFilterContext()) {
-    if (typeof applyI18N === 'function') applyI18N();
-    return;
-  }
-  renderModelStats();
-  renderTrendChart();
-  renderApiDetailFromCache();
-  if (typeof applyI18N === 'function') applyI18N();
-}
-
 async function rerender(options) {
   const opts = Object.assign({ refreshEvents: true, refreshApiDetail: true }, options || {});
   const previousApi = selectedApi;
-  renderCostCache = new WeakMap();
 
   // Refresh locale-aware formatters if language changed
   if (typeof getFormatLocale === 'function') {
@@ -1820,18 +1888,16 @@ async function rerender(options) {
   renderStats();
   renderStorageStatus();
   renderHealth();
-  if (modelPricesReady) renderPrices();
+  renderPrices();
   renderClientApiStats();
   renderApiStats();
   renderModelStats();
   initTrendChart();
   renderTrendChart();
-  const details = [];
-  if (opts.refreshEvents) details.push(renderEvents());
+  if (opts.refreshEvents) await renderEvents();
   else renderEventsContent();
-  if (opts.refreshApiDetail || previousApi !== selectedApi) details.push(renderApiDetail());
+  if (opts.refreshApiDetail || previousApi !== selectedApi) await renderApiDetail();
   else renderApiDetailFromCache();
-  await Promise.all(details);
   if (typeof applyI18N === 'function') applyI18N();
 }
 
@@ -1841,16 +1907,19 @@ function nextFailureDelay() { return Math.min(300000, [5000, 15000, 45000, 90000
 
 async function load(options) {
   const forceDetails = options && options.forceDetails;
-  let pricesPromise = null;
   try {
     const previousSummary = summaryData;
     const selectedRange = $('range').value;
     // Try new summary endpoint first with current range
     const summaryUrl = pluginEndpoint('dashboard-summary') + '?range=' + encodeURIComponent(selectedRange);
-    // A slow price response must never delay range-scoped summary rendering.
-    const data = await fetchConditionalJsonPayload('dashboard-summary:' + summaryUrl, summaryUrl, pluginFetchOptions({ cache: 'no-store' }));
+    // A transient model-prices error must not send the page through the
+    // compatibility data path; stale prices are better than replacing
+    // range-scoped stats with reconstructed fallback data.
+    const [data] = await Promise.all([
+      fetchConditionalJsonPayload('dashboard-summary:' + summaryUrl, summaryUrl, pluginFetchOptions({ cache: 'no-store' })),
+      loadModelPrices().catch(function() { /* prices failure tolerated; stale prices beat wrong stats */ }),
+    ]);
     summaryData = requireObjectPayload(data, 'dashboard-summary');
-    pricesPromise = refreshModelPricesInBackground(summaryData, selectedRange);
     if (selectedClientApi) await refreshFilteredSummary();
     updatedState = { type: 'success', generatedAt: data.generated_at || Date.now(), message: '' };
     renderUpdated();
@@ -1863,13 +1932,10 @@ async function load(options) {
     try {
       const previousSummary = summaryData;
       const selectedRange = $('range').value;
-      const data = await fetchJsonPayload(pluginEndpoint('dashboard-data'), pluginFetchOptions({ cache: 'no-store' }));
-      summaryData = buildSummaryFromFullUsage(data, selectedRange);
-      // The compatibility path calculates historical cost buckets in the
-      // browser. Derive the slim price request from its provisional model
-      // summary, then rebuild once prices are available.
-      pricesPromise = refreshModelPricesInBackground(summaryData, selectedRange);
-      await pricesPromise;
+      const [data] = await Promise.all([
+        fetchJsonPayload(pluginEndpoint('dashboard-data'), pluginFetchOptions({ cache: 'no-store' })),
+        loadModelPrices().catch(function() { /* prices failure tolerated */ }),
+      ]);
       summaryData = buildSummaryFromFullUsage(data, selectedRange);
       if (selectedClientApi) {
         filteredSummaryData = null;
@@ -1900,8 +1966,6 @@ function handleVisibilityChange() {
 
 // Event bindings
 $('range').value = localStorage.getItem(rangeKey) || '24h';
-$('togglePriceSettings').onclick = togglePriceSettings;
-setPriceSettingsOpen(false);
 $('range').onchange = () => { localStorage.setItem(rangeKey, $('range').value); load({ forceDetails: true }) };
 $('refreshBtn').onclick = () => load({ forceDetails: true });
 $('savePrice').onclick = async () => {
@@ -1916,6 +1980,36 @@ $('savePrice').onclick = async () => {
   }
 };
 $('priceModel').onchange = () => syncPriceFormForModel($('priceModel').value);
+$('priceReferenceModel').onfocus = () => {
+  if ($('priceReferenceModel').disabled) return;
+  priceReferenceActiveIndex = -1;
+  renderPriceReferenceOptions($('priceReferenceModel').value, true);
+};
+$('priceReferenceModel').oninput = () => {
+  selectedPriceReferenceModel = '';
+  priceReferenceActiveIndex = -1;
+  renderPriceReferenceInfo(priceReferenceOptions());
+  renderPriceReferenceOptions($('priceReferenceModel').value, true);
+};
+$('priceReferenceModel').onchange = () => {
+  const value = $('priceReferenceModel').value;
+  const exact = priceReferenceOptions().find((model) => normalizedPriceKey(model) === normalizedPriceKey(value));
+  if (exact) selectPriceReferenceModel(exact);
+};
+$('priceReferenceModel').onkeydown = handlePriceReferenceKeydown;
+$('priceReferenceOptions').onmousedown = (event) => {
+  let target = event && event.target;
+  while (target && target !== $('priceReferenceOptions') && !(target.dataset && target.dataset.priceReferenceOption)) target = target.parentNode;
+  if (target && target.dataset && target.dataset.priceReferenceOption && event && event.preventDefault) event.preventDefault();
+};
+$('priceReferenceOptions').onclick = (event) => {
+  let target = event && event.target;
+  while (target && target !== $('priceReferenceOptions') && !(target.dataset && target.dataset.priceReferenceOption)) target = target.parentNode;
+  if (target && target.dataset && target.dataset.priceReferenceOption) selectPriceReferenceModel(target.dataset.priceReferenceOption);
+};
+if (document.addEventListener) document.addEventListener('click', (event) => {
+  if (!elementContains($('priceReferenceCombo'), event && event.target)) closePriceReferenceOptions();
+});
 document.querySelectorAll('[data-api-sort]').forEach((btn) => btn.onclick = async () => {
   clientApiSort = btn.dataset.apiSort || 'requests';
   clientApiSelectMode = false;

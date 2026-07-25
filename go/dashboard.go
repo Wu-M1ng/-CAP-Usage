@@ -31,7 +31,6 @@ var dashboardHelpersJS string
 var dashboardPageJS string
 
 var completeDashboardHTML string
-var dashboardPageETag string
 
 type HealthAlert struct {
 	Severity string `json:"severity"`
@@ -58,7 +57,6 @@ func init() {
 	h = strings.Replace(h, "</body>",
 		"<script>\n"+dashboardI18nJS+"\n"+dashboardHelpersJS+"\n"+dashboardPageJS+"\n</script></body>", 1)
 	completeDashboardHTML = h
-	dashboardPageETag = dashboardWeakETag("dashboard-page", completeDashboardHTML)
 }
 
 // handleDashboardSummary returns lightweight dashboard data without detail arrays.

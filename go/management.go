@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 )
@@ -42,7 +41,7 @@ func handleManagement(requestBody []byte) ([]byte, error) {
 	tail := pathTail(req.Path)
 	switch {
 	case req.Method == "GET" && tail == "dashboard":
-		return handleDashboardPage(req.Headers)
+		return handleDashboardPage()
 	case req.Method == "GET" && tail == "dashboard-summary":
 		return handleDashboardSummary(req.Query, req.Headers)
 	case req.Method == "GET" && tail == "dashboard-events":
@@ -62,7 +61,7 @@ func handleManagement(requestBody []byte) ([]byte, error) {
 	case req.Method == "GET" && tail == "dashboard-data":
 		return handleDashboardData()
 	case req.Method == "GET" && tail == "model-prices":
-		return handleGetModelPrices(req.Query, req.Headers)
+		return handleGetModelPrices()
 	case req.Method == "PUT" && tail == "model-prices":
 		return handlePutModelPrice(req.Body)
 	case req.Method == "DELETE" && tail == "model-prices":
@@ -255,19 +254,14 @@ func handleDashboardData() ([]byte, error) {
 	return okEnvelopeJSON(string(mustMarshal(resp)))
 }
 
-func handleDashboardPage(headers map[string][]string) ([]byte, error) {
-	pageHeaders := map[string][]string{
-		"Content-Type":  {"text/html; charset=utf-8"},
-		"Cache-Control": {"private, no-cache"},
-		"ETag":          {dashboardPageETag},
-	}
-	if dashboardConditionalMatch("dashboard", headers, dashboardPageETag) {
-		return dashboardNotModifiedWithHeaders(pageHeaders)
-	}
+func handleDashboardPage() ([]byte, error) {
 	resp := ManagementResponse{
 		StatusCode: http.StatusOK,
-		Headers:    pageHeaders,
-		Body:       []byte(completeDashboardHTML),
+		Headers: map[string][]string{
+			"Content-Type":  {"text/html; charset=utf-8"},
+			"Cache-Control": {"no-store"},
+		},
+		Body: []byte(completeDashboardHTML),
 	}
 	return okEnvelopeJSON(string(mustMarshal(resp)))
 }
@@ -296,54 +290,8 @@ func handleGetUsage() ([]byte, error) {
 	return okEnvelopeJSON(string(mustMarshal(resp)))
 }
 
-func handleGetModelPrices(query map[string][]string, headers map[string][]string) ([]byte, error) {
-	var keys []string
-	if strings.EqualFold(strings.TrimSpace(queryRawValue(query, "scope")), "dashboard") {
-		rangeKey := queryRawValue(query, "range")
-		clientAPI := queryRawValue(query, "client_api")
-		summary := stats.SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey, clientAPI, time.Now())
-		keys = dashboardSummaryModelPriceKeys(summary)
-		if keys == nil {
-			keys = []string{}
-		}
-	}
-	responseJSON, etag, err := stats.ModelPricesPayload(keys)
-	if err != nil {
-		return nil, err
-	}
-	if dashboardConditionalMatch("model-prices", headers, etag) {
-		return dashboardNotModified(etag)
-	}
-	return modelPricesManagementJSONResponse(responseJSON, etag)
-}
-
-func dashboardSummaryModelPriceKeys(summary DashboardSummary) []string {
-	seen := make(map[string]struct{})
-	keys := make([]string, 0, len(summary.ModelStats)*2)
-	add := func(key string) {
-		key = strings.TrimSpace(key)
-		normalized := normalizeModelPriceKey(key)
-		if normalized == "" {
-			return
-		}
-		if _, exists := seen[normalized]; exists {
-			return
-		}
-		seen[normalized] = struct{}{}
-		keys = append(keys, key)
-	}
-	for _, model := range summary.ModelStats {
-		for _, key := range modelPriceLookupKeys(model.Model, "") {
-			add(key)
-		}
-		for _, provider := range model.Providers {
-			for _, key := range modelPriceLookupKeys(model.Model, provider.Provider) {
-				add(key)
-			}
-		}
-	}
-	sort.Strings(keys)
-	return keys
+func handleGetModelPrices() ([]byte, error) {
+	return modelPricesManagementResponse(stats.ModelPrices())
 }
 
 func handlePutModelPrice(body []byte) ([]byte, error) {
@@ -374,26 +322,17 @@ func handleDeleteModelPrice(query map[string][]string) ([]byte, error) {
 }
 
 func modelPricesManagementResponse(data ModelPricesResponse) ([]byte, error) {
-	responseJSON, etag, err := marshalModelPricesResponse(data)
+	responseJSON, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
 	}
-	return modelPricesManagementJSONResponse(responseJSON, etag)
-}
-
-func marshalModelPricesResponse(data ModelPricesResponse) ([]byte, string, error) {
-	responseJSON, err := json.Marshal(data)
-	if err != nil {
-		return nil, "", err
-	}
-	return responseJSON, dashboardWeakETag("model-prices", string(responseJSON)), nil
-}
-
-func modelPricesManagementJSONResponse(responseJSON []byte, etag string) ([]byte, error) {
 	resp := ManagementResponse{
 		StatusCode: http.StatusOK,
-		Headers:    dashboardJSONHeaders(etag),
-		Body:       responseJSON,
+		Headers: map[string][]string{
+			"Content-Type":  {"application/json; charset=utf-8"},
+			"Cache-Control": {"no-store"},
+		},
+		Body: responseJSON,
 	}
 	return okEnvelopeJSON(string(mustMarshal(resp)))
 }
