@@ -4,6 +4,46 @@
 
 `v1.0.0` 到 `v1.2.18` 为规范化发布流程建立前的 legacy 历史版本，不在本文件中回填；对应说明见 [v1-history.md](v1-history.md)。
 
+## Unreleased
+
+## v2.5.6 - 2026-07-28
+
+### 看板性能与缓存
+- 看板页面支持 gzip、ETag 和条件请求；摘要、事件、接口详情及价格查询可复用未变化的响应，减少重复传输和重渲染
+- 健康网格改为紧凑传输格式并复用前端单元格；请求事件改为每页 50 条的分页加载，避免大数据量时阻塞首屏
+- 页面隐藏时降低轮询频率，并为摘要与事件请求增加序列保护，避免过期响应覆盖最新界面
+
+### 服务端费用与模型价格
+- 后端按模型、上游接口和客户端 API 预先计算估算费用，价格变更后看板立即重新拉取汇总数据
+- 模型价格目录支持搜索、分页、已用模型范围和条件缓存；`scope=used` 的 ETag 与同一用量快照绑定，兼容大小写范围参数
+
+### 构建与验证
+- 发布构建启用 `-trimpath -ldflags="-s -w"`，减少产物体积
+- 增加健康网格压缩、服务端费用、价格查询、条件请求和分页竞态的 Go/JavaScript 回归测试
+
+## v2.5.5 - 2026-07-28
+
+### Codex OpenAI 协议兜底去重
+- 修复 CPA 响应拦截元数据缺少 `selected_auth_id` 时，同一 Codex 请求同时落入 `openai-compatible` 与 Codex OAuth 上游组的问题；仅对无认证身份、零延迟的 `/v1/chat/completions` 或 `/v1/responses` 兜底，在相同模型、客户端 API、token 明细和 1 秒完成时间窗口内与 Codex 原生 usage 一对一合并
+- 保留原生 Codex 的认证、延迟和 TTFT，并从响应兜底补齐端点、推理强度与流式标记；即使 CPA 未提供相关元数据，也会从 OpenAI 请求协议恢复端点和显式 reasoning effort
+- 支持兜底先到、原生先到和兜底已提交后的乱序情况，并在导入、storage snapshot、JSONL 重放及热重载时修复已有重复；无原生对应项、跨时间窗口及非 Codex 上游不会被合并
+
+### DeepSeek 上游归因兼容
+- 兼容新版 CPA 将成功的 `deepseek-*` 原生 usage 记录成 `claude:apikey` 身份的情况，避免看板产生 `claude · 上游 <auth_index>` 错误分组
+- 只有同一客户端 API、同一 DeepSeek 型号族存在唯一的 `openai-compatible-<name>` 具体身份旁证时才纠正；优先限定同一端点，旧记录缺少端点时要求跨端点候选仍唯一；候选冲突、失败请求、匿名请求和真实 Claude 模型均保留原记录
+- 实时可疑记录最多等待 90 秒，同时支持导入、storage snapshot 和跨 JSONL 分片冷启动恢复时迁移已有异常明细
+- 归因迁移保留原始模型、时间、延迟、TTFT 和执行器信息，并同步转换 Claude 独占缓存输入口径，避免影响 token 与费用计算
+
+## v2.5.4 - 2026-07-26
+
+### Codex OAuth 源回退修复
+- 当 CPA 短暂将 Codex OAuth 请求的 Source 回退为 provider 名称时，插件自动从持久化的 OAuth credential 文件名（authID）中恢复邮箱作为分组标识，避免仪表盘出现两个分组的重复统计
+- 恢复逻辑仅在 provider 为 codex、认证方式为 OAuth、且 Source 已回退为 provider/executor 名称时才生效，不影响已有有效 Source 或 API Key 认证的请求
+
+### 测试数据脱敏
+- 将测试中疑似真实 Apple Hide My Email 地址替换为虚构的 `privaterelay.example.com` 域名
+- 将测试中的 hex 标识符替换为明显虚构值
+
 ## v2.5.3 - 2026-07-25
 
 ### 模型价格查询优化
