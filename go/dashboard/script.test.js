@@ -851,6 +851,7 @@ test('dashboard follows runtime language changes', async () => {
 
 test('dashboard language changes do not translate API key labels', async () => {
   const apiLabel = '成功模型凭证';
+  const maskedApiLabel = '成******';
   const { document, setLanguage } = createDashboardHarness({
     clientApiStats: [{
       api_key: apiLabel,
@@ -862,11 +863,12 @@ test('dashboard language changes do not translate API key labels', async () => {
     }],
   });
 
-  await waitFor(() => document.getElementById('clientApiStats').innerHTML.includes(apiLabel));
+  await waitFor(() => document.getElementById('clientApiStats').innerHTML.includes(maskedApiLabel));
   setLanguage('en');
 
   await waitFor(() => document.getElementById('clientApiStats').innerHTML.includes('Requests'));
-  assert.match(document.getElementById('clientApiStats').innerHTML, /<div class="apiName">成功模型凭证<\/div>/);
+  assert.match(document.getElementById('clientApiStats').innerHTML, /<div class="apiName">成\*{6}<\/div>/);
+  assert.doesNotMatch(document.getElementById('clientApiStats').innerHTML, new RegExp(apiLabel));
   assert.doesNotMatch(document.getElementById('clientApiStats').innerHTML, /apiArrow|▶/);
   assert.match(document.getElementById('clientApiStats').innerHTML, /<span class="ok">1,230<\/span>&nbsp;<span class="bad">66<\/span>/);
 });
