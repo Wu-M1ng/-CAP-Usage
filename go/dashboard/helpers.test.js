@@ -352,9 +352,10 @@ test('friendlyApiName cleans API names', () => {
   assert.strictEqual(helpers.friendlyApiName(''), '未知接口');
 });
 
-test('clientApiLabel extracts API key label', () => {
-  assert.strictEqual(helpers.clientApiLabel({ api_key: 'my-key' }), 'my-key');
-  assert.strictEqual(helpers.clientApiLabel({ api_key: '  my-key  ' }), 'my-key');
+test('clientApiLabel masks API key labels to the first character', () => {
+  assert.strictEqual(helpers.maskClientAPIKey('sk******xx'), 's******');
+  assert.strictEqual(helpers.clientApiLabel({ api_key: 'my-key' }), 'm******');
+  assert.strictEqual(helpers.clientApiLabel({ api_key: '  my-key  ' }), 'm******');
   assert.strictEqual(helpers.clientApiLabel({}), '未知 API');
 });
 
@@ -382,6 +383,12 @@ test('healthColor returns gradient colors', () => {
   assert.ok(green.startsWith('rgb('));
   // No data returns empty
   assert.strictEqual(helpers.healthColor(-1), '');
+});
+
+test('healthCellStyle maps five days into 96 columns', () => {
+  assert.match(helpers.healthCellStyle(0, 480, 0, -1), /grid-column:1;grid-row:1;/);
+  assert.match(helpers.healthCellStyle(96, 480, 0, -1), /grid-column:1;grid-row:2;/);
+  assert.match(helpers.healthCellStyle(479, 480, 0, -1), /grid-column:96;grid-row:5;/);
 });
 
 test('timestampMs parses timestamps', () => {

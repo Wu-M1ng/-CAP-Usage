@@ -31,8 +31,8 @@ plugins:
     usage-dashboard-zduu:
       enabled: true
       store:
-        version: "2.5.6"
-        release-tag: "v2.5.6"
+        version: "2.5.3"
+        release-tag: "v2.5.3"
         repository: "https://github.com/zduu/cpa-usage-plugin"
       # 其他配置项见第 4 节 ...
 ```
@@ -265,8 +265,8 @@ plugins:
     usage-dashboard-zduu:
       enabled: true
       store:
-        version: "2.5.6"
-        release-tag: "v2.5.6"
+        version: "2.5.3"
+        release-tag: "v2.5.3"
         repository: "https://github.com/zduu/cpa-usage-plugin"
       # 每个上游接口/模型最多保留的请求明细条数。默认 5000。
       max_details_per_model: 5000
@@ -304,7 +304,7 @@ plugins:
       models_dev_prices_refresh_interval_seconds: 43200
       # 可选：允许外部脚本更新插件文件。默认 false。
       update_enabled: false
-      # 可选：latest 或指定版本号，例如 v2.5.6。
+      # 可选：latest 或指定版本号，例如 v2.5.3。
       update_version: latest
 ```
 
@@ -330,8 +330,8 @@ cd CLIProxyAPI
 启动后查看日志确认插件加载成功：
 
 ```text
-pluginhost: plugin loaded plugin_id=usage-dashboard-zduu version=2.5.6 path=plugins/usage-dashboard-zduu-v2.5.6.so
-pluginhost: plugin registered plugin_id=usage-dashboard-zduu plugin_name=用量统计 version=2.5.6 path=plugins/usage-dashboard-zduu-v2.5.6.so
+pluginhost: plugin loaded plugin_id=usage-dashboard-zduu version=2.5.3 path=plugins/usage-dashboard-zduu-v2.5.3.so
+pluginhost: plugin registered plugin_id=usage-dashboard-zduu plugin_name=用量统计 version=2.5.3 path=plugins/usage-dashboard-zduu-v2.5.3.so
 ```
 
 > `store-sources` 引入插件商店注册表，管理面板可浏览安装。`store` 块标记当前期望版本，pluginhost 会匹配 `usage-dashboard-zduu-v{版本号}.{ext}` 文件名，并自动清理旧版本文件。
@@ -360,8 +360,8 @@ pluginhost: plugin registered plugin_id=usage-dashboard-zduu plugin_name=用量�
 ### 页面功能
 
 - **统计卡片**：总请求数、成功/失败、总 token、每分钟请求、估算花费，附带小时级折线图。
-- **服务健康监测**：7 天 × 15 分钟粒度的彩色网格，鼠标悬停显示窗口详情，灰色格表示无请求。
-- **API 详细统计**：按调用 CPA 服务的客户端 API key 聚合。页面显示脱敏 key；点击右侧“API Key 筛选”后再点击具体 key，可联动筛选上游接口统计、上游接口详情、模型统计、请求事件明细和用量趋势。被选中的 key 会明确显示“已选中”；再次点击可取消，点击“请求次数 / Token数量 / 总花费”任一排序项也会恢复全量。API key 不是必选项，默认只应用全局时间范围。
+- **服务健康监测**：5 天 × 15 分钟粒度的自适应彩色网格，鼠标悬停显示窗口详情，灰色格表示无请求。
+- **API 详细统计**：按调用 CPA 服务的客户端 API key 聚合。页面统一只显示 key 的首字符和六个星号（例如 `t******`）；点击右侧“API Key 筛选”后再点击具体 key，可联动筛选上游接口统计、上游接口详情、模型统计、请求事件明细和用量趋势。被选中的 key 会明确显示“已选中”；再次点击可取消，点击“请求次数 / Token数量 / 总花费”任一排序项也会恢复全量。API key 不是必选项，默认只应用全局时间范围。
 - **上游接口统计**：按上游接口聚合，点击查看模型分布和最近请求详情；最近请求会在有数据时显示推理强度、请求端点和生成速度。
 - **模型统计**：跨接口的模型汇总，包含请求数、token、平均延迟、成功率和费用。
 - **模型价格查询与设置**：查询和设置位于同一个默认收起的展开区。查询框支持按模型名或 `provider/model` 输入匹配，会搜索完整价格表但一次最多显示 100 项，超过时提示匹配总数；选择后只读查看输入、输出、缓存读取和缓存写入价格（US$/M token）。设置输入会列出实际用量中出现过的 `provider/model` 上游组合，也允许直接输入新的组合；裸模型名仍可手动输入，作为所有上游的回退价格。使用 `provider/modelname` 可为不同上游的同名模型分别定价。价格跨设备共享，可启用 models.dev 默认价格源并由后端定时拉取 `input`/`output`/`cache_read`/`cache_write` 基础价格；缺少 `cache_write` 时视为价格未知并默认使用 0，不自动推算写入费率。手动价格覆盖默认价格，模型名匹配大小写不敏感；收费模型需显式填写实际写入价格，免费模型填写 0。models.dev 的分层价格需要当前请求上下文长度等字段，CPA v7 当前 usage 插件接口未提供这些字段，因此本插件暂不使用 `tiers`/`context_over_200k`。
@@ -389,7 +389,7 @@ curl http://127.0.0.1:8317/v0/management/plugins/usage-dashboard-zduu/dashboard-
   -H 'x-management-key: <你的管理密钥>'
 ```
 
-响应包含 `usage`（无 details 聚合数据）、`health_grid`（672 个 15 分钟槽位）、`source_stats`（用于事件来源筛选）、`credential_stats`、`client_api_stats`、`model_stats` 和 `_meta` 元数据。每个 `client_api_stats` 项包含不可逆 `selector`；把它作为 `client_api` 查询参数传给摘要、事件、事件导出或上游接口详情接口，可得到同一客户端 API 身份的数据。不要使用脱敏显示文本代替 selector。
+响应包含 `usage`（无 details 聚合数据）、`health_grid`（480 个 15 分钟槽位）、`source_stats`（用于事件来源筛选）、`credential_stats`、`client_api_stats`、`model_stats` 和 `_meta` 元数据。每个 `client_api_stats[].api_key` 只包含首字符和六个星号，每项同时包含不可逆 `selector`；把 selector 作为 `client_api` 查询参数传给摘要、事件、事件导出或上游接口详情接口，可得到同一客户端 API 身份的数据。不要使用脱敏显示文本代替 selector。
 
 ```bash
 # 例：使用摘要中某个 client_api_stats[].selector 筛选最近 24 小时摘要
@@ -563,7 +563,7 @@ plugins:
     usage-dashboard-zduu:
       enabled: true
       update_enabled: true
-      update_version: latest   # 或 v2.5.6
+      update_version: latest   # 或 v2.5.3
 ```
 
 执行脚本：
@@ -637,7 +637,7 @@ CPA 主程序负责在请求完成后把 usage 记录下发给插件。CPA `v7.2
 - 流式 chunk 兜底没有完整请求耗时上下文，延迟字段可能为空或为 0；这表示该记录来自兜底链路，不代表模型真实耗时为 0。
 - CPA 响应拦截请求不一定包含已选上游 provider/source。走兜底路径时，上游名称可能显示为通用 `openai-compatible`；走原生 usage 路径时仍会保留 CPA 下发的精确上游名称。
 - Claude/Anthropic 流式 usage 中的 `cache_read_input_tokens`、`cache_creation_input_tokens` 会按 Anthropic 口径并回输入 token，以便和 CPA 原生 usage 去重；其他来源的同名字段只作为缓存字段保留，不会全局抬高输入 token。
-- CPA API key 的历史脱敏格式和新版 hash 分组可能不同。`v2.2.8` 起，留空 `api_key_hash_salt` 会使用插件默认稳定 salt，避免新记录在重启或升级后继续换 hash；历史无 hash 旧记录只会在同一脱敏显示值下存在唯一 hash 时合并。若同一脱敏显示值下已有多个不同 hash，插件会保留分组，避免把不同真实 key 误合并。
+- CPA API key 的历史脱敏格式和当前“首字符 + 六个星号”格式可能不同。`v2.2.8` 起，留空 `api_key_hash_salt` 会使用插件默认稳定 salt，避免新记录在重启或升级后继续换 hash；历史无 hash 旧记录只会在同一脱敏显示值下存在唯一 hash 时合并。不同脱敏格式或同一显示值下存在多个不同 hash 时，插件会保留分组，避免把不同真实 key 误合并。
 
 ## 注意
 
@@ -645,4 +645,4 @@ CPA 主程序负责在请求完成后把 usage 记录下发给插件。CPA `v7.2
 - 多实例部署时，每个实例独立统计。
 - token 是否完整取决于上游返回的 usage 信息；CPA 主程序需向插件传递可解析的 usage 字段。SSE 中同一事件内的多条独立 `data:` JSON 行会分别解析，插件会选择信息最完整的 usage。
 - 实时请求不会被去重窗口合并；`max_details_per_model` 只裁剪请求明细，不会扣减总请求、token、成功率等累计统计。`retention_days` 超出窗口的记录会被淘汰并从窗口统计中扣除。
-- `api_key_hash_salt` 只影响新记录的 `api_key_hash`。留空时使用插件默认稳定 salt；填写后使用自定义稳定 salt。客户端 API 统计优先按 `api_key_hash` 聚合，缺失 hash 时再按脱敏后的 `api_key` 展示值聚合；hash 仅用于分组/排查，不能反推原始 key。导入已脱敏的旧导出数据时，插件会忽略外部实例生成的 hash，并按脱敏展示值作为兼容身份。同一脱敏显示值下存在多个不同 hash 时不会强行合并，避免把不同真实 key 混为一条。
+- `api_key_hash_salt` 只影响新记录的 `api_key_hash`。留空时使用插件默认稳定 salt；填写后使用自定义稳定 salt。客户端 API 统计优先按 `api_key_hash` 聚合，缺失 hash 时再按脱敏后的 `api_key` 展示值聚合；页面、JSON/JSONL 接口及导出中的 `api_key` 都只显示首字符和六个星号，hash 仅用于分组/排查，不能反推原始 key。导入当前脱敏格式且携带合法 56 位 hash 的导出数据时会保留该 hash；导入旧脱敏格式时会忽略外部实例生成的 hash，并按旧脱敏显示值作为兼容身份。同一脱敏显示值下存在多个不同 hash 时不会强行合并，避免把不同真实 key 混为一条。

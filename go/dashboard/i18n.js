@@ -32,7 +32,7 @@ var I18N_MAP = {
 
     // ---- health panel ----
     health_title: '服务健康监测',
-    health_subtle: '最近7天，15分钟一个网格；绿色代表成功率高，红色代表失败较多。',
+    health_subtle: '最近5天，15分钟一个网格；绿色代表成功率高，红色代表失败较多。',
     success_rate: '成功率',
     success: '成功',
     failure: '失败',
@@ -167,9 +167,6 @@ var I18N_MAP = {
 
     // ---- events export / import ----
     events_count: '共 {0} 条，显示 {1} 条',
-    events_page: '第 {0} / {1} 页',
-    events_previous_page: '上一页',
-    events_next_page: '下一页',
     export_truncated: '导出已截断：共 {0} 条，已导出 {1} 条',
     export_failed: '导出失败',
     export_failed_msg: '导出失败：',
@@ -277,7 +274,7 @@ var I18N_MAP = {
     cost_meta: '依本頁模型價格估算',
 
     health_title: '服務健康監測',
-    health_subtle: '最近7天，15分鐘一個網格；綠色代表成功率高，紅色代表失敗較多。',
+    health_subtle: '最近5天，15分鐘一個網格；綠色代表成功率高，紅色代表失敗較多。',
     success_rate: '成功率',
     success: '成功',
     failure: '失敗',
@@ -401,9 +398,6 @@ var I18N_MAP = {
     write_pressure: '寫入壓力',
 
     events_count: '共 {0} 條，顯示 {1} 條',
-    events_page: '第 {0} / {1} 頁',
-    events_previous_page: '上一頁',
-    events_next_page: '下一頁',
     export_truncated: '匯出已截斷：共 {0} 條，已匯出 {1} 條',
     export_failed: '匯出失敗',
     export_failed_msg: '匯出失敗：',
@@ -503,7 +497,7 @@ var I18N_MAP = {
     cost_meta: 'Estimated with model prices on this page',
 
     health_title: 'Service Health',
-    health_subtle: 'Last 7 days, 15-min slots. Green = high success rate, red = failures.',
+    health_subtle: 'Last 5 days, 15-min slots. Green = high success rate, red = failures.',
     success_rate: 'Success Rate',
     success: 'Success',
     failure: 'Failure',
@@ -627,9 +621,6 @@ var I18N_MAP = {
     write_pressure: 'Write Pressure',
 
     events_count: 'Total {0}, showing {1}',
-    events_page: 'Page {0} of {1}',
-    events_previous_page: 'Previous page',
-    events_next_page: 'Next page',
     export_truncated: 'Export truncated: total {0}, exported {1}',
     export_failed: 'Export failed',
     export_failed_msg: 'Export failed: ',
@@ -729,7 +720,7 @@ var I18N_MAP = {
     cost_meta: 'Оценка по ценам моделей',
 
     health_title: 'Здоровье сервиса',
-    health_subtle: 'Последние 7 дней, интервалы по 15 мин. Зелёный = высокий успех, красный = много ошибок.',
+    health_subtle: 'Последние 5 дней, интервалы по 15 мин. Зелёный = высокий успех, красный = много ошибок.',
     success_rate: 'Успешность',
     success: 'Успешно',
     failure: 'Ошибок',
@@ -853,9 +844,6 @@ var I18N_MAP = {
     write_pressure: 'Нагрузка записи',
 
     events_count: 'Всего {0}, показано {1}',
-    events_page: 'Страница {0} из {1}',
-    events_previous_page: 'Предыдущая страница',
-    events_next_page: 'Следующая страница',
     export_truncated: 'Экспорт обрезан: всего {0}, экспортировано {1}',
     export_failed: 'Ошибка экспорта',
     export_failed_msg: 'Ошибка экспорта: ',

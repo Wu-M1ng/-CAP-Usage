@@ -2,7 +2,7 @@
 
 CPA 用量统计插件，用于在 CLIProxyAPI/CPA v7 插件系统中记录请求用量，并提供管理页面查看统计数据。
 
-当前代码版本：`2.5.6`。
+当前代码版本：`2.5.4`。
 
 > **2.4.0 迁移提示**：插件 ID 已从 `usage-statistics` 改为 `usage-dashboard-zduu`，用于避开 CPA 官方商店中同 ID 插件造成的安装状态、配置和路由冲突。升级时必须先停用并删除旧插件，再安装新插件；历史统计数据路径保持不变。详细步骤见[部署文档的 2.3.4 → 2.4.0 迁移章节](docs/guides/cpa-usage.md#从-234-迁移到-240)。
 
@@ -13,15 +13,15 @@ CPA 用量统计插件，用于在 CLIProxyAPI/CPA v7 插件系统中记录请�
 - 记录请求数、成功/失败、延迟、TTFT。
 - 记录 input/output/reasoning/cache/total token。
 - 按上游接口、模型、来源、CPA 凭证和调用 CPA 的客户端 API key 聚合统计。
-- API 详细统计支持主动选择脱敏后的客户端 API key，并联动筛选上游接口统计、上游接口详情、模型统计、请求事件明细和用量趋势；默认仍展示当前时间范围内的全量数据。
+- API 详细统计支持主动选择脱敏后的客户端 API key；页面统一只显示首字符和六个星号（例如 `t******`），并联动筛选上游接口统计、上游接口详情、模型统计、请求事件明细和用量趋势；默认仍展示当前时间范围内的全量数据。
 - 上游接口详情的最近请求展示推理强度、请求端点和生成速度；流式请求按首个 token 后的生成时长计算速度，非流式请求按完整响应耗时计算。
 - 在 CPA 原生 usage 记录缺失时，可从成功响应体或流式 chunk 中的 usage 字段写入兜底统计，并通过延迟写入和指纹匹配避免与原生记录重复计数。
 - 轻量级首屏摘要：看板数据不含请求明细，首包体积不随记录数增长。
 - 请求事件明细支持按模型、来源、凭证、时间范围筛选，页面以滚动表格展示；来源列显示完整上游接口标识，便于区分同一 Codex、Claude 等提供商下的不同上游凭证。
-- 服务健康网格按 15 分钟展示最近 7 天状态，鼠标悬停显示窗口信息。
-- 用量趋势图支持切换每日成本、请求数、token 和平均 RPM，并提示近期用量突增或下降。
+- 服务健康网格按 15 分钟展示最近 5 天状态，并自动适配可用宽度；鼠标悬停显示窗口信息。
+- 用量趋势图默认选择 Token 指标，支持切换成本、请求数、token 和平均 RPM，并提示近期用量突增或下降。
 - 支持导入/导出统计数据，导出包含版本、插件版本、明细数和配置摘要；导入返回输入/接收/拒绝/新增/跳过/过期忽略明细。
-- API key 只保存脱敏显示值和分组 hash；导入旧数据时会兼容无 hash 记录，但同一脱敏显示值下存在多个不同 hash 时不会强行合并，避免混淆不同真实 key。
+- API key 只保存脱敏显示值和分组 hash；页面、JSON/JSONL 接口及导出中的 `api_key` 统一为首字符加六个星号。导入旧数据时会兼容无 hash 记录，但同一脱敏显示值下存在多个不同 hash 时不会强行合并，避免混淆不同真实 key。
 - 支持后端全局模型价格表并分别按输入、输出、缓存读取、缓存写入 token 估算成本，跨设备打开看板可见同一份最新价格；手动价格可用 `provider/modelname` 区分同名上游模型，裸模型名作为所有上游的回退。
 - 可选启用 models.dev 默认价格源，后端定时拉取价格表；手动设置的模型价格优先级更高，模型名匹配大小写不敏感。看板将价格查询与设置放在同一个默认收起的展开区，查询会搜索完整价格表、单次最多渲染 100 项并提示匹配总数；设置候选来自实际用量中出现过的 `provider/model`，裸模型名仍可直接输入作为全局回退，新上游模型无需先手动复制名称。
 - 模型统计展示成功率、缓存命中率、估算花费和实际单价（US$/M token），便于比较不同模型效率。
@@ -72,21 +72,21 @@ CPA 用量统计插件，用于在 CLIProxyAPI/CPA v7 插件系统中记录请�
 
 ```bash
 cd go
-CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -buildvcs=false -trimpath -ldflags="-s -w" -o ../usage-dashboard-zduu.so .
+CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -buildvcs=false -o ../usage-dashboard-zduu.so .
 ```
 
 本地交叉构建 arm64 需要安装对应 C 交叉编译器，例如 `aarch64-linux-gnu-gcc`：
 
 ```bash
 cd go
-CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -buildvcs=false -trimpath -ldflags="-s -w" -o ../usage-dashboard-zduu-linux-arm64.so .
+CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -buildvcs=false -o ../usage-dashboard-zduu-linux-arm64.so .
 ```
 
 本地测试：
 
 ```bash
 cd go && go test -v -race ./...
-node --check go/dashboard/helpers.js go/dashboard/i18n.js go/dashboard/script.js
+node --check go/dashboard/helpers.js go/dashboard/script.js
 node --test go/dashboard/*.test.js
 ```
 

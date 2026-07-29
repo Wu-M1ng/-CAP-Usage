@@ -125,8 +125,8 @@ func TestDashboardSummaryHasHealthGrid(t *testing.T) {
 	})
 
 	summary := stats.SummaryWithoutDetails()
-	if len(summary.HealthGrid) != 672 {
-		t.Fatalf("health grid should have 672 slots, got %d", len(summary.HealthGrid))
+	if len(summary.HealthGrid) != 480 {
+		t.Fatalf("health grid should have 480 slots, got %d", len(summary.HealthGrid))
 	}
 
 	// At least one slot should have data
@@ -142,110 +142,6 @@ func TestDashboardSummaryHasHealthGrid(t *testing.T) {
 	}
 	if !hasData {
 		t.Fatal("health grid should have at least one populated slot")
-	}
-}
-
-func TestDashboardSummaryCompactHealthGridResponse(t *testing.T) {
-	previousStats := stats
-	stats = NewRequestStatistics()
-	t.Cleanup(func() { stats = previousStats })
-	now := time.Now()
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-4.1",
-		RequestedAt: now,
-		Detail:      UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
-	})
-
-	legacyResp := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method: "GET",
-		Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-summary",
-		Query:  map[string][]string{"range": {"24h"}},
-	}), nil)
-	compactResp := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method: "GET",
-		Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-summary",
-		Query:  map[string][]string{"range": {"24h"}, "compact_health": {"1"}},
-	}), nil)
-
-	var legacy, compact DashboardSummary
-	if err := json.Unmarshal(legacyResp.Body, &legacy); err != nil {
-		t.Fatalf("unmarshal legacy summary: %v", err)
-	}
-	if err := json.Unmarshal(compactResp.Body, &compact); err != nil {
-		t.Fatalf("unmarshal compact summary: %v", err)
-	}
-	if len(legacy.HealthGrid) != dashboardHealthSlotCount || legacy.HealthGridV2 != nil {
-		t.Fatalf("legacy health representation = slots %d compact %#v", len(legacy.HealthGrid), legacy.HealthGridV2)
-	}
-	if len(compact.HealthGrid) != 0 || compact.HealthGridV2 == nil {
-		t.Fatalf("compact health representation = slots %d compact %#v", len(compact.HealthGrid), compact.HealthGridV2)
-	}
-	if compact.HealthGridV2.Count != dashboardHealthSlotCount || compact.HealthGridV2.StepSeconds != int64(dashboardHealthStep/time.Second) || len(compact.HealthGridV2.Slots) != 1 {
-		t.Fatalf("compact grid = %#v", compact.HealthGridV2)
-	}
-	if len(compactResp.Body) >= len(legacyResp.Body)/2 {
-		t.Fatalf("compact summary size = %d, legacy = %d; expected at least 50%% reduction", len(compactResp.Body), len(legacyResp.Body))
-	}
-	legacyGzip, _ := gzipBytes(legacyResp.Body)
-	compactGzip, _ := gzipBytes(compactResp.Body)
-	t.Logf("summary bytes: legacy=%d/%d gzip, compact=%d/%d gzip", len(legacyResp.Body), len(legacyGzip), len(compactResp.Body), len(compactGzip))
-	if legacyResp.Headers["ETag"][0] == compactResp.Headers["ETag"][0] {
-		t.Fatal("legacy and compact representations must use different ETags")
-	}
-}
-
-func TestDashboardSummaryIncludesEstimatedCosts(t *testing.T) {
-	stats := NewRequestStatistics()
-	stats.modelPrices = map[string]ModelPrice{
-		"openai/gpt-4.1": {Prompt: 2, Completion: 8, Cache: 0.5, CacheWrite: 1},
-	}
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-4.1",
-		APIKey:      "sk-client-cost",
-		RequestedAt: time.Now(),
-		Detail:      UsageDetail{InputTokens: 1_000_000, OutputTokens: 1_000_000, TotalTokens: 2_000_000},
-	})
-
-	summary := stats.SummaryWithoutDetailsForRange("24h")
-	if math.Abs(summary.Usage.TotalCost-10) > 1e-9 {
-		t.Fatalf("total cost = %v, want 10", summary.Usage.TotalCost)
-	}
-	if len(summary.ModelStats) != 1 || math.Abs(summary.ModelStats[0].EstimatedCost-10) > 1e-9 {
-		t.Fatalf("model costs = %#v, want 10", summary.ModelStats)
-	}
-	api := summary.Usage.APIs["openai"]
-	if math.Abs(api.EstimatedCost-10) > 1e-9 || math.Abs(api.Models["gpt-4.1"].EstimatedCost-10) > 1e-9 {
-		t.Fatalf("api costs = %#v, want 10", api)
-	}
-	if len(summary.ClientAPIStats) != 1 || math.Abs(summary.ClientAPIStats[0].EstimatedCost-10) > 1e-9 {
-		t.Fatalf("client API costs = %#v, want 10", summary.ClientAPIStats)
-	}
-}
-
-func TestQueryModelPricesSupportsSearchPaginationAndUsedScope(t *testing.T) {
-	stats := NewRequestStatistics()
-	_ = stats.ModelPrices()
-	stats.modelPrices = map[string]ModelPrice{
-		"openai/gpt-4.1":       {Prompt: 1, Completion: 2},
-		"openrouter/gpt-4.1":   {Prompt: 3, Completion: 4},
-		"catalogue/unused-one": {Prompt: 5, Completion: 6},
-	}
-	stats.modelPriceIndex = normalizedModelPriceIndex(stats.modelPrices)
-	stats.priceVersion = 7
-	stats.Record(UsageRecord{Provider: "openai", Model: "gpt-4.1", RequestedAt: time.Now(), Detail: UsageDetail{TotalTokens: 1}})
-
-	page := stats.QueryModelPrices("catalogue", "gpt-4.1", 1, 1)
-	if page.Total != 2 || page.Limit != 1 || page.Offset != 1 || len(page.Prices) != 1 {
-		t.Fatalf("catalogue page = %#v", page)
-	}
-	used := stats.QueryModelPrices("used", "", 0, 0)
-	if used.Total != 1 || len(used.Prices) != 1 {
-		t.Fatalf("used prices = %#v, want only the effective OpenAI model", used)
-	}
-	if _, ok := used.Prices["openai/gpt-4.1"]; !ok {
-		t.Fatalf("used prices missing provider-scoped match: %#v", used.Prices)
 	}
 }
 
@@ -355,7 +251,7 @@ func TestDashboardSummaryAggregatesClientAPIKeyStats(t *testing.T) {
 	}
 
 	first := summary.ClientAPIStats[0]
-	if first.APIKey != "sk******xx" {
+	if first.APIKey != "s******" {
 		t.Fatalf("first client api label = %q, want masked CPA api key", first.APIKey)
 	}
 	if first.TotalRequests != 2 || first.TotalTokens != 1780 {
@@ -404,7 +300,7 @@ func TestClientAPISelectorFiltersSummaryEventsAndAPIDetail(t *testing.T) {
 	}
 	var alpha ClientAPIStat
 	for _, stat := range base.ClientAPIStats {
-		if stat.APIKey == "sk******xx" {
+		if stat.APIKey == "s******" {
 			alpha = stat
 		}
 	}
@@ -459,6 +355,9 @@ func TestClientAPISelectorMatchesCoalescedLegacyIdentity(t *testing.T) {
 	if !clientAPISelectorMatchesDetail(mergedSelector, RequestDetail{APIKey: "sk******xx", APIKeyHash: hash}) {
 		t.Fatal("masked selector should match all identities represented by a merged masked group")
 	}
+	if strings.Contains(selector, "c2sQKioqKip4eA") || strings.Contains(mergedSelector, "c2sQKioqKip4eA") {
+		t.Fatalf("masked selector leaked a reversible API key label: %q", mergedSelector)
+	}
 }
 
 func TestClientAPIFilterChangesDashboardETags(t *testing.T) {
@@ -504,7 +403,7 @@ func TestCoalesceMaskedClientAPIStatsKeepsDifferentLiveHashesSeparateWithoutImpo
 	}
 }
 
-func TestDashboardSummaryMergesLegacyHashlessClientAPIKeyWithUniqueCurrentHash(t *testing.T) {
+func TestDashboardSummaryKeepsLegacyHashlessClientAPIKeySeparateFromNewMask(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, RetentionDays: 0})
 	when := time.Now().Add(-time.Hour)
@@ -539,25 +438,42 @@ func TestDashboardSummaryMergesLegacyHashlessClientAPIKeyWithUniqueCurrentHash(t
 		Detail:      UsageDetail{InputTokens: 30, OutputTokens: 10, TotalTokens: 40},
 	})
 
-	assertMerged := func(label string, summary DashboardSummary) {
+	assertSeparate := func(label string, summary DashboardSummary) {
 		t.Helper()
-		if len(summary.ClientAPIStats) != 1 {
-			t.Fatalf("%s client api stats len = %d, want 1: %#v", label, len(summary.ClientAPIStats), summary.ClientAPIStats)
+		if len(summary.ClientAPIStats) != 2 {
+			t.Fatalf("%s client api stats len = %d, want legacy and current groups: %#v", label, len(summary.ClientAPIStats), summary.ClientAPIStats)
 		}
-		got := summary.ClientAPIStats[0]
-		if got.APIKey != "sk******xx" || got.APIKeyHash == "" || got.TotalRequests != 2 || got.TotalTokens != 160 {
-			t.Fatalf("%s client api stat = %#v, want merged legacy/current key totals", label, got)
+		legacySeen := false
+		currentSeen := false
+		for _, got := range summary.ClientAPIStats {
+			if len(got.Models) != 1 || got.Models[0].Model != "gpt-4.1" || got.Models[0].TotalRequests != 1 {
+				t.Fatalf("%s client api model stats = %#v, want one request per identity", label, got.Models)
+			}
+			switch got.APIKey {
+			case "sk******xx":
+				legacySeen = true
+				if got.APIKeyHash != "" || got.TotalRequests != 1 || got.TotalTokens != 120 {
+					t.Fatalf("%s legacy client api stat = %#v, want hashless legacy identity", label, got)
+				}
+			case "s******":
+				currentSeen = true
+				if got.APIKeyHash == "" || got.TotalRequests != 1 || got.TotalTokens != 40 {
+					t.Fatalf("%s current client api stat = %#v, want hashed current identity", label, got)
+				}
+			default:
+				t.Fatalf("%s unexpected client api label: %#v", label, got)
+			}
 		}
-		if len(got.Models) != 1 || got.Models[0].Model != "gpt-4.1" || got.Models[0].TotalRequests != 2 {
-			t.Fatalf("%s client api model stats = %#v, want merged model totals", label, got.Models)
+		if !legacySeen || !currentSeen {
+			t.Fatalf("%s client api stats missing legacy or current identity: %#v", label, summary.ClientAPIStats)
 		}
 	}
 
-	assertMerged("all", stats.SummaryWithoutDetails())
-	assertMerged("range", stats.SummaryWithoutDetailsForRange("24h"))
+	assertSeparate("all", stats.SummaryWithoutDetails())
+	assertSeparate("range", stats.SummaryWithoutDetailsForRange("24h"))
 }
 
-func TestDashboardSummaryMergesCrossDeploymentHashlessClientAPIKeyWithHashVariants(t *testing.T) {
+func TestDashboardSummaryKeepsCrossDeploymentLegacyMaskSeparateFromNewHashVariants(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, RetentionDays: 0})
 	when := time.Now().Add(-time.Hour)
@@ -599,15 +515,32 @@ func TestDashboardSummaryMergesCrossDeploymentHashlessClientAPIKeyWithHashVarian
 	}
 
 	summary := stats.SummaryWithoutDetails()
-	if len(summary.ClientAPIStats) != 1 {
-		t.Fatalf("client api stats len = %d, want cross-deployment masked key merged: %#v", len(summary.ClientAPIStats), summary.ClientAPIStats)
+	if len(summary.ClientAPIStats) != 3 {
+		t.Fatalf("client api stats len = %d, want two current hashes and one legacy group: %#v", len(summary.ClientAPIStats), summary.ClientAPIStats)
 	}
-	got := summary.ClientAPIStats[0]
-	if got.APIKey != "sk******xx" || got.APIKeyHash != "" || got.TotalRequests != 3 || got.TotalTokens != 220 {
-		t.Fatalf("client api stat = %#v, want merged cross-deployment totals 3/220", got)
+	var legacyRequests, currentRequests, totalTokens int64
+	for _, got := range summary.ClientAPIStats {
+		if len(got.Models) != 1 || got.Models[0].TotalRequests != 1 {
+			t.Fatalf("client api model stats = %#v, want one request per distinct identity", got.Models)
+		}
+		totalTokens += got.TotalTokens
+		switch got.APIKey {
+		case "sk******xx":
+			if got.APIKeyHash != "" {
+				t.Fatalf("legacy client api stat unexpectedly has a hash: %#v", got)
+			}
+			legacyRequests += got.TotalRequests
+		case "s******":
+			if got.APIKeyHash == "" {
+				t.Fatalf("current client api stat is missing its hash: %#v", got)
+			}
+			currentRequests += got.TotalRequests
+		default:
+			t.Fatalf("unexpected client api label: %#v", got)
+		}
 	}
-	if len(got.Models) != 1 || got.Models[0].TotalRequests != 3 || got.Models[0].TotalTokens != 220 {
-		t.Fatalf("client api model stats = %#v, want merged cross-deployment model totals", got.Models)
+	if legacyRequests != 1 || currentRequests != 2 || totalTokens != 220 {
+		t.Fatalf("client api totals = legacy %d current %d tokens %d, want 1/2/220: %#v", legacyRequests, currentRequests, totalTokens, summary.ClientAPIStats)
 	}
 }
 
@@ -739,7 +672,7 @@ func TestDashboardSummaryMergesImportedRawClientAPIKeysByMaskedLabel(t *testing.
 	}
 	var totalTokens int64
 	for _, got := range summary.ClientAPIStats {
-		if got.APIKey != "sk******xx" || got.APIKeyHash == "" || got.TotalRequests != 1 {
+		if got.APIKey != "s******" || got.APIKeyHash == "" || got.TotalRequests != 1 {
 			t.Fatalf("client api stat = %#v, want distinct current-salt masked key", got)
 		}
 		totalTokens += got.TotalTokens
@@ -800,7 +733,7 @@ func TestMergeSnapshotMasksImportedNonStandardRawClientAPIKey(t *testing.T) {
 			}
 		}
 	}
-	if detail.APIKey != "ra******ey" || detail.APIKeyHash != hashAPIKey(rawKey) {
+	if detail.APIKey != "r******" || detail.APIKeyHash != hashAPIKey(rawKey) {
 		t.Fatalf("imported detail api identity = %q/%q, want masked current-salt hash", detail.APIKey, detail.APIKeyHash)
 	}
 	if strings.Contains(detail.Source, rawKey) {
@@ -812,7 +745,7 @@ func TestMergeSnapshotMasksImportedNonStandardRawClientAPIKey(t *testing.T) {
 		t.Fatalf("client api stats = %#v, want one stat", summary.ClientAPIStats)
 	}
 	got := summary.ClientAPIStats[0]
-	if got.APIKey != "ra******ey" || got.APIKeyHash != hashAPIKey(rawKey) || got.TotalRequests != 1 {
+	if got.APIKey != "r******" || got.APIKeyHash != hashAPIKey(rawKey) || got.TotalRequests != 1 {
 		t.Fatalf("client api stat = %#v, want masked current-salt hash", got)
 	}
 }
@@ -2306,7 +2239,7 @@ func TestSummaryWithoutDetailsKeepsAggregatesAfterDetailTrim(t *testing.T) {
 		}
 		var clientRequests, clientTokens, clientModelRequests int64
 		for _, stat := range summary.ClientAPIStats {
-			if stat.APIKey != "sk******56" || stat.APIKeyHash == "" || len(stat.Models) != 1 {
+			if stat.APIKey != "s******" || stat.APIKeyHash == "" || len(stat.Models) != 1 {
 				t.Fatalf("%s client api stat = %#v", label, stat)
 			}
 			clientRequests += stat.TotalRequests
@@ -2880,8 +2813,8 @@ func TestSummaryRangeEmptyResultIsValid(t *testing.T) {
 	if summary.Usage.TotalRequests != 0 {
 		t.Fatalf("empty summary total_requests = %d, want 0", summary.Usage.TotalRequests)
 	}
-	if len(summary.HealthGrid) != 672 {
-		t.Fatalf("health grid length = %d, want 672", len(summary.HealthGrid))
+	if len(summary.HealthGrid) != 480 {
+		t.Fatalf("health grid length = %d, want 480", len(summary.HealthGrid))
 	}
 	if summary.GeneratedAt == "" {
 		t.Fatal("generated_at should not be empty")
@@ -3181,7 +3114,7 @@ func TestDashboardEventsQueryParsesClientAPISelector(t *testing.T) {
 }
 
 func TestQueryRawValuePreservesClientAPISelectorCase(t *testing.T) {
-	selector := "m.c2sQKioqKip6eQ"
+	selector := "m." + strings.Repeat("a", 56)
 	query := map[string][]string{"client_api": {"  " + selector + "  "}}
 	if got := queryRawValue(query, "client_api"); got != selector {
 		t.Fatalf("queryRawValue() = %q, want %q", got, selector)

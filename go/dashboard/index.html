@@ -34,7 +34,7 @@
   </section>
   <section class="panel full">
     <div class="panelHead">
-      <div><h2 data-i18n="health_title">服务健康监测</h2><div class="subtle" data-i18n="health_subtle">最近7天，15分钟一个网格；绿色代表成功率高，红色代表失败较多。</div></div>
+      <div><h2 data-i18n="health_title">服务健康监测</h2><div class="subtle" data-i18n="health_subtle">最近5天，15分钟一个网格；绿色代表成功率高，红色代表失败较多。</div></div>
       <div class="healthSummary"><span data-i18n="success_rate">成功率</span><span class="healthRate" id="healthRate">-</span><span class="ok" id="healthSuccess">成功 -</span><span class="bad" id="healthFailure">失败 -</span></div>
     </div>
     <div class="healthScroller"><div class="healthGrid" id="healthGrid"></div></div>
@@ -120,11 +120,7 @@
         <select id="filterSource" class="select"></select>
         <select id="filterAuth" class="select"></select>
       </div>
-      <div class="eventsMeta">
-        <span id="eventsCount">-</span>
-        <div class="eventsPager"><button id="eventsPrev" class="iconBtn" type="button">&larr;</button><span id="eventsPage">-</span><button id="eventsNext" class="iconBtn" type="button">&rarr;</button></div>
-        <span data-i18n="events_latency_unit">用时 / 首字按时长显示 ms/s</span>
-      </div>
+      <div class="eventsMeta"><span id="eventsCount">-</span><span data-i18n="events_latency_unit">用时 / 首字按时长显示 ms/s</span></div>
       <div class="tableWrap" id="events"></div>
     </div>
   </section>

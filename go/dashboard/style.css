@@ -370,8 +370,8 @@ tbody td{transition:background-color .12s}
 .healthScroller::-webkit-scrollbar{height:6px}
 .healthScroller::-webkit-scrollbar-track{background:transparent}
 .healthScroller::-webkit-scrollbar-thumb{background:var(--cpa-scrollbar);border-radius:3px}
-.healthGrid{display:grid;grid-template-columns:repeat(96,12px);grid-template-rows:repeat(7,12px);gap:4px;min-width:max-content}
-.healthCell{width:12px;height:12px;border-radius:3px;background:var(--cpa-bg-health);cursor:pointer;transition:transform .1s}
+.healthGrid{display:grid;grid-template-columns:repeat(96,minmax(2px,1fr));grid-template-rows:repeat(5,auto);gap:clamp(1px,.25vw,4px);width:100%;min-width:288px;max-width:1532px;margin-inline:auto}
+.healthCell{width:100%;height:auto;min-width:0;aspect-ratio:1;border-radius:clamp(1px,.2vw,3px);background:var(--cpa-bg-health);cursor:pointer;transition:transform .1s}
 .healthCell:hover{transform:scale(1.25)}
 .legend{display:flex;gap:6px;align-items:center;color:var(--cpa-text-tertiary);font-size:11px;margin-top:8px;flex-wrap:wrap}
 .legendDot{width:12px;height:12px;border-radius:3px;display:inline-block}
@@ -379,11 +379,6 @@ tbody td{transition:background-color .12s}
 /* ---- 筛选器 ---- */
 .filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 .eventsMeta{display:flex;justify-content:space-between;color:var(--cpa-text-tertiary);font-size:12px;margin-bottom:6px;gap:8px;flex-wrap:wrap}
-.eventsPager{display:flex;align-items:center;justify-content:center;gap:8px;min-width:150px}
-.iconBtn{display:inline-grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid var(--cpa-btn-border);border-radius:7px;background:var(--cpa-btn-bg);color:var(--cpa-btn-text);font-size:16px;line-height:1}
-.iconBtn:hover:not(:disabled){border-color:var(--cpa-btn-hover-border);background:var(--cpa-btn-hover-bg)}
-.iconBtn:focus-visible{outline:none;border-color:var(--cpa-accent);box-shadow:0 0 0 3px var(--cpa-accent-ring)}
-.iconBtn:disabled{opacity:.4;cursor:not-allowed}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}
 .nowrap{white-space:nowrap}
 

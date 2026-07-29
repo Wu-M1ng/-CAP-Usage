@@ -11,7 +11,7 @@ import (
 
 const pluginID = "usage-dashboard-zduu"
 const legacyPluginID = "usage-statistics"
-const pluginVersion = "2.5.6"
+const pluginVersion = "2.5.3"
 
 func handleRegister(requestBody []byte) ([]byte, error) {
 	applyRuntimeConfig(requestBody)
@@ -158,12 +158,6 @@ func handleRegister(requestBody []byte) ([]byte, error) {
 }
 
 func handleReconfigure(requestBody []byte) ([]byte, error) {
-	if upstreamAttributions != nil {
-		upstreamAttributions.Reset()
-	}
-	if stats != nil {
-		stats.ReconcileProtocolFallbacks()
-	}
 	return handleRegister(requestBody)
 }
 

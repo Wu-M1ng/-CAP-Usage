@@ -384,6 +384,7 @@ func encodeDashboardEventsPaged(params EventsQuery, opts dashboardEventsExportOp
 	exported := 0
 	for {
 		for _, event := range page.Events {
+			event = sanitizeRequestDetailAPIKeyForOutput(event)
 			if err := consume(event); err != nil {
 				return exported, err
 			}

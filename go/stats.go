@@ -5,7 +5,6 @@ import (
 	"container/heap"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -114,14 +113,11 @@ type RequestStatistics struct {
 	priceStorageLoadedPath string
 	priceStorageLastError  string
 	modelPrices            map[string]ModelPrice
-	modelPriceIndex        map[string]ModelPrice
 	modelPricesUpdatedAt   time.Time
-	priceVersion           uint64
 	modelsDevPricesEnabled bool
 	modelsDevPricesURL     string
 	modelsDevRefresh       time.Duration
 	modelsDevPrices        map[string]ModelPrice
-	modelsDevPriceIndex    map[string]ModelPrice
 	modelsDevUpdatedAt     time.Time
 	modelsDevLastAttempt   time.Time
 	modelsDevLastSuccess   time.Time
@@ -451,7 +447,7 @@ var hourKeys = [24]string{
 }
 
 const (
-	dashboardHealthSlotCount       = 672
+	dashboardHealthSlotCount       = 5 * 24 * 4
 	dashboardHealthStep            = 15 * time.Minute
 	dashboardEventCacheMax         = 16
 	dashboardSummaryRangeCacheMax  = 16
@@ -550,11 +546,9 @@ func NewRequestStatistics() *RequestStatistics {
 		exportMaxRecords:              defaultExportMaxRecords,
 		priceStoragePath:              defaultRuntimeConfig().PriceStoragePath,
 		modelPrices:                   make(map[string]ModelPrice),
-		modelPriceIndex:               make(map[string]ModelPrice),
 		modelsDevPricesURL:            defaultRuntimeConfig().ModelsDevPricesURL,
 		modelsDevRefresh:              time.Duration(defaultRuntimeConfig().ModelsDevRefreshSeconds) * time.Second,
 		modelsDevPrices:               make(map[string]ModelPrice),
-		modelsDevPriceIndex:           make(map[string]ModelPrice),
 		conditionalRequests:           make(map[string]conditionalRequestCounter),
 		startedAt:                     time.Now(),
 	}
@@ -662,8 +656,6 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	}
 	if oldModelsDevEnabled != s.modelsDevPricesEnabled || oldModelsDevURL != s.modelsDevPricesURL {
 		s.modelsDevPrices = make(map[string]ModelPrice)
-		s.modelsDevPriceIndex = make(map[string]ModelPrice)
-		s.priceVersion++
 		s.modelsDevUpdatedAt = time.Time{}
 		s.modelsDevLastAttempt = time.Time{}
 		s.modelsDevLastSuccess = time.Time{}
@@ -1540,8 +1532,6 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 	if s == nil {
 		return
 	}
-	snapshot, _ = reconcileProtocolFallbackSnapshot(snapshot)
-	snapshot, _ = reconcileUpstreamAttributionSnapshot(snapshot, newUpstreamRouteResolver(maxHistoricalAttributionRoutes))
 	s.totalRequests = nonNegativeInt64(snapshot.TotalRequests)
 	s.successCount = nonNegativeInt64(snapshot.SuccessCount)
 	s.failureCount = nonNegativeInt64(snapshot.FailureCount)
@@ -2731,7 +2721,9 @@ func (s *RequestStatistics) replayStorageLocked(path string) error {
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 1024*1024)
 	scanner.Buffer(buf, 10*1024*1024)
-	var records []persistedDetail
+	now := time.Now()
+	existing := s.detailKeysLocked()
+	pendingMetadata := make(map[requestDedupKey]RequestDetail)
 	var invalidLines int
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -2748,22 +2740,6 @@ func (s *RequestStatistics) replayStorageLocked(path string) error {
 			invalidLines++
 			continue
 		}
-		records = append(records, persisted)
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan storage: %w", err)
-	}
-
-	now := time.Now()
-	resolver := s.upstreamRouteResolverLocked()
-	records = reconcilePersistedUpstreamAttributions(records, resolver)
-	records, _ = reconcilePersistedProtocolFallbacks(records)
-	s.reconcileRecordedUpstreamAttributionsWithResolverLocked(now, resolver)
-	s.reconcileRecordedProtocolFallbacksLocked(now)
-	existing := s.detailKeysLocked()
-	pendingMetadata := make(map[requestDedupKey]RequestDetail)
-	for _, persisted := range records {
-		apiName := strings.TrimSpace(persisted.API)
 		detail := persisted.Detail
 		modelName := normalizeDetailModelName(persisted.Model, detail.Model)
 		detail.Model = modelName
@@ -2801,8 +2777,9 @@ func (s *RequestStatistics) replayStorageLocked(path string) error {
 			}
 		}
 	}
-	s.reconcileRecordedUpstreamAttributionsLocked(now)
-	s.reconcileRecordedProtocolFallbacksLocked(now)
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan storage: %w", err)
+	}
 	if invalidLines > 0 {
 		return fmt.Errorf("replay storage skipped %d invalid line(s)", invalidLines)
 	}
@@ -3060,8 +3037,6 @@ func (s *RequestStatistics) refreshModelsDevPricesOnceWithStop(stop <-chan struc
 		return
 	}
 	s.modelsDevPrices = prices
-	s.modelsDevPriceIndex = normalizedModelPriceIndex(prices)
-	s.priceVersion++
 	s.modelsDevUpdatedAt = updatedAt
 	s.modelsDevLastAttempt = attemptAt
 	s.modelsDevLastSuccess = attemptAt
@@ -3211,8 +3186,6 @@ func (s *RequestStatistics) loadModelPricesLocked() {
 			s.priceStoragePath = path
 			s.priceStorageLoadedPath = abs
 			s.modelPrices = make(map[string]ModelPrice)
-			s.modelPriceIndex = make(map[string]ModelPrice)
-			s.priceVersion++
 			s.modelPricesUpdatedAt = time.Time{}
 			s.priceStorageLastError = ""
 			return
@@ -3239,8 +3212,6 @@ func (s *RequestStatistics) loadModelPricesLocked() {
 	s.priceStoragePath = path
 	s.priceStorageLoadedPath = abs
 	s.modelPrices = prices
-	s.modelPriceIndex = normalizedModelPriceIndex(prices)
-	s.priceVersion++
 	s.modelPricesUpdatedAt = parseRFC3339OrZero(persisted.UpdatedAt)
 	s.priceStorageLastError = ""
 }
@@ -3317,16 +3288,6 @@ func copyModelPrices(source map[string]ModelPrice) map[string]ModelPrice {
 	return copy
 }
 
-func normalizedModelPriceIndex(source map[string]ModelPrice) map[string]ModelPrice {
-	index := make(map[string]ModelPrice, len(source))
-	for model, price := range source {
-		if key := normalizeModelPriceKey(model); key != "" {
-			index[key] = price
-		}
-	}
-	return index
-}
-
 func normalizeModelPriceKey(model string) string {
 	return strings.ToLower(strings.TrimSpace(model))
 }
@@ -3370,108 +3331,6 @@ func (s *RequestStatistics) ModelPrices() ModelPricesResponse {
 	return s.modelPricesResponseLocked()
 }
 
-func (s *RequestStatistics) QueryModelPrices(scope, query string, limit, offset int) ModelPricesResponse {
-	if s == nil {
-		return ModelPricesResponse{Prices: map[string]ModelPrice{}, ManualPrices: map[string]ModelPrice{}}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.loadModelPricesLocked()
-	response := s.modelPricesResponseLocked()
-	// The used-price representation depends on modelSummaryStats, which is
-	// versioned by summaryVersion. Capture both under the same lock so the
-	// response body and its conditional-request validator describe one snapshot.
-	response.dashboardVersion = s.summaryVersion
-	scope = strings.ToLower(strings.TrimSpace(scope))
-	query = normalizeModelPriceKey(query)
-	if scope == "" && query == "" && limit <= 0 && offset <= 0 {
-		response.Total = len(response.Prices)
-		return response
-	}
-	source := response.Prices
-	if scope == "used" {
-		source = s.usedModelPricesLocked(response.Prices)
-	}
-	if scope == "manual" {
-		source = response.ManualPrices
-	}
-	keys := make([]string, 0, len(source))
-	for key := range source {
-		if query == "" || strings.Contains(normalizeModelPriceKey(key), query) {
-			keys = append(keys, key)
-		}
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		return normalizeModelPriceKey(keys[i]) < normalizeModelPriceKey(keys[j])
-	})
-	response.Total = len(keys)
-	if (scope == "used" || scope == "manual") && query == "" {
-		response.Prices = copyModelPrices(source)
-		response.Limit = len(source)
-		response.Offset = 0
-		return response
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > len(keys) {
-		offset = len(keys)
-	}
-	if limit <= 0 || limit > 100 {
-		limit = 100
-	}
-	end := offset + limit
-	if end > len(keys) {
-		end = len(keys)
-	}
-	response.Prices = make(map[string]ModelPrice, end-offset)
-	for _, key := range keys[offset:end] {
-		response.Prices[key] = source[key]
-	}
-	response.Limit = limit
-	response.Offset = offset
-	return response
-}
-
-func (s *RequestStatistics) usedModelPricesLocked(effective map[string]ModelPrice) map[string]ModelPrice {
-	used := make(map[string]ModelPrice)
-	if s == nil || len(effective) == 0 {
-		return used
-	}
-	index := normalizedModelPriceIndex(effective)
-	displayKeys := make(map[string]string, len(effective))
-	for key := range effective {
-		displayKeys[normalizeModelPriceKey(key)] = key
-	}
-	add := func(model, provider string) {
-		for _, candidate := range modelPriceLookupKeys(model, provider) {
-			norm := normalizeModelPriceKey(candidate)
-			price, ok := index[norm]
-			if !ok {
-				continue
-			}
-			key := displayKeys[norm]
-			if key == "" {
-				key = candidate
-			}
-			used[key] = price
-			return
-		}
-	}
-	for modelName, model := range s.modelSummaryStats {
-		if model == nil || len(model.providerStats) == 0 {
-			add(modelName, "")
-			continue
-		}
-		for _, provider := range model.providerStats {
-			if provider != nil {
-				add(modelName, provider.Provider)
-			}
-		}
-	}
-	return used
-}
-
 func (s *RequestStatistics) modelsDevPriceStatusLocked() ModelsDevPriceStatus {
 	status := ModelsDevPriceStatus{
 		Enabled:        s.modelsDevPricesEnabled,
@@ -3511,12 +3370,10 @@ func (s *RequestStatistics) UpsertModelPrice(model string, price ModelPrice) (Mo
 		s.modelPrices = make(map[string]ModelPrice)
 	}
 	setModelPriceCaseInsensitive(s.modelPrices, model, price)
-	s.modelPriceIndex = normalizedModelPriceIndex(s.modelPrices)
 	if err := s.saveModelPricesLocked(); err != nil {
 		return ModelPricesResponse{}, err
 	}
 	s.rebuildCostSeriesLocked()
-	s.priceVersion++
 	s.invalidateSummaryLocked()
 	return s.modelPricesResponseLocked(), nil
 }
@@ -3536,12 +3393,10 @@ func (s *RequestStatistics) DeleteModelPrice(model string) (ModelPricesResponse,
 		s.modelPrices = make(map[string]ModelPrice)
 	}
 	deleteModelPriceCaseInsensitive(s.modelPrices, model)
-	s.modelPriceIndex = normalizedModelPriceIndex(s.modelPrices)
 	if err := s.saveModelPricesLocked(); err != nil {
 		return ModelPricesResponse{}, err
 	}
 	s.rebuildCostSeriesLocked()
-	s.priceVersion++
 	s.invalidateSummaryLocked()
 	return s.modelPricesResponseLocked(), nil
 }
@@ -3556,7 +3411,6 @@ func (s *RequestStatistics) modelPricesResponseLocked() ModelPricesResponse {
 			LastError:  s.priceStorageLastError,
 		},
 		ModelsDev: s.modelsDevPriceStatusLocked(),
-		Version:   s.priceVersion,
 	}
 	if !s.modelPricesUpdatedAt.IsZero() {
 		response.UpdatedAt = s.modelPricesUpdatedAt.UTC().Format(time.RFC3339)
@@ -4375,13 +4229,6 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, persist bool, now time.Time) (MergeResult, []persistedDetail) {
 	result := MergeResult{}
 	var persisted []persistedDetail
-	var reconciledProtocolFallbacks int
-	snapshot, reconciledProtocolFallbacks = reconcileProtocolFallbackSnapshot(snapshot)
-	result.Skipped += int64(reconciledProtocolFallbacks)
-	s.reconcileRecordedProtocolFallbacksLocked(now)
-	resolver := s.upstreamRouteResolverLocked()
-	snapshot, _ = reconcileUpstreamAttributionSnapshot(snapshot, resolver)
-	s.reconcileRecordedUpstreamAttributionsWithResolverLocked(now, resolver)
 	var cutoff time.Time
 	if s.retention > 0 {
 		cutoff = now.Add(-s.retention)
@@ -4454,11 +4301,6 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, per
 	}
 
 	s.pruneLocked(now, true)
-	reconciledRecorded := s.reconcileRecordedProtocolFallbacksLocked(now)
-	if reconciledRecorded > 0 {
-		result.Skipped += int64(reconciledRecorded)
-		result.Added = maxInt64(result.Added-int64(reconciledRecorded), 0)
-	}
 	s.rebuildSeenLocked(now)
 	return result, persisted
 }
@@ -4604,113 +4446,22 @@ func (s *RequestStatistics) timeSeriesTokenCostLocked(stat TimeSeriesTokenStat) 
 		float64(cacheWriteTokens)/1e6*price.CacheWrite
 }
 
-func (s *RequestStatistics) aggregateEstimatedCostLocked(model string, totalTokens, inputTokens, outputTokens, cachedTokens, cacheWriteTokens int64, providers []ModelProviderStat) float64 {
-	if len(providers) == 0 {
-		return s.timeSeriesTokenCostLocked(TimeSeriesTokenStat{
-			Model:            model,
-			TotalTokens:      totalTokens,
-			InputTokens:      inputTokens,
-			OutputTokens:     outputTokens,
-			CachedTokens:     cachedTokens,
-			CacheWriteTokens: cacheWriteTokens,
-		})
-	}
-	var cost float64
-	for _, provider := range providers {
-		cost += s.timeSeriesTokenCostLocked(TimeSeriesTokenStat{
-			Model:            model,
-			Provider:         provider.Provider,
-			TotalTokens:      provider.TotalTokens,
-			InputTokens:      provider.InputTokens,
-			OutputTokens:     provider.OutputTokens,
-			CachedTokens:     provider.CachedTokens,
-			CacheWriteTokens: provider.CacheWriteTokens,
-		})
-	}
-	return cost
-}
-
-func (s *RequestStatistics) applySummaryEstimatedCostsLocked(summary *DashboardSummary) {
-	if s == nil || summary == nil {
-		return
-	}
-	summary.Usage.TotalCost = 0
-	for i := range summary.ModelStats {
-		model := &summary.ModelStats[i]
-		model.EstimatedCost = s.aggregateEstimatedCostLocked(model.Model, model.TotalTokens, model.InputTokens, model.OutputTokens, model.CachedTokens, model.CacheWriteTokens, model.Providers)
-		summary.Usage.TotalCost += model.EstimatedCost
-	}
-	for apiName, api := range summary.Usage.APIs {
-		api.EstimatedCost = 0
-		for modelName, model := range api.Models {
-			model.EstimatedCost = s.aggregateEstimatedCostLocked(modelName, model.TotalTokens, model.InputTokens, model.OutputTokens, model.CachedTokens, model.CacheWriteTokens, model.Providers)
-			api.EstimatedCost += model.EstimatedCost
-			api.Models[modelName] = model
-		}
-		summary.Usage.APIs[apiName] = api
-	}
-	for i := range summary.ClientAPIStats {
-		client := &summary.ClientAPIStats[i]
-		client.EstimatedCost = 0
-		for j := range client.Models {
-			model := &client.Models[j]
-			model.EstimatedCost = s.aggregateEstimatedCostLocked(model.Model, model.TotalTokens, model.InputTokens, model.OutputTokens, model.CachedTokens, model.CacheWriteTokens, model.Providers)
-			client.EstimatedCost += model.EstimatedCost
-		}
-	}
-}
-
-func (s *RequestStatistics) applyModelEstimatedCostsLocked(models []ModelStat) float64 {
-	var total float64
-	for i := range models {
-		model := &models[i]
-		model.EstimatedCost = s.aggregateEstimatedCostLocked(model.Model, model.TotalTokens, model.InputTokens, model.OutputTokens, model.CachedTokens, model.CacheWriteTokens, model.Providers)
-		total += model.EstimatedCost
-	}
-	return total
-}
-
 func (s *RequestStatistics) priceForDetailLocked(modelName, provider string) (ModelPrice, bool) {
 	provider = strings.TrimSpace(provider)
 	modelName = strings.TrimSpace(modelName)
-	if len(s.modelPriceIndex) != len(s.modelPrices) {
-		s.modelPriceIndex = normalizedModelPriceIndex(s.modelPrices)
-	}
-	if len(s.modelsDevPriceIndex) != len(s.modelsDevPrices) {
-		s.modelsDevPriceIndex = normalizedModelPriceIndex(s.modelsDevPrices)
-	}
-	if price, ok := priceForDetailFromIndex(s.modelPriceIndex, modelName, provider); ok {
+	if price, ok := priceForDetailFromMap(s.modelPrices, modelName, provider); ok {
 		return price, true
 	}
-	return priceForDetailFromIndex(s.modelsDevPriceIndex, modelName, provider)
+	return priceForDetailFromMap(s.modelsDevPrices, modelName, provider)
 }
 
-func priceForDetailFromIndex(prices map[string]ModelPrice, modelName, provider string) (ModelPrice, bool) {
-	modelName = normalizeModelPriceKey(modelName)
-	provider = normalizeModelPriceKey(provider)
-	if modelName == "" || len(prices) == 0 {
-		return ModelPrice{}, false
-	}
-	if provider != "" {
-		if price, ok := prices[provider+"/"+modelName]; ok {
-			return price, true
-		}
-	}
-	if price, ok := prices[modelName]; ok {
-		return price, true
-	}
-	if idx := strings.IndexByte(modelName, '/'); idx > 0 && idx < len(modelName)-1 {
-		if price, ok := prices[modelName[idx+1:]]; ok {
+func priceForDetailFromMap(prices map[string]ModelPrice, modelName, provider string) (ModelPrice, bool) {
+	for _, key := range modelPriceLookupKeys(modelName, provider) {
+		if price, ok := modelPriceCaseInsensitive(prices, key); ok {
 			return price, true
 		}
 	}
 	return ModelPrice{}, false
-}
-
-// priceForDetailFromMap is kept for callers that provide an ad-hoc display
-// map. Runtime cost aggregation uses the prebuilt normalized indexes above.
-func priceForDetailFromMap(prices map[string]ModelPrice, modelName, provider string) (ModelPrice, bool) {
-	return priceForDetailFromIndex(normalizedModelPriceIndex(prices), modelName, provider)
 }
 
 func modelPriceLookupKeys(modelName, provider string) []string {
@@ -5031,11 +4782,6 @@ func cloneDashboardSummary(summary DashboardSummary) DashboardSummary {
 	cloned := summary
 	cloned.Usage = cloneStatisticsSnapshotWithoutDetails(summary.Usage)
 	cloned.HealthGrid = append([]HealthGridSlot(nil), summary.HealthGrid...)
-	if summary.HealthGridV2 != nil {
-		grid := *summary.HealthGridV2
-		grid.Slots = append([][3]int64(nil), summary.HealthGridV2.Slots...)
-		cloned.HealthGridV2 = &grid
-	}
 	cloned.SourceStats = append([]SourceStat(nil), summary.SourceStats...)
 	cloned.CredentialStats = append([]CredentialStat(nil), summary.CredentialStats...)
 	cloned.ClientAPIStats = make([]ClientAPIStat, len(summary.ClientAPIStats))
@@ -5302,7 +5048,6 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 	summary.Meta.CurrentHour = now.Hour()
 	summary.Meta.EvictedTotal = s.evictedTotal
 	summary.Meta.SummaryVersion = s.summaryVersion
-	summary.Meta.PriceVersion = s.priceVersion
 	summary.Meta.Storage = s.storageStatusLocked()
 	if !s.lastRecordedAt.IsZero() {
 		summary.Meta.LastRecordedAt = s.lastRecordedAt.UTC().Format(time.RFC3339)
@@ -5315,7 +5060,6 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 		}
 	}
 
-	s.applySummaryEstimatedCostsLocked(&summary)
 	summary.GeneratedAt = now.UTC().Format(time.RFC3339)
 	return summary
 }
@@ -5330,18 +5074,18 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	var totalTokens, inputTokens, outputTokens, cachedTokens, cacheWriteTokens, reasoningTokens int64
 	var latencySum, latencyN int64
 
-	requestsByDay := make(map[summaryDayKey]int64)
+	requestsByDay := make(map[string]int64)
 	requestsByHour := make(map[int]int64)
-	tokensByDay := make(map[summaryDayKey]int64)
+	tokensByDay := make(map[string]int64)
 	tokensByHour := make(map[int]int64)
-	costByDay := make(map[summaryDayKey]float64)
+	costByDay := make(map[string]float64)
 	costByHour := make(map[int]float64)
 
 	// Dimension aggregators
 	modelAgg := make(map[string]*ModelStat)
 	sourceAgg := make(map[string]*sourceStatAccumulator)
 	credentialAgg := make(map[string]*CredentialStat)
-	clientAPIAgg := make(map[clientAPIGroupIdentity]*clientAPIStatAccumulator)
+	clientAPIAgg := make(map[string]*clientAPIStatAccumulator)
 	apiAgg := make(map[string]*apiRangeAgg)
 
 	for apiName, apiSt := range s.apis {
@@ -5381,7 +5125,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 				}
 
 				// Day/hour time series
-				dayKey := newSummaryDayKey(detail.Timestamp)
+				dayKey := detail.Timestamp.Format("2006-01-02")
 				hourKey := detail.Timestamp.Hour()
 				cost := s.detailCostLocked(modelName, detail, totals)
 				requestsByDay[dayKey]++
@@ -5472,7 +5216,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 				cred.TotalTokens += totals.totalTokens
 
 				// Client API stats
-				clientKey := clientAPIIdentity(detail)
+				clientKey := clientAPIGroupKey(detail)
 				client, ok := clientAPIAgg[clientKey]
 				if !ok {
 					client = &clientAPIStatAccumulator{
@@ -5582,9 +5326,9 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	})
 
 	// Build client API stats
-	summary.ClientAPIStats = clientAPIStatsFromIdentityAccumulators(clientAPIAgg)
+	summary.ClientAPIStats = clientAPIStatsFromAccumulators(clientAPIAgg)
 
-	// Build health grid from pre-aggregated health buckets (always 7-day window, not scoped by range).
+	// Build health grid from pre-aggregated health buckets (always 5-day window, not scoped by range).
 	healthStart := healthWindow.Add(-dashboardHealthSlotCount * dashboardHealthStep)
 	summary.HealthGrid = make([]HealthGridSlot, dashboardHealthSlotCount)
 	for i := 0; i < dashboardHealthSlotCount; i++ {
@@ -5603,7 +5347,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	// Time series
 	summary.Usage.RequestsByDay = make(map[string]int64, len(requestsByDay))
 	for k, v := range requestsByDay {
-		summary.Usage.RequestsByDay[k.String()] = v
+		summary.Usage.RequestsByDay[k] = v
 	}
 	summary.Usage.RequestsByHour = make(map[string]int64, 24)
 	for hour, v := range requestsByHour {
@@ -5613,7 +5357,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	}
 	summary.Usage.TokensByDay = make(map[string]int64, len(tokensByDay))
 	for k, v := range tokensByDay {
-		summary.Usage.TokensByDay[k.String()] = v
+		summary.Usage.TokensByDay[k] = v
 	}
 	summary.Usage.TokensByHour = make(map[string]int64, 24)
 	for hour, v := range tokensByHour {
@@ -5623,7 +5367,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	}
 	summary.Usage.CostByDay = make(map[string]float64, len(costByDay))
 	for k, v := range costByDay {
-		summary.Usage.CostByDay[k.String()] = v
+		summary.Usage.CostByDay[k] = v
 	}
 	summary.Usage.CostByHour = make(map[string]float64, 24)
 	for hour, v := range costByHour {
@@ -5639,7 +5383,6 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	summary.Meta.CurrentHour = now.Hour()
 	summary.Meta.EvictedTotal = s.evictedTotal
 	summary.Meta.SummaryVersion = s.summaryVersion
-	summary.Meta.PriceVersion = s.priceVersion
 	summary.Meta.Storage = s.storageStatusLocked()
 	if !s.lastRecordedAt.IsZero() {
 		summary.Meta.LastRecordedAt = s.lastRecordedAt.UTC().Format(time.RFC3339)
@@ -5652,7 +5395,6 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 		}
 	}
 
-	s.applySummaryEstimatedCostsLocked(&summary)
 	summary.GeneratedAt = now.UTC().Format(time.RFC3339)
 	return summary
 }
@@ -5687,21 +5429,6 @@ type modelRangeAgg struct {
 	latencySum       int64
 	latencyN         int64
 	providerStats    map[string]*ModelProviderStat
-}
-
-type summaryDayKey struct {
-	year  int
-	month time.Month
-	day   int
-}
-
-func newSummaryDayKey(value time.Time) summaryDayKey {
-	year, month, day := value.Date()
-	return summaryDayKey{year: year, month: month, day: day}
-}
-
-func (key summaryDayKey) String() string {
-	return fmt.Sprintf("%04d-%02d-%02d", key.year, key.month, key.day)
 }
 
 func getOrCreateAPIRangeAgg(apiAgg map[string]*apiRangeAgg, apiName string) *apiRangeAgg {
@@ -5786,35 +5513,7 @@ func clientAPIGroupKey(detail RequestDetail) string {
 	return "(unknown)"
 }
 
-type clientAPIGroupIdentity struct {
-	hash  string
-	label string
-}
-
-func clientAPIIdentity(detail RequestDetail) clientAPIGroupIdentity {
-	if hash := strings.TrimSpace(detail.APIKeyHash); hash != "" {
-		return clientAPIGroupIdentity{hash: hash}
-	}
-	return clientAPIGroupIdentity{label: strings.TrimSpace(detail.APIKey)}
-}
-
 func clientAPIStatsFromAccumulators(accumulators map[string]*clientAPIStatAccumulator) []ClientAPIStat {
-	values := make([]*clientAPIStatAccumulator, 0, len(accumulators))
-	for _, accumulator := range accumulators {
-		values = append(values, accumulator)
-	}
-	return clientAPIStatsFromAccumulatorValues(values)
-}
-
-func clientAPIStatsFromIdentityAccumulators(accumulators map[clientAPIGroupIdentity]*clientAPIStatAccumulator) []ClientAPIStat {
-	values := make([]*clientAPIStatAccumulator, 0, len(accumulators))
-	for _, accumulator := range accumulators {
-		values = append(values, accumulator)
-	}
-	return clientAPIStatsFromAccumulatorValues(values)
-}
-
-func clientAPIStatsFromAccumulatorValues(accumulators []*clientAPIStatAccumulator) []ClientAPIStat {
 	stats := make([]ClientAPIStat, 0, len(accumulators))
 	for _, agg := range accumulators {
 		if agg == nil {
@@ -5842,20 +5541,23 @@ func clientAPIStatsFromAccumulatorValues(accumulators []*clientAPIStatAccumulato
 func clientAPISelectorForStat(stat ClientAPIStat) string {
 	label := strings.TrimSpace(stat.APIKey)
 	hash := strings.TrimSpace(stat.APIKeyHash)
-	encodedLabel := base64.RawURLEncoding.EncodeToString([]byte(label))
 	if hash != "" {
-		return "h." + hash + "." + encodedLabel
+		if label == "" || label == "未知 API" {
+			return "h." + hash
+		}
+		labelHash := hashAPIKey(label)
+		return "h." + hash + "." + labelHash
 	}
 	if label == "" || label == "未知 API" {
 		return "u"
 	}
-	return "m." + encodedLabel
+	return "m." + hashAPIKey(label)
 }
 
 type clientAPISelector struct {
-	kind  byte
-	hash  string
-	label string
+	kind      byte
+	hash      string
+	labelHash string
 }
 
 func parseClientAPISelector(value string) (clientAPISelector, bool) {
@@ -5865,19 +5567,26 @@ func parseClientAPISelector(value string) (clientAPISelector, bool) {
 	}
 	parts := strings.Split(value, ".")
 	if len(parts) == 2 && parts[0] == "m" {
-		label, err := base64.RawURLEncoding.DecodeString(parts[1])
-		if err != nil || strings.TrimSpace(string(label)) == "" {
+		labelHash := strings.TrimSpace(parts[1])
+		if !isStoredAPIKeyHashShape(labelHash) {
 			return clientAPISelector{}, false
 		}
-		return clientAPISelector{kind: 'm', label: strings.TrimSpace(string(label))}, true
+		return clientAPISelector{kind: 'm', labelHash: labelHash}, true
 	}
 	if len(parts) == 3 && parts[0] == "h" {
 		hash := strings.TrimSpace(parts[1])
-		label, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil || hash == "" || strings.TrimSpace(string(label)) == "" {
+		labelHash := strings.TrimSpace(parts[2])
+		if !isStoredAPIKeyHashShape(hash) || !isStoredAPIKeyHashShape(labelHash) {
 			return clientAPISelector{}, false
 		}
-		return clientAPISelector{kind: 'h', hash: hash, label: strings.TrimSpace(string(label))}, true
+		return clientAPISelector{kind: 'h', hash: hash, labelHash: labelHash}, true
+	}
+	if len(parts) == 2 && parts[0] == "h" {
+		hash := strings.TrimSpace(parts[1])
+		if !isStoredAPIKeyHashShape(hash) {
+			return clientAPISelector{}, false
+		}
+		return clientAPISelector{kind: 'h', hash: hash}, true
 	}
 	return clientAPISelector{}, false
 }
@@ -5896,9 +5605,9 @@ func clientAPISelectorMatchesDetail(value string, detail RequestDetail) bool {
 	case 'u':
 		return label == "" && hash == ""
 	case 'm':
-		return label == selector.label
+		return hashAPIKey(label) == selector.labelHash
 	case 'h':
-		return hash == selector.hash || hash == "" && label == selector.label
+		return hash == selector.hash || selector.labelHash != "" && hash == "" && hashAPIKey(label) == selector.labelHash
 	default:
 		return false
 	}
@@ -6110,11 +5819,13 @@ func normalizeImportedClientAPIIdentity(detail RequestDetail) RequestDetail {
 		hash = hashAPIKey(label)
 		label = maskAPIKey(label)
 	}
-	// Imported exports may carry hashes generated with a different instance's
-	// salt. For already-masked labels, keep the documented cross-instance merge
-	// behavior by grouping on the masked display value instead.
+	// New exports preserve a valid opaque hash because their one-character
+	// labels no longer contain enough information to keep distinct keys apart.
+	// Legacy masks retain the historical cross-instance merge behavior.
 	if alreadyMasked {
-		hash = ""
+		if !isFirstCharacterAPIKeyMask(label) || !isStoredAPIKeyHashShape(hash) {
+			hash = ""
+		}
 	}
 	detail.APIKey = label
 	detail.APIKeyHash = hash
@@ -6933,7 +6644,6 @@ func (s *RequestStatistics) QueryAPIDetailForClientAPIAt(api string, rangeKey st
 	generatedAt := s.dashboardQueryGeneratedAtLocked(rangeKey, now).UTC().Format(time.RFC3339)
 	result.GeneratedAt = generatedAt
 	finish := func(result APIDetailResponse) APIDetailResponse {
-		result.Summary.EstimatedCost = s.applyModelEstimatedCostsLocked(result.ModelStats)
 		result.dashboardVersion = s.summaryVersion
 		s.apiDetailQueries++
 		s.lastAPIDetailDuration = time.Since(startedAt)

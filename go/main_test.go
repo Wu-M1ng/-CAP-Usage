@@ -336,7 +336,7 @@ func TestResponseInterceptFallbackRecordsOpenAIUsage(t *testing.T) {
 	if summary.Usage.TotalRequests != 1 || summary.Usage.TotalTokens != 104 {
 		t.Fatalf("summary usage = %#v, want one 104-token fallback record", summary.Usage)
 	}
-	if len(summary.ClientAPIStats) != 1 || summary.ClientAPIStats[0].APIKey != "sk******xx" {
+	if len(summary.ClientAPIStats) != 1 || summary.ClientAPIStats[0].APIKey != "s******" {
 		t.Fatalf("client api stats = %#v, want masked CPA key", summary.ClientAPIStats)
 	}
 	api, ok := summary.Usage.APIs["openai-compatible"]
@@ -464,7 +464,7 @@ func TestResponseStreamChunkRecordsDeepSeekViaClaudeCode(t *testing.T) {
 	if _, ok := summary.Usage.APIs["openai-compatible-opencode-go"]; !ok {
 		t.Fatalf("summary APIs = %#v, want OpenAI-compatible grouping from selected_auth_id, not claude", summary.Usage.APIs)
 	}
-	if len(summary.ClientAPIStats) != 1 || summary.ClientAPIStats[0].APIKey != "sk******wj" {
+	if len(summary.ClientAPIStats) != 1 || summary.ClientAPIStats[0].APIKey != "s******" {
 		t.Fatalf("client api stats = %#v, want masked Claude Code CPA key", summary.ClientAPIStats)
 	}
 	if len(summary.CredentialStats) != 1 || summary.CredentialStats[0].AuthIndex != "f85c45252fee" {
@@ -1134,7 +1134,7 @@ func TestResponseStreamChunkDoesNotDoubleCountNativeCodexUsage(t *testing.T) {
 		stats = previousStats
 	})
 
-	authID := "codex-hide-my-email@privaterelay.example.com-plus.json"
+	authID := "codex-xpspwc9mfb@privaterelay.appleid.com-plus.json"
 	streamReq := ResponseStreamChunkRequest{
 		ResponseInterceptRequest: ResponseInterceptRequest{
 			SourceFormat:   "openai",
@@ -1174,7 +1174,7 @@ func TestResponseStreamChunkDoesNotDoubleCountNativeCodexUsage(t *testing.T) {
 		AuthID:          authID,
 		AuthIndex:       "a2f9cd186fd7dee9",
 		AuthType:        "oauth",
-		Source:          "hide-my-email@privaterelay.example.com",
+		Source:          "xpspwc9mfb@privaterelay.appleid.com",
 		ReasoningEffort: "high",
 		RequestedAt:     time.Now(),
 		Latency:         5062 * time.Millisecond,
@@ -1201,7 +1201,7 @@ func TestResponseStreamChunkDoesNotDoubleCountNativeCodexUsage(t *testing.T) {
 	if _, ok := summary.Usage.APIs["openai-compatible"]; ok {
 		t.Fatalf("summary APIs = %#v, did not expect fallback openai-compatible record", summary.Usage.APIs)
 	}
-	if _, ok := summary.Usage.APIs["codex · hide-my-email@privaterelay.example.com"]; !ok {
+	if _, ok := summary.Usage.APIs["codex · xpspwc9mfb@privaterelay.appleid.com"]; !ok {
 		t.Fatalf("summary APIs = %#v, want native Codex API key", summary.Usage.APIs)
 	}
 }
@@ -1898,7 +1898,7 @@ func TestRecordStoresMaskedClientAPIKeyAndCleanSource(t *testing.T) {
 	if detail.Source != "openai-compatible-example" {
 		t.Fatalf("detail source = %q, want clean source", detail.Source)
 	}
-	if detail.APIKey != "sk******xx" {
+	if detail.APIKey != "s******" {
 		t.Fatalf("detail api key = %q, want masked key", detail.APIKey)
 	}
 	if detail.AuthIndex != "1111222233334444" {
@@ -3146,7 +3146,7 @@ func TestRecordCanonicalizesBearerClientAPIKeyForAggregation(t *testing.T) {
 		t.Fatalf("client api stats = %#v, want one canonical API key group", summary.ClientAPIStats)
 	}
 	got := summary.ClientAPIStats[0]
-	if got.APIKey != "sk******wj" || got.APIKeyHash == "" || got.TotalRequests != 3 || got.TotalTokens != 39 {
+	if got.APIKey != "s******" || got.APIKeyHash == "" || got.TotalRequests != 3 || got.TotalTokens != 39 {
 		t.Fatalf("client api stat = %#v, want canonicalized bearer/raw API key totals", got)
 	}
 	if len(got.Models) != 1 || got.Models[0].Model != "deepseek-chat" || got.Models[0].TotalRequests != 3 {
@@ -4392,71 +4392,6 @@ func TestManagementModelPricesCRUDAndPersistence(t *testing.T) {
 	}
 }
 
-func TestManagementUsedModelPricesETagTracksAtomicUsageSnapshot(t *testing.T) {
-	previousStats := stats
-	stats = NewRequestStatistics()
-	stats.Configure(runtimeConfig{
-		PriceStoragePath:   filepath.Join(t.TempDir(), "prices.json"),
-		DedupWindowMinutes: 0,
-	})
-	t.Cleanup(func() { stats = previousStats })
-
-	stats.mu.Lock()
-	stats.modelPrices = map[string]ModelPrice{
-		"openai/gpt-4.1": {Prompt: 1, Completion: 2},
-		"openai/gpt-5":   {Prompt: 3, Completion: 4},
-	}
-	stats.modelPriceIndex = normalizedModelPriceIndex(stats.modelPrices)
-	stats.priceVersion++
-	stats.mu.Unlock()
-
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-4.1",
-		RequestedAt: time.Now(),
-		Detail:      UsageDetail{TotalTokens: 1},
-	})
-	request := ManagementRequest{
-		Method: "GET",
-		Path:   "/v0/management/plugins/usage-dashboard-zduu/model-prices",
-		// Scope matching is case-insensitive, so the ETag dependency must be too.
-		Query: map[string][]string{"scope": {"USED"}},
-	}
-	first := decodeManagementResponse(t, invokeManagement(t, request), nil)
-	var firstData ModelPricesResponse
-	if err := json.Unmarshal(first.Body, &firstData); err != nil {
-		t.Fatalf("unmarshal first used prices: %v", err)
-	}
-	if _, ok := firstData.Prices["openai/gpt-4.1"]; !ok {
-		t.Fatalf("first used prices = %#v", firstData.Prices)
-	}
-	if len(first.Headers["ETag"]) != 1 || first.Headers["ETag"][0] == "" {
-		t.Fatalf("first used-price ETag = %#v", first.Headers["ETag"])
-	}
-
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-5",
-		RequestedAt: time.Now().Add(time.Millisecond),
-		Detail:      UsageDetail{TotalTokens: 1},
-	})
-	request.Headers = map[string][]string{"If-None-Match": {first.Headers["ETag"][0]}}
-	second := decodeManagementResponse(t, invokeManagement(t, request), nil)
-	if second.StatusCode != http.StatusOK {
-		t.Fatalf("changed used-price response status = %d, want 200", second.StatusCode)
-	}
-	var secondData ModelPricesResponse
-	if err := json.Unmarshal(second.Body, &secondData); err != nil {
-		t.Fatalf("unmarshal second used prices: %v", err)
-	}
-	if _, ok := secondData.Prices["openai/gpt-5"]; !ok {
-		t.Fatalf("updated used prices missing gpt-5: %#v", secondData.Prices)
-	}
-	if len(second.Headers["ETag"]) != 1 || second.Headers["ETag"][0] == first.Headers["ETag"][0] {
-		t.Fatalf("used-price ETag did not change: first=%#v second=%#v", first.Headers["ETag"], second.Headers["ETag"])
-	}
-}
-
 func TestModelPricesUseModelsDevDefaultsWithManualOverride(t *testing.T) {
 	previousStats := stats
 	pricePath := filepath.Join(t.TempDir(), "prices.json")
@@ -5171,86 +5106,20 @@ func TestModelPriceDefaultsMissingCacheWriteForLegacyJSON(t *testing.T) {
 
 func TestDashboardMarkupContainsHealthRowsApiSelectorAndBackoff(t *testing.T) {
 	checks := map[string]string{
-		"health grid seven rows":       "grid-template-rows:repeat(7,12px)",
-		"health grid column style":     "healthCellStyle",
-		"health grid column order":     "healthColor(rate)",
-		"upstream api selector":        `id="apiSelect"`,
-		"selector options are updated": "$('apiSelect').innerHTML",
-		"poll scheduler exists":        "function schedulePoll",
-		"failure backoff exists":       "function nextFailureDelay",
+		"health grid responsive columns": "grid-template-columns:repeat(96,minmax(2px,1fr))",
+		"health grid five rows":          "grid-template-rows:repeat(5,auto)",
+		"health grid square cells":       "aspect-ratio:1",
+		"health grid column style":       "healthCellStyle",
+		"health grid column order":       "healthColor(rate)",
+		"upstream api selector":          `id="apiSelect"`,
+		"selector options are updated":   "$('apiSelect').innerHTML",
+		"poll scheduler exists":          "function schedulePoll",
+		"failure backoff exists":         "function nextFailureDelay",
 	}
 	for name, needle := range checks {
 		if !strings.Contains(completeDashboardHTML, needle) {
 			t.Fatalf("%s: completeDashboardHTML missing %q", name, needle)
 		}
-	}
-}
-
-func TestDashboardPageSupportsGzipAndConditionalRequests(t *testing.T) {
-	gzipResp := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method:  "GET",
-		Path:    "/v0/management/plugins/usage-dashboard-zduu/dashboard",
-		Headers: map[string][]string{"Accept-Encoding": {"br, gzip"}},
-	}), nil)
-	if gzipResp.StatusCode != http.StatusOK || len(gzipResp.Headers["Content-Encoding"]) != 1 || gzipResp.Headers["Content-Encoding"][0] != "gzip" {
-		t.Fatalf("gzip dashboard response = status %d headers %#v", gzipResp.StatusCode, gzipResp.Headers)
-	}
-	reader, err := gzip.NewReader(bytes.NewReader(gzipResp.Body))
-	if err != nil {
-		t.Fatalf("open dashboard gzip: %v", err)
-	}
-	decompressed, err := io.ReadAll(reader)
-	if closeErr := reader.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatalf("read dashboard gzip: %v", err)
-	}
-	if string(decompressed) != completeDashboardHTML {
-		t.Fatal("decompressed dashboard does not match embedded HTML")
-	}
-	if len(gzipResp.Body) >= len(decompressed) {
-		t.Fatalf("gzip dashboard size = %d, raw = %d", len(gzipResp.Body), len(decompressed))
-	}
-	t.Logf("dashboard bytes: raw=%d gzip=%d", len(decompressed), len(gzipResp.Body))
-	etag := gzipResp.Headers["ETag"]
-	if len(etag) != 1 || etag[0] == "" {
-		t.Fatalf("dashboard ETag = %#v", etag)
-	}
-	notModified := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method: "GET",
-		Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard",
-		Headers: map[string][]string{
-			"Accept-Encoding": {"gzip"},
-			"If-None-Match":   {etag[0]},
-		},
-	}), nil)
-	if notModified.StatusCode != http.StatusNotModified || len(notModified.Body) != 0 {
-		t.Fatalf("conditional dashboard = status %d body %d", notModified.StatusCode, len(notModified.Body))
-	}
-	rawResp := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method:  "GET",
-		Path:    "/v0/management/plugins/usage-dashboard-zduu/dashboard",
-		Headers: map[string][]string{"Accept-Encoding": {"gzip;q=0"}},
-	}), nil)
-	if len(rawResp.Headers["Content-Encoding"]) != 0 || string(rawResp.Body) != completeDashboardHTML {
-		t.Fatalf("identity dashboard response = headers %#v body %d", rawResp.Headers, len(rawResp.Body))
-	}
-	explicitDisabled := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method:  "GET",
-		Path:    "/v0/management/plugins/usage-dashboard-zduu/dashboard",
-		Headers: map[string][]string{"Accept-Encoding": {"gzip;q=0.0, *;q=1"}},
-	}), nil)
-	if len(explicitDisabled.Headers["Content-Encoding"]) != 0 {
-		t.Fatalf("explicit gzip exclusion ignored: %#v", explicitDisabled.Headers)
-	}
-	uppercaseQuality := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
-		Method:  "GET",
-		Path:    "/v0/management/plugins/usage-dashboard-zduu/dashboard",
-		Headers: map[string][]string{"Accept-Encoding": {"gzip;Q=0"}},
-	}), nil)
-	if len(uppercaseQuality.Headers["Content-Encoding"]) != 0 {
-		t.Fatalf("case-insensitive gzip exclusion ignored: %#v", uppercaseQuality.Headers)
 	}
 }
 
@@ -5649,237 +5518,6 @@ func TestUsageGroupKey_DifferentiatesSameProviderChannels(t *testing.T) {
 	}
 	if k2 != "codex · user-a@example.invalid" {
 		t.Fatalf("second key = %q, want source without credential label", k2)
-	}
-}
-
-func TestUsageGroupKeyRecoversCodexOAuthEmailWhenSourceFallsBackToProvider(t *testing.T) {
-	authID := "codex-deadbeef-hide-my-email@privaterelay.example.com-plus.json"
-	complete := UsageRecord{
-		Provider:  "codex",
-		Source:    "hide-my-email@privaterelay.example.com",
-		AuthID:    authID,
-		AuthIndex: "ba5eba11ba5eba11",
-		AuthType:  "oauth",
-	}
-	fallback := complete
-	fallback.Source = "codex"
-
-	want := "codex · hide-my-email@privaterelay.example.com"
-	if got := usageGroupKey(complete); got != want {
-		t.Fatalf("complete key = %q, want %q", got, want)
-	}
-	if got := usageGroupKey(fallback); got != want {
-		t.Fatalf("fallback key = %q, want %q", got, want)
-	}
-	if got := usageSource(fallback); got != "hide-my-email@privaterelay.example.com" {
-		t.Fatalf("fallback source = %q, want recovered OAuth email", got)
-	}
-}
-
-func TestUsageGroupKeyDoesNotOverrideStableCodexSourceOrAPIKeyIdentity(t *testing.T) {
-	authID := "codex-deadbeef-user@example.com-plus.json"
-	stableSource := UsageRecord{
-		Provider:  "codex",
-		Source:    "team-primary",
-		AuthID:    authID,
-		AuthIndex: "channel-a",
-		AuthType:  "oauth",
-	}
-	if got := usageGroupKey(stableSource); got != "codex · team-primary" {
-		t.Fatalf("stable source key = %q, want explicit source preserved", got)
-	}
-
-	apiKey := stableSource
-	apiKey.Source = "codex"
-	apiKey.AuthType = "apikey"
-	if got := usageGroupKey(apiKey); got != "codex · 上游 channel-a" {
-		t.Fatalf("API-key key = %q, want credential channel instead of OAuth filename email", got)
-	}
-}
-
-func TestCodexOAuthEmailFromAuthID(t *testing.T) {
-	tests := map[string]string{
-		"codex-deadbeef-user@example.com-plus.json":            "user@example.com",
-		"codex-user@example.com.json":                          "user@example.com",
-		"/auth/codex-deadbeef-user-name@example.com-team.json": "user-name@example.com",
-		"codex-user@example.com-team-plan.json":                "user@example.com",
-		"codex-user@example.foo-bar-plus.json":                 "user@example.foo-bar",
-		"codex-user@example.xn--fiqs8s-plus.json":              "user@example.xn--fiqs8s",
-		"codex:apikey:abcdef123456":                            "",
-		"claude-user@example.com.json":                         "",
-		"codex-not-an-email-plus.json":                         "",
-	}
-	for authID, want := range tests {
-		if got := codexOAuthEmailFromAuthID(authID); got != want {
-			t.Errorf("codexOAuthEmailFromAuthID(%q) = %q, want %q", authID, got, want)
-		}
-	}
-}
-
-func TestRecordMergesCodexOAuthProviderFallbackIntoEmailGroup(t *testing.T) {
-	stats := NewRequestStatistics()
-	stats.Configure(runtimeConfig{DedupWindowMinutes: 0})
-	authID := "codex-deadbeef-hide-my-email@privaterelay.example.com-plus.json"
-	base := UsageRecord{
-		Provider:    "codex",
-		Model:       "gpt-5.6-sol",
-		AuthID:      authID,
-		AuthIndex:   "ba5eba11ba5eba11",
-		AuthType:    "oauth",
-		RequestedAt: time.Date(2026, 7, 26, 12, 53, 16, 0, time.FixedZone("CST", 8*60*60)),
-		Detail:      UsageDetail{TotalTokens: 72_001},
-	}
-	complete := base
-	complete.Source = "hide-my-email@privaterelay.example.com"
-	fallback := base
-	fallback.Source = "codex"
-	fallback.RequestedAt = fallback.RequestedAt.Add(time.Minute)
-	fallback.Detail.TotalTokens = 223_842
-
-	stats.Record(complete)
-	stats.Record(fallback)
-
-	snapshot := stats.Snapshot()
-	wantAPI := "codex · hide-my-email@privaterelay.example.com"
-	if len(snapshot.APIs) != 1 {
-		t.Fatalf("snapshot APIs = %#v, want one stable Codex OAuth group", snapshot.APIs)
-	}
-	api := snapshot.APIs[wantAPI]
-	if api.TotalRequests != 2 || api.TotalTokens != 295_843 {
-		t.Fatalf("merged API = %#v, want two requests and 295843 tokens; all APIs=%#v", api, snapshot.APIs)
-	}
-	for _, detail := range api.Models["gpt-5.6-sol"].Details {
-		if detail.Source != "hide-my-email@privaterelay.example.com" {
-			t.Fatalf("detail source = %q, want recovered OAuth email", detail.Source)
-		}
-	}
-}
-
-func TestMergeSnapshotMergesCodexOAuthProviderFallbackIntoEmailGroup(t *testing.T) {
-	stats := NewRequestStatistics()
-	stats.Configure(runtimeConfig{RetentionDays: 0, DedupWindowMinutes: 0})
-	when := time.Date(2026, 7, 26, 12, 53, 16, 0, time.FixedZone("CST", 8*60*60))
-	authID := "codex-deadbeef-hide-my-email@privaterelay.example.com-plus.json"
-	detail := func(source string, timestamp time.Time, tokens int64) RequestDetail {
-		return RequestDetail{
-			Model:     "gpt-5.6-sol",
-			Timestamp: timestamp,
-			Source:    source,
-			Provider:  "codex",
-			AuthID:    authID,
-			AuthIndex: "ba5eba11ba5eba11",
-			AuthType:  "oauth",
-			Tokens:    TokenStats{TotalTokens: tokens},
-		}
-	}
-	snapshot := StatisticsSnapshot{
-		APIs: map[string]APISnapshot{
-			"codex · hide-my-email@privaterelay.example.com": {
-				Models: map[string]ModelSnapshot{
-					"gpt-5.6-sol": {Details: []RequestDetail{detail("hide-my-email@privaterelay.example.com", when, 72_001)}},
-				},
-			},
-			"codex · 上游 ba5eba11ba5eba11": {
-				Models: map[string]ModelSnapshot{
-					"gpt-5.6-sol": {Details: []RequestDetail{detail("codex", when.Add(time.Minute), 223_842)}},
-				},
-			},
-		},
-	}
-
-	result := stats.MergeSnapshot(snapshot)
-	if result.Added != 2 || result.Skipped != 0 {
-		t.Fatalf("merge result = %#v, want both distinct requests imported", result)
-	}
-	merged := stats.Snapshot()
-	wantAPI := "codex · hide-my-email@privaterelay.example.com"
-	if len(merged.APIs) != 1 {
-		t.Fatalf("snapshot APIs = %#v, want imported legacy groups merged", merged.APIs)
-	}
-	api := merged.APIs[wantAPI]
-	if api.TotalRequests != 2 || api.TotalTokens != 295_843 {
-		t.Fatalf("merged API = %#v, want two requests and 295843 tokens", api)
-	}
-}
-
-func TestStorageSnapshotRestoreMergesCodexOAuthProviderFallbackIntoEmailGroup(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "usage-statistics")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir storage dir: %v", err)
-	}
-	when := time.Date(2026, 7, 26, 12, 53, 16, 0, time.FixedZone("CST", 8*60*60))
-	authID := "codex-deadbeef-hide-my-email@privaterelay.example.com-plus.json"
-	detail := func(source string, timestamp time.Time, tokens int64) RequestDetail {
-		return RequestDetail{
-			Model:     "gpt-5.6-sol",
-			Timestamp: timestamp,
-			Source:    source,
-			Provider:  "codex",
-			AuthID:    authID,
-			AuthIndex: "ba5eba11ba5eba11",
-			AuthType:  "oauth",
-			Tokens:    TokenStats{TotalTokens: tokens},
-		}
-	}
-	payload := persistedStorageSnapshot{
-		Version:     currentStorageSnapshotVersion,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Usage: StatisticsSnapshot{
-			TotalRequests: 2,
-			SuccessCount:  2,
-			TotalTokens:   295_843,
-			APIs: map[string]APISnapshot{
-				"codex · hide-my-email@privaterelay.example.com": {
-					TotalRequests: 1,
-					SuccessCount:  1,
-					TotalTokens:   72_001,
-					Models: map[string]ModelSnapshot{
-						"gpt-5.6-sol": {
-							TotalRequests: 1, SuccessCount: 1, TotalTokens: 72_001,
-							Details: []RequestDetail{detail("hide-my-email@privaterelay.example.com", when, 72_001)},
-						},
-					},
-				},
-				"codex · 上游 ba5eba11ba5eba11": {
-					TotalRequests: 1,
-					SuccessCount:  1,
-					TotalTokens:   223_842,
-					Models: map[string]ModelSnapshot{
-						"gpt-5.6-sol": {
-							TotalRequests: 1, SuccessCount: 1, TotalTokens: 223_842,
-							Details: []RequestDetail{detail("codex", when.Add(time.Minute), 223_842)},
-						},
-					},
-				},
-			},
-			RequestsByDay:  map[string]int64{when.Format("2006-01-02"): 2},
-			RequestsByHour: map[string]int64{hourKeys[when.Hour()]: 2},
-			TokensByDay:    map[string]int64{when.Format("2006-01-02"): 295_843},
-			TokensByHour:   map[string]int64{hourKeys[when.Hour()]: 295_843},
-		},
-	}
-	if err := os.WriteFile(storageSnapshotPath(dir), mustMarshal(payload), 0o600); err != nil {
-		t.Fatalf("write storage snapshot: %v", err)
-	}
-
-	stats := NewRequestStatistics()
-	stats.Configure(runtimeConfig{
-		MaxDetailsPerModel: 100,
-		RetentionDays:      0,
-		DedupWindowMinutes: 0,
-		StorageEnabled:     true,
-		StoragePath:        dir,
-	})
-	defer stats.Close()
-
-	snapshot := stats.Snapshot()
-	wantAPI := "codex · hide-my-email@privaterelay.example.com"
-	if len(snapshot.APIs) != 1 {
-		t.Fatalf("snapshot APIs = %#v, want restored legacy groups merged", snapshot.APIs)
-	}
-	api := snapshot.APIs[wantAPI]
-	if api.TotalRequests != 2 || api.TotalTokens != 295_843 {
-		t.Fatalf("restored API = %#v, want two requests and 295843 tokens", api)
 	}
 }
 
@@ -6341,43 +5979,6 @@ func BenchmarkSummaryWithoutDetailsRebuild100k(b *testing.B) {
 		stats.invalidateSummaryLocked()
 		stats.mu.Unlock()
 		_ = stats.SummaryWithoutDetails()
-	}
-}
-
-func clearBenchmarkSummaryRangeCache(stats *RequestStatistics) {
-	stats.mu.Lock()
-	stats.summaryRangeCache = nil
-	stats.summaryRangeCacheWindow = nil
-	stats.mu.Unlock()
-}
-
-func BenchmarkSummaryRange7d100k(b *testing.B) {
-	stats := buildBenchmarkStats(100000)
-	now := time.Now()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		clearBenchmarkSummaryRangeCache(stats)
-		_ = stats.SummaryWithoutDetailsForRangeAt("7d", now)
-	}
-}
-
-func BenchmarkSummaryRange7d100kPrices5000(b *testing.B) {
-	stats := buildBenchmarkStats(100000)
-	stats.mu.Lock()
-	stats.modelPrices = make(map[string]ModelPrice, 5004)
-	for i := 0; i < 5000; i++ {
-		stats.modelPrices[fmt.Sprintf("catalogue/model-%04d", i)] = ModelPrice{Prompt: 1, Completion: 2, Cache: 0.1}
-	}
-	for _, item := range [][2]string{{"openai", "gpt-4.1"}, {"deepseek", "deepseek-v3"}, {"claude", "claude-sonnet"}, {"gemini", "gemini-pro"}} {
-		stats.modelPrices[item[0]+"/"+item[1]] = ModelPrice{Prompt: 2, Completion: 8, Cache: 0.5}
-	}
-	stats.modelPriceIndex = normalizedModelPriceIndex(stats.modelPrices)
-	stats.mu.Unlock()
-	now := time.Now()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		clearBenchmarkSummaryRangeCache(stats)
-		_ = stats.SummaryWithoutDetailsForRangeAt("7d", now)
 	}
 }
 
