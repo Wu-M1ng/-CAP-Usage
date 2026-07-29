@@ -299,8 +299,9 @@ func TestClientAPISelectorFiltersSummaryEventsAndAPIDetail(t *testing.T) {
 		t.Fatalf("base client api stats = %#v, want two groups", base.ClientAPIStats)
 	}
 	var alpha ClientAPIStat
+	alphaHash := hashAPIKey("sk-client-alpha-0000xx")
 	for _, stat := range base.ClientAPIStats {
-		if stat.APIKey == "s******" {
+		if stat.APIKeyHash == alphaHash {
 			alpha = stat
 		}
 	}
