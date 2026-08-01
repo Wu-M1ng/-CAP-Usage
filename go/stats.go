@@ -28,6 +28,8 @@ import (
 type RequestStatistics struct {
 	mu sync.RWMutex
 
+	configurationApplied bool
+
 	storageControlMu sync.Mutex
 	storageEnqueueWG sync.WaitGroup
 
@@ -589,6 +591,9 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	s.configurationApplied = true
+	s.mu.Unlock()
 	storageConfigTouched := cfg.StorageEnabled != nil || cfg.StoragePath != nil
 	pruneConfigTouched := cfg.MaxDetailsPerModel != nil || cfg.RetentionDays != nil
 	var candidate *eventStore
@@ -596,6 +601,8 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	var candidateHasSnapshot bool
 	var storageError error
 	var switchStore bool
+	var legacyWarning error
+	effectiveStoragePath := ""
 	if storageConfigTouched || pruneConfigTouched {
 		s.storageControlMu.Lock()
 		defer s.storageControlMu.Unlock()
@@ -617,18 +624,48 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 		if path == "" {
 			path = defaultEventStorePath
 		}
+		storagePathInfo, pathErr := resolveEventStorePath(path)
+		if pathErr != nil {
+			storageError = pathErr
+		} else {
+			path = storagePathInfo.databasePath
+			effectiveStoragePath = path
+		}
 		needsSwitch := currentStore == nil || currentEnabled != enabled ||
 			(enabled && !sameEventStorePath(currentPath, path)) ||
 			(!enabled && currentStore != nil)
 		if needsSwitch {
 			switchStore = true
-			if enabled {
+			if enabled && storageError == nil {
 				candidate, storageError = openEventStore(path, false)
 				if storageError == nil && currentStore != nil && !sameEventStorePath(currentStore.path, candidate.path) {
 					var empty bool
 					empty, storageError = candidate.isEmpty(context.Background())
 					if storageError == nil && empty {
 						storageError = candidate.copyFrom(context.Background(), currentStore)
+					}
+				}
+				if storageError == nil && storagePathInfo.legacy {
+					var empty bool
+					empty, storageError = candidate.isEmpty(context.Background())
+					if storageError == nil && empty {
+						var migrationSnapshot StatisticsSnapshot
+						migrationSnapshot, _, legacyWarning = s.loadLegacyStorageForSQLite(storagePathInfo, cfg, time.Now())
+						if hasLegacyStorageData(migrationSnapshot) {
+							if storageError = migrateLegacySnapshotToSQLite(candidate, migrationSnapshot, time.Now()); storageError == nil {
+								if compacted, compactErr := compactStorageShardsBeforeSnapshot(storagePathInfo.legacyDir, time.Now(), filepath.Join(storagePathInfo.legacyDir, storageFileName(storageDate(time.Now())))); compactErr != nil {
+									warnings := make([]string, 0, 2)
+									if legacyWarning != nil {
+										warnings = append(warnings, legacyWarning.Error())
+									}
+									warnings = append(warnings, compactErr.Error())
+									legacyWarning = combineStorageWarnings(warnings)
+								} else if compacted > 0 {
+									// The old shard files are no longer the active store. The
+									// SQLite database now owns the migrated records.
+								}
+							}
+						}
 					}
 				}
 				if storageError == nil {
@@ -713,12 +750,15 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 				s.storageEnabled = *cfg.StorageEnabled
 			}
 			if cfg.StoragePath != nil {
-				s.storagePath = strings.TrimSpace(*cfg.StoragePath)
+				s.storagePath = effectiveStoragePath
 			}
 			if s.storagePath == "" {
 				s.storagePath = defaultEventStorePath
 			}
 			s.eventStoreLastError = ""
+			if legacyWarning != nil {
+				s.eventStoreLastError = legacyWarning.Error()
+			}
 			if switchStore {
 				previousStore = s.eventStore
 				s.eventStore = candidate
@@ -775,6 +815,138 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	if previousStore != nil && previousStore != candidate {
 		_ = previousStore.close()
 	}
+}
+
+type eventStorePathInfo struct {
+	databasePath string
+	legacyDir    string
+	legacyPath   string
+	legacy       bool
+}
+
+// resolveEventStorePath keeps the active storage target SQLite while allowing
+// an old JSONL file or shard directory to be read once during startup.
+func resolveEventStorePath(path string) (eventStorePathInfo, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = defaultEventStorePath
+	}
+	cleanPath := filepath.Clean(path)
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return eventStorePathInfo{}, fmt.Errorf("resolve event store path: %w", err)
+	}
+	ext := strings.ToLower(filepath.Ext(cleanPath))
+	if ext == ".jsonl" {
+		base := strings.TrimSuffix(cleanPath, filepath.Ext(cleanPath))
+		return eventStorePathInfo{
+			databasePath: base + ".db",
+			legacyDir:    strings.TrimSuffix(absPath, filepath.Ext(absPath)),
+			legacyPath:   absPath,
+			legacy:       true,
+		}, nil
+	}
+	if strings.EqualFold(filepath.Base(cleanPath), "snapshot.json") {
+		dir := filepath.Dir(cleanPath)
+		absDir := filepath.Dir(absPath)
+		return eventStorePathInfo{
+			databasePath: filepath.Join(dir, "usage-statistics.db"),
+			legacyDir:    absDir,
+			legacy:       true,
+		}, nil
+	}
+	if info, statErr := os.Stat(absPath); statErr == nil && info.IsDir() {
+		return eventStorePathInfo{
+			databasePath: filepath.Join(cleanPath, "usage-statistics.db"),
+			legacyDir:    absPath,
+			legacy:       true,
+		}, nil
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return eventStorePathInfo{}, fmt.Errorf("inspect event store path: %w", statErr)
+	}
+	return eventStorePathInfo{databasePath: cleanPath}, nil
+}
+
+func (s *RequestStatistics) loadLegacyStorageForSQLite(info eventStorePathInfo, cfg runtimeConfigPatch, now time.Time) (StatisticsSnapshot, time.Time, error) {
+	legacy := NewRequestStatistics()
+	s.mu.RLock()
+	legacy.maxDetailsPerModel = s.maxDetailsPerModel
+	legacy.retention = s.retention
+	legacy.modelPrices = copyModelPrices(s.modelPrices)
+	s.mu.RUnlock()
+	if cfg.MaxDetailsPerModel != nil && *cfg.MaxDetailsPerModel >= 0 {
+		legacy.maxDetailsPerModel = *cfg.MaxDetailsPerModel
+	}
+	if cfg.RetentionDays != nil && *cfg.RetentionDays >= 0 {
+		legacy.retention = time.Duration(*cfg.RetentionDays) * 24 * time.Hour
+	}
+	legacy.dedupWindow = 0
+	legacy.storageEnabled = false
+
+	legacy.mu.Lock()
+	snapshotAt, snapshotErr := legacy.loadStorageSnapshotLocked(info.legacyDir, now)
+	replayErr := legacy.replayStorageFilesLocked(info.legacyDir, info.legacyPath, now, snapshotAt)
+	legacy.pruneLocked(now, true)
+	snapshot := legacy.snapshotLocked()
+	legacy.mu.Unlock()
+
+	warnings := make([]string, 0, 2)
+	if snapshotErr != nil {
+		warnings = append(warnings, snapshotErr.Error())
+	}
+	if replayErr != nil {
+		warnings = append(warnings, replayErr.Error())
+	}
+	return snapshot, snapshotAt, combineStorageWarnings(warnings)
+}
+
+func hasLegacyStorageData(snapshot StatisticsSnapshot) bool {
+	if snapshot.TotalRequests != 0 || snapshot.SuccessCount != 0 || snapshot.FailureCount != 0 ||
+		snapshot.TotalTokens != 0 || len(snapshot.APIs) != 0 {
+		return true
+	}
+	return len(snapshot.RequestsByDay) != 0 || len(snapshot.TokensByDay) != 0 || len(snapshot.CostByDay) != 0
+}
+
+func migrateLegacySnapshotToSQLite(store *eventStore, snapshot StatisticsSnapshot, now time.Time) error {
+	if store == nil {
+		return errors.New("event store is nil during legacy migration")
+	}
+	db, err := store.database()
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("begin legacy SQLite migration: %w", err)
+	}
+	defer tx.Rollback()
+	for apiName, apiSnapshot := range snapshot.APIs {
+		apiName = strings.TrimSpace(apiName)
+		if apiName == "" {
+			continue
+		}
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelName = normalizeModelName(modelName)
+			for _, detail := range modelSnapshot.Details {
+				detail = normalizeStorageSnapshotDetail(modelName, detail, now)
+				modelNameForRow := normalizeDetailModelName(modelName, detail.Model)
+				apiNameForRow := usageGroupKeyFromDetail(apiName, detail)
+				row := eventRowFromDetail(apiNameForRow, modelNameForRow, detail)
+				fingerprint := eventFingerprint(apiNameForRow, modelNameForRow, detail)
+				if _, _, err := store.insertEventTx(context.Background(), tx, row, fingerprint, true, time.Time{}); err != nil {
+					return fmt.Errorf("migrate legacy event: %w", err)
+				}
+			}
+		}
+	}
+	if err := store.saveAggregateTx(context.Background(), tx, snapshot); err != nil {
+		return fmt.Errorf("save migrated aggregate: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy SQLite migration: %w", err)
+	}
+	return nil
 }
 
 func intPtr(value int) *int {
@@ -838,8 +1010,12 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	if store == nil {
 		now := time.Now()
 		s.mu.Lock()
-		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, true, true)
-		s.pruneLocked(now, false)
+		// Live usage records are unique observations. The compatibility
+		// deduplication window applies to imported snapshots only.
+		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, true)
+		if s.configurationApplied {
+			s.pruneLocked(now, false)
+		}
 		s.eventStoreLastError = ""
 		s.mu.Unlock()
 		return
@@ -4799,7 +4975,7 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, per
 }
 
 func (s *RequestStatistics) recordImported(apiName, modelName string, detail RequestDetail, dedup requestDedupKey, now time.Time) bool {
-	return s.recordDetailLocked(apiName, modelName, detail, dedup, now, false, false)
+	return s.recordDetailLocked(apiName, modelName, detail, dedup, now, false, true)
 }
 
 func snapshotImportDetailCapacity(snapshot StatisticsSnapshot, cutoff time.Time, now time.Time) int64 {
@@ -5063,9 +5239,13 @@ func nonNegativeIntFromInt64(value int64) int {
 
 func durationMilliseconds(value time.Duration) float64 {
 	if value <= 0 {
-		return 0
+		return 0.001
 	}
-	return float64(value) / float64(time.Millisecond)
+	ms := float64(value) / float64(time.Millisecond)
+	if ms < 0.001 {
+		return 0.001
+	}
+	return ms
 }
 
 func normalizeModelName(model string) string {

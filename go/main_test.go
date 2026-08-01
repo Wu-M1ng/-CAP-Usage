@@ -5219,6 +5219,7 @@ func TestStorageReplayRekeysUpstreamChannelsFromDetail(t *testing.T) {
 
 	stats := NewRequestStatistics()
 	stats.Configure(runtimeConfig{StorageEnabled: true, StoragePath: path, RetentionDays: 0, DedupWindowMinutes: 0})
+	defer stats.Close()
 	snapshot := stats.Snapshot()
 	if _, ok := snapshot.APIs["codex"]; ok {
 		t.Fatalf("snapshot APIs = %#v, want codex records split by upstream channel", snapshot.APIs)

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -603,6 +604,13 @@ ORDER BY COUNT(*) DESC, model ASC, provider ASC`, eventTotalTokensSQL, eventCach
 		}
 		return result.ModelStats[i].Model < result.ModelStats[j].Model
 	})
+	if (strings.TrimSpace(rangeKey) == "" || strings.EqualFold(strings.TrimSpace(rangeKey), "all")) && strings.TrimSpace(clientAPI) == "" {
+		if aggregate, ok, aggregateErr := storedAPIAggregateForDetail(ctx, tx, api); aggregateErr != nil {
+			return APIDetailResponse{}, aggregateErr
+		} else if ok {
+			applyStoredAPIAggregateToDetail(&result, aggregate)
+		}
+	}
 
 	sourceAgg := make(map[string]*SourceStat)
 	sourceRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
@@ -701,6 +709,80 @@ LIMIT ?`, where), append(append([]any{}, args...), errorLimit)...)
 	}
 	recentRows.Close()
 	return result, nil
+}
+
+func storedAPIAggregateForDetail(ctx context.Context, tx *sql.Tx, api string) (APISnapshot, bool, error) {
+	var encoded string
+	err := tx.QueryRowContext(ctx, "SELECT state_json FROM aggregate_state WHERE id = 1").Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return APISnapshot{}, false, nil
+	}
+	if err != nil {
+		return APISnapshot{}, false, fmt.Errorf("read api detail aggregate state: %w", err)
+	}
+	var snapshot StatisticsSnapshot
+	if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
+		return APISnapshot{}, false, fmt.Errorf("decode api detail aggregate state: %w", err)
+	}
+	apiSnapshot, ok := snapshot.APIs[strings.TrimSpace(api)]
+	return apiSnapshot, ok, nil
+}
+
+func applyStoredAPIAggregateToDetail(result *APIDetailResponse, apiSnapshot APISnapshot) {
+	if result == nil {
+		return
+	}
+	result.Summary = APIDetailSummary{
+		TotalRequests:    apiSnapshot.TotalRequests,
+		SuccessCount:     apiSnapshot.SuccessCount,
+		FailureCount:     apiSnapshot.FailureCount,
+		TotalTokens:      apiSnapshot.TotalTokens,
+		InputTokens:      apiSnapshot.InputTokens,
+		OutputTokens:     apiSnapshot.OutputTokens,
+		CachedTokens:     apiSnapshot.CachedTokens,
+		CacheWriteTokens: apiSnapshot.CacheWriteTokens,
+		ReasoningTokens:  apiSnapshot.ReasoningTokens,
+		AvgLatencyMs:     apiSnapshot.AvgLatencyMs,
+	}
+	result.ModelStats = make([]ModelStat, 0, len(apiSnapshot.Models))
+	for modelName, modelSnapshot := range apiSnapshot.Models {
+		stat := ModelStat{
+			Model:            normalizeModelName(modelName),
+			TotalRequests:    modelSnapshot.TotalRequests,
+			SuccessCount:     modelSnapshot.SuccessCount,
+			FailureCount:     modelSnapshot.FailureCount,
+			TotalTokens:      modelSnapshot.TotalTokens,
+			InputTokens:      modelSnapshot.InputTokens,
+			OutputTokens:     modelSnapshot.OutputTokens,
+			CachedTokens:     modelSnapshot.CachedTokens,
+			CacheWriteTokens: modelSnapshot.CacheWriteTokens,
+			ReasoningTokens:  modelSnapshot.ReasoningTokens,
+			latencySum:       restoredLatencySum(modelSnapshot.AvgLatencyMs, modelSnapshot.TotalRequests),
+			latencyN:         restoredLatencyCount(modelSnapshot.AvgLatencyMs, modelSnapshot.TotalRequests),
+			providerStats:    modelProviderStatsFromSnapshot(modelSnapshot.Providers),
+		}
+		result.ModelStats = append(result.ModelStats, finalizeModelStat(stat))
+	}
+	sort.SliceStable(result.ModelStats, func(i, j int) bool {
+		if result.ModelStats[i].TotalRequests != result.ModelStats[j].TotalRequests {
+			return result.ModelStats[i].TotalRequests > result.ModelStats[j].TotalRequests
+		}
+		return result.ModelStats[i].Model < result.ModelStats[j].Model
+	})
+}
+
+func restoredLatencySum(avg float64, count int64) int64 {
+	if !(avg > 0) || count <= 0 {
+		return 0
+	}
+	return int64(math.Round(avg * float64(count)))
+}
+
+func restoredLatencyCount(avg float64, count int64) int64 {
+	if !(avg > 0) || count <= 0 {
+		return 0
+	}
+	return count
 }
 
 func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *StatisticsSnapshot) error {

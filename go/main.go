@@ -56,7 +56,6 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
-	"encoding/json"
 	"unsafe"
 )
 
@@ -142,15 +141,6 @@ func handleMethod(method string, requestBody []byte) ([]byte, error) {
 	}
 }
 
-func okEnvelopeJSON(result string) ([]byte, error) {
-	return json.Marshal(envelope{OK: true, Result: json.RawMessage(result)})
-}
-
-func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
-	return raw
-}
-
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
 		return
@@ -161,9 +151,4 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
-}
-
-func mustMarshal(v interface{}) []byte {
-	data, _ := json.Marshal(v)
-	return data
 }
