@@ -595,6 +595,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	var candidateSnapshot StatisticsSnapshot
 	var candidateHasSnapshot bool
 	var storageError error
+	var switchStore bool
 	if storageConfigTouched || pruneConfigTouched {
 		s.storageControlMu.Lock()
 		defer s.storageControlMu.Unlock()
@@ -617,34 +618,38 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 			path = defaultEventStorePath
 		}
 		needsSwitch := currentStore == nil || currentEnabled != enabled ||
-			(enabled && !sameEventStorePath(currentPath, path))
+			(enabled && !sameEventStorePath(currentPath, path)) ||
+			(!enabled && currentStore != nil)
 		if needsSwitch {
-			candidate, storageError = openEventStore(path, !enabled)
-			if storageError == nil && currentStore != nil && !sameEventStorePath(currentStore.path, candidate.path) {
-				var empty bool
-				empty, storageError = candidate.isEmpty(context.Background())
-				if storageError == nil && empty {
-					storageError = candidate.copyFrom(context.Background(), currentStore)
-				}
-			}
-			if storageError == nil {
-				candidateSnapshot, candidateHasSnapshot, storageError = candidate.loadAggregate(context.Background())
-				if storageError != nil {
-					// A damaged aggregate_state must not hide recoverable event rows.
-					// Keep the database when it contains events and rebuild the
-					// in-memory aggregate from those rows below.
-					if count, countErr := candidate.count(context.Background()); countErr == nil && count > 0 {
-						candidateSnapshot = StatisticsSnapshot{}
-						candidateHasSnapshot = false
-						storageError = nil
+			switchStore = true
+			if enabled {
+				candidate, storageError = openEventStore(path, false)
+				if storageError == nil && currentStore != nil && !sameEventStorePath(currentStore.path, candidate.path) {
+					var empty bool
+					empty, storageError = candidate.isEmpty(context.Background())
+					if storageError == nil && empty {
+						storageError = candidate.copyFrom(context.Background(), currentStore)
 					}
 				}
-			}
-			if storageError != nil {
-				if candidate != nil {
-					_ = candidate.close()
+				if storageError == nil {
+					candidateSnapshot, candidateHasSnapshot, storageError = candidate.loadAggregate(context.Background())
+					if storageError != nil {
+						// A damaged aggregate_state must not hide recoverable event rows.
+						// Keep the database when it contains events and rebuild the
+						// in-memory aggregate from those rows below.
+						if count, countErr := candidate.count(context.Background()); countErr == nil && count > 0 {
+							candidateSnapshot = StatisticsSnapshot{}
+							candidateHasSnapshot = false
+							storageError = nil
+						}
+					}
 				}
-				candidate = nil
+				if storageError != nil {
+					if candidate != nil {
+						_ = candidate.close()
+					}
+					candidate = nil
+				}
 			}
 		}
 	}
@@ -714,38 +719,43 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 				s.storagePath = defaultEventStorePath
 			}
 			s.eventStoreLastError = ""
-			if candidate != nil {
+			if switchStore {
 				previousStore = s.eventStore
 				s.eventStore = candidate
-				s.eventStorePath = candidate.path
-				s.eventStoreTemporary = candidate.temporary
-				restoreNow := time.Now()
-				eventCount, countErr := candidate.count(context.Background())
-				if countErr != nil {
-					s.eventStoreLastError = countErr.Error()
-					if candidateHasSnapshot {
+				if candidate != nil {
+					s.eventStorePath = candidate.path
+					s.eventStoreTemporary = candidate.temporary
+					restoreNow := time.Now()
+					eventCount, countErr := candidate.count(context.Background())
+					if countErr != nil {
+						s.eventStoreLastError = countErr.Error()
+						if candidateHasSnapshot {
+							s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
+						}
+					} else if candidateHasSnapshot && (len(candidateSnapshot.APIs) > 0 || eventCount == 0) {
 						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
-					}
-				} else if candidateHasSnapshot && (len(candidateSnapshot.APIs) > 0 || eventCount == 0) {
-					s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
-					if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
-						s.eventStoreLastError = err.Error()
-					}
-				} else if eventCount > 0 {
-					s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
-					if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, true); err != nil {
-						s.eventStoreLastError = err.Error()
-					} else {
-						snapshot := s.snapshotLocked()
-						if err := candidate.saveAggregate(context.Background(), snapshot); err != nil {
+						if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
+							s.eventStoreLastError = err.Error()
+						}
+					} else if eventCount > 0 {
+						s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
+						if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, true); err != nil {
+							s.eventStoreLastError = err.Error()
+						} else {
+							snapshot := s.snapshotLocked()
+							if err := candidate.saveAggregate(context.Background(), snapshot); err != nil {
+								s.eventStoreLastError = err.Error()
+							}
+						}
+					} else if candidateHasSnapshot {
+						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
+						if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
 							s.eventStoreLastError = err.Error()
 						}
 					}
-				} else if candidateHasSnapshot {
-					s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
-					if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
-						s.eventStoreLastError = err.Error()
-					}
+				} else {
+					s.eventStorePath = ""
+					s.eventStoreTemporary = false
 				}
 			}
 		}
@@ -754,6 +764,8 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 		if err := s.pruneSQLiteLocked(s.eventStore, time.Now()); err != nil {
 			s.eventStoreLastError = err.Error()
 		}
+	} else if storageError == nil && pruneConfigTouched && s.eventStore == nil {
+		s.pruneLocked(time.Now(), true)
 	}
 	s.configureModelsDevPriceWorkerLocked()
 	s.loadModelPricesLocked()
@@ -824,7 +836,12 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	s.mu.RUnlock()
 	detail := requestDetailFromUsageRecord(record, timestamp, whitelist)
 	if store == nil {
-		s.recordEventStoreFailure(errors.New("event store is not configured"), true)
+		now := time.Now()
+		s.mu.Lock()
+		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, true, true)
+		s.pruneLocked(now, false)
+		s.eventStoreLastError = ""
+		s.mu.Unlock()
 		return
 	}
 	db, err := store.database()
@@ -941,7 +958,27 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 	store := s.eventStore
 	s.mu.RUnlock()
 	if store == nil {
-		s.recordEventStoreFailure(errors.New("event store is not configured"), true)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		apiSt := s.apis[apiName]
+		if apiSt == nil {
+			return false
+		}
+		modelSt := apiSt.Models[modelName]
+		if modelSt == nil {
+			return false
+		}
+		target := dedupKey(apiName, modelName, base)
+		for i := range modelSt.Details {
+			if dedupKey(apiName, modelName, modelSt.Details[i]) != target {
+				continue
+			}
+			if !enrichRequestDetailMetadata(&modelSt.Details[i], update) {
+				return false
+			}
+			s.invalidateSummaryLocked()
+			return true
+		}
 		return false
 	}
 	changed, err := store.enrichEvent(context.Background(), eventFingerprint(apiName, modelName, base), record.RequestedAt, update)
