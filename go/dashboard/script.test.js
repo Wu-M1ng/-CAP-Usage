@@ -1352,139 +1352,25 @@ test('dashboard wide statistic panels span the full layout width', () => {
   assert.match(css, /\.barLabel\{[^}]*overflow-wrap:anywhere;[^}]*word-break:break-word/);
 });
 
-test('dashboard shows pending storage buffer status', async () => {
-  const { document, fetchCalls } = createDashboardHarness({
-    storage: {
-      enabled: true,
-      path: 'usage-statistics.jsonl',
-      loaded_path: 'usage-statistics/usage-2026-06-28.jsonl',
-      pending_buffered_records: 2,
-    },
-  });
-
-  const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.strictEqual(el.textContent, '持久化已开启');
-  assert.match(el.title, /2 条记录/);
-});
-
-test('dashboard shows pending storage write queue status', async () => {
+test('dashboard shows sqlite storage status', async () => {
   const { document } = createDashboardHarness({
     storage: {
       enabled: true,
-      path: 'usage-statistics.jsonl',
-      loaded_path: 'usage-statistics/usage-2026-06-28.jsonl',
-      write_queue_length: 5,
-      write_queue_capacity: 4096,
-      pending_buffered_records: 2,
+      path: 'usage-statistics.db',
+      database_path: 'data/usage-statistics.db',
+      event_count: 12,
+      database_size_bytes: 2048,
+      last_write_at: '2026-06-28T01:00:00Z',
+      dropped_events: 3,
     },
   });
 
   const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.strictEqual(el.textContent, '持久化已开启');
-  assert.match(el.title, /5 条记录/);
-  assert.match(el.title, /4,096/);
-});
-
-test('dashboard omits storage queue capacity when unavailable', async () => {
-  const { document } = createDashboardHarness({
-    storage: {
-      enabled: true,
-      path: 'usage-statistics.jsonl',
-      loaded_path: 'usage-statistics/usage-2026-06-28.jsonl',
-      write_queue_length: 5,
-      write_queue_capacity: 0,
-    },
-  });
-
-  const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.match(el.title, /5 条记录等待后台写入/);
-  assert.doesNotMatch(el.title, /队列容量/);
-});
-
-test('dashboard shows pending storage snapshot status', async () => {
-  const { document } = createDashboardHarness({
-    storage: {
-      enabled: true,
-      path: 'usage-statistics.jsonl',
-      loaded_path: 'usage-statistics/usage-2026-06-28.jsonl',
-      last_flush_at: '2026-06-28T01:00:00Z',
-      pending_snapshot_records: 3,
-    },
-  });
-
-  const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.strictEqual(el.textContent, '持久化已开启');
-  assert.match(el.title, /3 条记录/);
-});
-
-test('dashboard shows pending storage fsync status', async () => {
-  const { document } = createDashboardHarness({
-    storage: {
-      enabled: true,
-      path: 'usage-statistics.jsonl',
-      loaded_path: 'usage-statistics/usage-2026-06-28.jsonl',
-      last_flush_at: '2026-06-28T01:00:00Z',
-      pending_unsynced_records: 4,
-      pending_snapshot_records: 3,
-    },
-  });
-
-  const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.strictEqual(el.textContent, '持久化已开启');
-  assert.match(el.title, /4 条记录/);
-});
-
-test('dashboard shows storage writer batch metrics in title', async () => {
-  const { document } = createDashboardHarness({
-    storage: {
-      enabled: true,
-      path: 'usage-statistics.jsonl',
-      last_flush_at: '2026-06-28T01:00:00Z',
-      last_write_batch_records: 12,
-      last_write_batch_duration_ms: 1.6,
-      last_write_queue_wait_ms: 3.2,
-      write_batch_avg_duration_ms: 2.4,
-      write_batch_p95_duration_ms: 5.6,
-      write_batch_p99_duration_ms: 7.8,
-      write_queue_wait_avg_ms: 1.2,
-      write_queue_wait_p95_ms: 8.4,
-      write_queue_wait_p99_ms: 10.2,
-      write_pressure: 'normal',
-    },
-  });
-
-  const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.strictEqual(el.textContent, '持久化已开启');
-  assert.match(el.title, /最近批量写入 12 条/);
-  assert.match(el.title, /写入压力：正常/);
-  assert.match(el.title, /平均耗时/);
-  assert.match(el.title, /耗时 p95/);
-  assert.match(el.title, /最长排队/);
-  assert.match(el.title, /排队 p95/);
-});
-
-test('dashboard warns when storage writer is slow without queue backlog', async () => {
-  const { document } = createDashboardHarness({
-    storage: {
-      enabled: true,
-      path: 'usage-statistics.jsonl',
-      last_flush_at: '2026-06-28T01:00:00Z',
-      last_write_batch_records: 8,
-      write_queue_wait_avg_ms: 250,
-      write_pressure: 'slow',
-    },
-  });
-
-  const el = document.getElementById('storageStatus');
-  await waitFor(() => el.textContent === '持久化已开启');
-  assert.strictEqual(el.textContent, '持久化已开启');
-  assert.match(el.title, /写入压力：写入偏慢/);
+  await waitFor(() => el.title.includes('data/usage-statistics.db'));
+  assert.match(el.title, /data\/usage-statistics\.db/);
+  assert.match(el.title, /12/);
+  assert.match(el.title, /2 KiB/);
+  assert.match(el.title, /3/);
 });
 
 test('dashboard uses a slower polling interval while hidden', async () => {

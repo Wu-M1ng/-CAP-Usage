@@ -67,7 +67,17 @@ type RequestStatistics struct {
 	credentialStats   map[string]*CredentialStat
 	clientAPIStats    map[string]*clientAPIStatAccumulator
 
-	logResponseHeaders            headerWhitelist
+	logResponseHeaders  headerWhitelist
+	eventStore          *eventStore
+	eventStorePath      string
+	eventStoreLastError string
+	eventStoreLastWrite time.Time
+	droppedEvents       int64
+	eventStoreTemporary bool
+
+	// Historical file-storage state is kept for source compatibility with the
+	// old implementation. Runtime records and configuration use eventStore;
+	// the JSONL worker is not started by the SQLite path.
 	storageEnabled                bool
 	storagePath                   string
 	storageFlush                  time.Duration
@@ -536,7 +546,9 @@ func NewRequestStatistics() *RequestStatistics {
 		sourceStats:                   make(map[string]*sourceStatAccumulator),
 		credentialStats:               make(map[string]*CredentialStat),
 		clientAPIStats:                make(map[string]*clientAPIStatAccumulator),
+		storageEnabled:                defaultRuntimeConfig().StorageEnabled,
 		storagePath:                   defaultRuntimeConfig().StoragePath,
+		eventStorePath:                defaultRuntimeConfig().StoragePath,
 		storageFlush:                  time.Duration(defaultStorageFlushSeconds) * time.Second,
 		storageSnapshotInterval:       time.Duration(defaultStorageSnapshotSeconds) * time.Second,
 		storageSnapshotRecordInterval: defaultStorageSnapshotRecords,
@@ -556,25 +568,20 @@ func NewRequestStatistics() *RequestStatistics {
 
 func (s *RequestStatistics) Configure(cfg runtimeConfig) {
 	s.ConfigurePatch(runtimeConfigPatch{
-		MaxDetailsPerModel:            positiveIntPtr(cfg.MaxDetailsPerModel),
-		RetentionDays:                 intPtr(cfg.RetentionDays),
-		DedupWindowMinutes:            intPtr(cfg.DedupWindowMinutes),
-		LogResponseHeaders:            stringPtr(cfg.LogResponseHeaders),
-		APIKeyHashSalt:                stringPtr(cfg.APIKeyHashSalt),
-		StorageEnabled:                boolPtr(cfg.StorageEnabled),
-		StoragePath:                   stringPtr(cfg.StoragePath),
-		StorageFlushSeconds:           positiveIntPtr(cfg.StorageFlushSeconds),
-		StorageSnapshotSeconds:        positiveIntPtr(cfg.StorageSnapshotSeconds),
-		StorageSnapshotRecordInterval: positiveIntPtr(cfg.StorageSnapshotRecordInterval),
-		StorageSyncSeconds:            intPtr(cfg.StorageSyncSeconds),
-		StorageSyncRecordInterval:     intPtr(cfg.StorageSyncRecordInterval),
-		ExportMaxRecords:              intPtr(cfg.ExportMaxRecords),
-		PriceStoragePath:              stringPtr(cfg.PriceStoragePath),
-		ModelsDevPricesEnabled:        boolPtr(cfg.ModelsDevPricesEnabled),
-		ModelsDevPricesURL:            stringPtr(cfg.ModelsDevPricesURL),
-		ModelsDevRefreshSeconds:       positiveIntPtr(cfg.ModelsDevRefreshSeconds),
-		UpdateEnabled:                 boolPtr(cfg.UpdateEnabled),
-		UpdateVersion:                 stringPtr(cfg.UpdateVersion),
+		MaxDetailsPerModel:      positiveIntPtr(cfg.MaxDetailsPerModel),
+		RetentionDays:           intPtr(cfg.RetentionDays),
+		DedupWindowMinutes:      intPtr(cfg.DedupWindowMinutes),
+		LogResponseHeaders:      stringPtr(cfg.LogResponseHeaders),
+		APIKeyHashSalt:          stringPtr(cfg.APIKeyHashSalt),
+		StorageEnabled:          boolPtr(cfg.StorageEnabled),
+		StoragePath:             stringPtr(cfg.StoragePath),
+		ExportMaxRecords:        intPtr(cfg.ExportMaxRecords),
+		PriceStoragePath:        stringPtr(cfg.PriceStoragePath),
+		ModelsDevPricesEnabled:  boolPtr(cfg.ModelsDevPricesEnabled),
+		ModelsDevPricesURL:      stringPtr(cfg.ModelsDevPricesURL),
+		ModelsDevRefreshSeconds: positiveIntPtr(cfg.ModelsDevRefreshSeconds),
+		UpdateEnabled:           boolPtr(cfg.UpdateEnabled),
+		UpdateVersion:           stringPtr(cfg.UpdateVersion),
 	})
 }
 
@@ -582,15 +589,64 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	if s == nil {
 		return
 	}
-	storageConfigTouched := cfg.StorageEnabled != nil ||
-		cfg.StoragePath != nil ||
-		cfg.StorageFlushSeconds != nil ||
-		cfg.StorageSnapshotSeconds != nil ||
-		cfg.StorageSnapshotRecordInterval != nil ||
-		cfg.StorageSyncSeconds != nil ||
-		cfg.StorageSyncRecordInterval != nil
+	storageConfigTouched := cfg.StorageEnabled != nil || cfg.StoragePath != nil
+	pruneConfigTouched := cfg.MaxDetailsPerModel != nil || cfg.RetentionDays != nil
+	var candidate *eventStore
+	var candidateSnapshot StatisticsSnapshot
+	var candidateHasSnapshot bool
+	var storageError error
+	if storageConfigTouched || pruneConfigTouched {
+		s.storageControlMu.Lock()
+		defer s.storageControlMu.Unlock()
+	}
 	if storageConfigTouched {
-		s.stopStorageWorker()
+		s.mu.RLock()
+		currentEnabled := s.storageEnabled
+		currentPath := s.storagePath
+		currentStore := s.eventStore
+		s.mu.RUnlock()
+		enabled := currentEnabled
+		path := currentPath
+		if cfg.StorageEnabled != nil {
+			enabled = *cfg.StorageEnabled
+		}
+		if cfg.StoragePath != nil {
+			path = strings.TrimSpace(*cfg.StoragePath)
+		}
+		if path == "" {
+			path = defaultEventStorePath
+		}
+		needsSwitch := currentStore == nil || currentEnabled != enabled ||
+			(enabled && !sameEventStorePath(currentPath, path))
+		if needsSwitch {
+			candidate, storageError = openEventStore(path, !enabled)
+			if storageError == nil && currentStore != nil && !sameEventStorePath(currentStore.path, candidate.path) {
+				var empty bool
+				empty, storageError = candidate.isEmpty(context.Background())
+				if storageError == nil && empty {
+					storageError = candidate.copyFrom(context.Background(), currentStore)
+				}
+			}
+			if storageError == nil {
+				candidateSnapshot, candidateHasSnapshot, storageError = candidate.loadAggregate(context.Background())
+				if storageError != nil {
+					// A damaged aggregate_state must not hide recoverable event rows.
+					// Keep the database when it contains events and rebuild the
+					// in-memory aggregate from those rows below.
+					if count, countErr := candidate.count(context.Background()); countErr == nil && count > 0 {
+						candidateSnapshot = StatisticsSnapshot{}
+						candidateHasSnapshot = false
+						storageError = nil
+					}
+				}
+			}
+			if storageError != nil {
+				if candidate != nil {
+					_ = candidate.close()
+				}
+				candidate = nil
+			}
+		}
 	}
 	modelsDevConfigTouched := cfg.ModelsDevPricesEnabled != nil ||
 		cfg.ModelsDevPricesURL != nil ||
@@ -599,7 +655,6 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 		s.stopModelsDevPriceWorker()
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if cfg.MaxDetailsPerModel != nil && *cfg.MaxDetailsPerModel >= 0 {
 		s.maxDetailsPerModel = *cfg.MaxDetailsPerModel
 	}
@@ -618,24 +673,6 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 			salt = defaultAPIKeyHashSalt
 		}
 		setAPIKeySalt(salt)
-	}
-	if cfg.StoragePath != nil && strings.TrimSpace(*cfg.StoragePath) != "" {
-		s.storagePath = strings.TrimSpace(*cfg.StoragePath)
-	}
-	if cfg.StorageFlushSeconds != nil && *cfg.StorageFlushSeconds > 0 {
-		s.storageFlush = time.Duration(*cfg.StorageFlushSeconds) * time.Second
-	}
-	if cfg.StorageSnapshotSeconds != nil && *cfg.StorageSnapshotSeconds >= 0 {
-		s.storageSnapshotInterval = time.Duration(*cfg.StorageSnapshotSeconds) * time.Second
-	}
-	if cfg.StorageSnapshotRecordInterval != nil && *cfg.StorageSnapshotRecordInterval >= 0 {
-		s.storageSnapshotRecordInterval = *cfg.StorageSnapshotRecordInterval
-	}
-	if cfg.StorageSyncSeconds != nil && *cfg.StorageSyncSeconds >= 0 {
-		s.storageSyncInterval = time.Duration(*cfg.StorageSyncSeconds) * time.Second
-	}
-	if cfg.StorageSyncRecordInterval != nil && *cfg.StorageSyncRecordInterval >= 0 {
-		s.storageSyncRecordInterval = *cfg.StorageSyncRecordInterval
 	}
 	if cfg.ExportMaxRecords != nil && *cfg.ExportMaxRecords >= 0 {
 		s.exportMaxRecords = *cfg.ExportMaxRecords
@@ -662,16 +699,70 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 		s.modelsDevLastError = ""
 		s.modelsDevETag = ""
 	}
-	if cfg.StorageEnabled != nil {
-		s.storageEnabled = *cfg.StorageEnabled
+	var previousStore *eventStore
+	if storageConfigTouched {
+		if storageError != nil {
+			s.eventStoreLastError = storageError.Error()
+		} else {
+			if cfg.StorageEnabled != nil {
+				s.storageEnabled = *cfg.StorageEnabled
+			}
+			if cfg.StoragePath != nil {
+				s.storagePath = strings.TrimSpace(*cfg.StoragePath)
+			}
+			if s.storagePath == "" {
+				s.storagePath = defaultEventStorePath
+			}
+			s.eventStoreLastError = ""
+			if candidate != nil {
+				previousStore = s.eventStore
+				s.eventStore = candidate
+				s.eventStorePath = candidate.path
+				s.eventStoreTemporary = candidate.temporary
+				restoreNow := time.Now()
+				eventCount, countErr := candidate.count(context.Background())
+				if countErr != nil {
+					s.eventStoreLastError = countErr.Error()
+					if candidateHasSnapshot {
+						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
+					}
+				} else if candidateHasSnapshot && (len(candidateSnapshot.APIs) > 0 || eventCount == 0) {
+					s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
+					if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
+						s.eventStoreLastError = err.Error()
+					}
+				} else if eventCount > 0 {
+					s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
+					if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, true); err != nil {
+						s.eventStoreLastError = err.Error()
+					} else {
+						snapshot := s.snapshotLocked()
+						if err := candidate.saveAggregate(context.Background(), snapshot); err != nil {
+							s.eventStoreLastError = err.Error()
+						}
+					}
+				} else if candidateHasSnapshot {
+					s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
+					if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
+						s.eventStoreLastError = err.Error()
+					}
+				}
+			}
+		}
+	}
+	if storageError == nil && (storageConfigTouched || pruneConfigTouched) && s.eventStore != nil {
+		if err := s.pruneSQLiteLocked(s.eventStore, time.Now()); err != nil {
+			s.eventStoreLastError = err.Error()
+		}
 	}
 	s.configureModelsDevPriceWorkerLocked()
-	s.configureStorageLocked()
 	s.loadModelPricesLocked()
 	s.rebuildCostSeriesLocked()
-	s.pruneLocked(time.Now(), true)
-	s.rebuildSeenLocked(time.Now())
 	s.invalidateSummaryLocked()
+	s.mu.Unlock()
+	if previousStore != nil && previousStore != candidate {
+		_ = previousStore.close()
+	}
 }
 
 func intPtr(value int) *int {
@@ -720,23 +811,81 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
-	statsKey := usageGroupKey(record)
+	apiName := usageGroupKey(record)
 	modelName := firstNonEmpty(record.Model, "unknown")
-	detail := requestDetailFromUsageRecord(record, timestamp, s.logResponseHeaders)
-	var persistDetail *persistedDetail
-	s.mu.Lock()
 
-	now := time.Now()
-	if s.recordDetailLocked(statsKey, modelName, detail, requestDedupKey{}, now, false) {
-		if s.storageEnabled {
-			persistDetail = &persistedDetail{API: statsKey, Model: modelName, Detail: detail}
-		}
-		s.pruneLocked(now, false)
-		s.pruneSeenLocked(now)
+	// Record, Configure and Close share this lock so a store is never closed
+	// between the SQLite transaction and the in-memory aggregate update.
+	s.storageControlMu.Lock()
+	defer s.storageControlMu.Unlock()
+	s.mu.RLock()
+	store := s.eventStore
+	whitelist := s.logResponseHeaders
+	s.mu.RUnlock()
+	detail := requestDetailFromUsageRecord(record, timestamp, whitelist)
+	if store == nil {
+		s.recordEventStoreFailure(errors.New("event store is not configured"), true)
+		return
 	}
-	s.mu.Unlock()
-	if persistDetail != nil {
-		s.enqueueStorageDetail(*persistDetail)
+	db, err := store.database()
+	if err != nil {
+		s.recordEventStoreFailure(err, true)
+		return
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		s.recordEventStoreFailure(fmt.Errorf("begin event record: %w", err), true)
+		return
+	}
+	defer tx.Rollback()
+	if _, _, err := store.insertEventTx(context.Background(), tx, eventRowFromDetail(apiName, modelName, detail), "", false, time.Time{}); err != nil {
+		s.recordEventStoreFailure(err, true)
+		return
+	}
+	s.mu.RLock()
+	maxDetails := s.maxDetailsPerModel
+	retention := s.retention
+	s.mu.RUnlock()
+	var pruneResult eventPruneResult
+	var previousLastRecordedAt time.Time
+	var previousEvictedTotal int64
+	var previousSummaryVersion uint64
+	if pruneResult, err = store.pruneTx(context.Background(), tx, maxDetails, retention, time.Now()); err != nil {
+		s.recordEventStoreFailure(err, false)
+		return
+	} else {
+		now := time.Now()
+		s.mu.Lock()
+		previousLastRecordedAt = s.lastRecordedAt
+		previousEvictedTotal = s.evictedTotal
+		previousSummaryVersion = s.summaryVersion
+		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
+		retentionRemoved := s.applyRetentionRemovalsLocked(pruneResult.RetentionDetails)
+		if pruneResult.Removed > 0 {
+			s.evictedTotal += pruneResult.Removed
+		}
+		snapshot := s.snapshotLocked()
+		s.mu.Unlock()
+		if err := store.saveAggregateTx(context.Background(), tx, snapshot); err != nil {
+			s.mu.Lock()
+			s.rollbackRecordedDetailLocked(apiName, modelName, detail, retentionRemoved, previousLastRecordedAt, previousEvictedTotal, previousSummaryVersion)
+			s.mu.Unlock()
+			s.recordEventStoreFailure(err, false)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			s.mu.Lock()
+			s.rollbackRecordedDetailLocked(apiName, modelName, detail, retentionRemoved, previousLastRecordedAt, previousEvictedTotal, previousSummaryVersion)
+			s.mu.Unlock()
+			s.recordEventStoreFailure(fmt.Errorf("commit event record: %w", err), false)
+			return
+		}
+		lockedNow := time.Now()
+		s.mu.Lock()
+		s.eventStoreLastError = ""
+		s.eventStoreLastWrite = lockedNow
+		s.mu.Unlock()
+		return
 	}
 }
 
@@ -783,37 +932,41 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 	}
 	apiName := usageGroupKey(record)
 	modelName := firstNonEmpty(record.Model, "unknown")
-	target := dedupKey(apiName, modelName, requestDetailFromUsageRecord(record, record.RequestedAt, headerWhitelist{}))
+	base := requestDetailFromUsageRecord(record, record.RequestedAt, headerWhitelist{})
+	update := requestDetailFromUsageRecord(enrichment, record.RequestedAt, headerWhitelist{})
 
-	s.mu.Lock()
-	apiSt := s.apis[apiName]
-	if apiSt == nil || apiSt.Models[modelName] == nil {
-		s.mu.Unlock()
+	s.storageControlMu.Lock()
+	defer s.storageControlMu.Unlock()
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store == nil {
+		s.recordEventStoreFailure(errors.New("event store is not configured"), true)
 		return false
 	}
-	details := apiSt.Models[modelName].Details
-	for i := len(details) - 1; i >= 0; i-- {
-		if dedupKey(apiName, modelName, details[i]) != target {
-			continue
-		}
-		update := requestDetailFromUsageRecord(enrichment, details[i].Timestamp, headerWhitelist{})
-		changed := enrichRequestDetailMetadata(&details[i], update)
-		var persistUpdate *persistedDetail
-		if changed {
-			apiSt.Models[modelName].Details = details
-			s.invalidateSummaryLocked()
-			if s.storageEnabled {
-				persistUpdate = &persistedDetail{API: apiName, Model: modelName, Detail: details[i], MetadataOnly: true}
-			}
-		}
+	changed, err := store.enrichEvent(context.Background(), eventFingerprint(apiName, modelName, base), record.RequestedAt, update)
+	if err != nil {
+		s.recordEventStoreFailure(err, true)
+		return false
+	}
+	if changed {
+		s.mu.Lock()
+		s.invalidateSummaryLocked()
 		s.mu.Unlock()
-		if persistUpdate != nil {
-			s.enqueueStorageDetail(*persistUpdate)
-		}
-		return changed
+	}
+	return changed
+}
+
+func (s *RequestStatistics) recordEventStoreFailure(err error, dropped bool) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.eventStoreLastError = err.Error()
+	if dropped {
+		s.droppedEvents++
 	}
 	s.mu.Unlock()
-	return false
 }
 
 func enrichRequestDetailMetadata(detail *RequestDetail, update RequestDetail) bool {
@@ -1345,7 +1498,7 @@ func (s *RequestStatistics) setStorageLastError(err error) {
 	s.mu.Unlock()
 }
 
-func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail RequestDetail, dedup requestDedupKey, now time.Time, useDedupWindow bool) bool {
+func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail RequestDetail, dedup requestDedupKey, now time.Time, useDedupWindow bool, retainDetail bool) bool {
 	if s == nil {
 		return false
 	}
@@ -1369,7 +1522,7 @@ func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail
 		s.apis[apiName] = apiSt
 	}
 
-	totals := s.updateAPIStats(apiSt, modelName, detail)
+	totals := s.updateAPIStats(apiSt, modelName, detail, retainDetail)
 	incrementAPISourceStats(apiSt, detail, totals)
 
 	s.totalRequests++
@@ -1405,6 +1558,20 @@ func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail
 	}
 	s.invalidateSummaryLocked()
 	return true
+}
+
+func (s *RequestStatistics) rollbackRecordedDetailLocked(apiName, modelName string, detail RequestDetail, retentionRemoved []RequestDetail, previousLastRecordedAt time.Time, previousEvictedTotal int64, previousSummaryVersion uint64) {
+	if s == nil {
+		return
+	}
+	for _, removed := range retentionRemoved {
+		s.recordDetailLocked(strings.TrimSpace(removed.UpstreamAPI), normalizeModelName(removed.Model), removed, requestDedupKey{}, time.Now(), false, false)
+	}
+	s.removeDetailLocked(apiName, modelName, detail)
+	s.lastRecordedAt = previousLastRecordedAt
+	s.evictedTotal = previousEvictedTotal
+	s.invalidateSummaryLocked()
+	s.summaryVersion = previousSummaryVersion
 }
 
 func (s *RequestStatistics) configureStorageLocked() {
@@ -1552,6 +1719,7 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 	s.costTokensByDay = timeSeriesTokenStatsByDayFromSnapshot(snapshot.CostTokensByDay)
 	s.costTokensByHour = timeSeriesTokenStatsByHourFromSnapshot(snapshot.CostTokensByHour)
 	s.healthBuckets = make(map[int64]healthBucket)
+	s.lastRecordedAt = time.Time{}
 	s.modelSummaryStats = make(map[string]*ModelStat)
 	s.sourceStats = make(map[string]*sourceStatAccumulator)
 	s.credentialStats = make(map[string]*CredentialStat)
@@ -1650,6 +1818,54 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 	} else {
 		s.restoreMissingCostSeriesLocked(restoredDetails)
 	}
+}
+
+// rebuildSQLiteDerivedAggregatesLocked restores dashboard dimensions that are
+// intentionally not serialized in aggregate_state. SQLite remains the source
+// of truth for event details, while only bounded aggregate maps are retained in
+// memory. When rebuildAll is true, the event rows also reconstruct the primary
+// counters because no usable aggregate snapshot was available.
+func (s *RequestStatistics) rebuildSQLiteDerivedAggregatesLocked(store *eventStore, now time.Time, rebuildAll bool) error {
+	if s == nil || store == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.sourceStats = make(map[string]*sourceStatAccumulator)
+	s.credentialStats = make(map[string]*CredentialStat)
+	s.clientAPIStats = make(map[string]*clientAPIStatAccumulator)
+	s.healthBuckets = make(map[int64]healthBucket)
+	if !rebuildAll {
+		for _, apiSt := range s.apis {
+			if apiSt != nil {
+				apiSt.Sources = make(map[string]*sourceStatAccumulator)
+			}
+		}
+	}
+
+	return store.forEachEvent(context.Background(), EventsQuery{}, now, func(detail RequestDetail) error {
+		apiName := strings.TrimSpace(detail.UpstreamAPI)
+		if apiName == "" {
+			apiName = usageGroupKey(UsageRecord{})
+		}
+		modelName := normalizeModelName(detail.Model)
+		if rebuildAll {
+			s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
+			return nil
+		}
+
+		totals := detailTotalsFromRequest(detail)
+		if apiSt := s.apis[apiName]; apiSt != nil {
+			incrementAPISourceStats(apiSt, detail, totals)
+		}
+		s.incrementSummaryDimensionStatsLocked(modelName, detail, totals)
+		s.incrementHealthBucketLocked(detail)
+		if detail.Timestamp.After(s.lastRecordedAt) {
+			s.lastRecordedAt = detail.Timestamp
+		}
+		return nil
+	})
 }
 
 func mergeRestoredModelStats(apiSt *apiStats, modelName string, modelSt *modelStats) {
@@ -1952,7 +2168,7 @@ func (s *RequestStatistics) restoreStorageSnapshotSplitAPILocked(apiName string,
 				s.apis[detailAPIName] = apiSt
 			}
 
-			totals := s.updateAPIStats(apiSt, detailModelName, detail)
+			totals := s.updateAPIStats(apiSt, detailModelName, detail, true)
 			detailAggregate.add(detail, totals)
 			detailProviderStats = incrementModelProviderStats(detailProviderStats, detail.Provider, detail.Failed, totals)
 			incrementAPISourceStats(apiSt, detail, totals)
@@ -2769,7 +2985,7 @@ func (s *RequestStatistics) replayStorageLocked(path string) error {
 			}
 			continue
 		}
-		if s.recordDetailLocked(apiName, modelName, detail, key, now, false) {
+		if s.recordDetailLocked(apiName, modelName, detail, key, now, false, true) {
 			existing[key] = struct{}{}
 			if pending, ok := pendingMetadata[key]; ok {
 				s.enrichPersistedDetailMetadataLocked(apiName, modelName, key, pending)
@@ -3418,7 +3634,7 @@ func (s *RequestStatistics) modelPricesResponseLocked() ModelPricesResponse {
 	return response
 }
 
-func (s *RequestStatistics) updateAPIStats(apiSt *apiStats, model string, detail RequestDetail) detailTotals {
+func (s *RequestStatistics) updateAPIStats(apiSt *apiStats, model string, detail RequestDetail, retainDetail bool) detailTotals {
 	totals := detailTotalsFromRequest(detail)
 	apiSt.TotalRequests++
 	if detail.Failed {
@@ -3455,7 +3671,9 @@ func (s *RequestStatistics) updateAPIStats(apiSt *apiStats, model string, detail
 	modelSt.latencySum += totals.latencySum
 	modelSt.latencyN += totals.latencyN
 	modelSt.providerStats = incrementModelProviderStats(modelSt.providerStats, detail.Provider, detail.Failed, totals)
-	modelSt.Details = append(modelSt.Details, detail)
+	if retainDetail {
+		modelSt.Details = append(modelSt.Details, detail)
+	}
 	return totals
 }
 
@@ -3840,6 +4058,62 @@ func (s *RequestStatistics) pruneLocked(now time.Time, sortNeeded bool) {
 	}
 }
 
+func (s *RequestStatistics) removeDetailLocked(apiName, modelName string, detail RequestDetail) bool {
+	if s == nil {
+		return false
+	}
+	apiName = strings.TrimSpace(apiName)
+	if apiName == "" {
+		apiName = strings.TrimSpace(detail.UpstreamAPI)
+	}
+	modelName = normalizeModelName(firstNonEmpty(modelName, detail.Model))
+	apiSt := s.apis[apiName]
+	if apiSt == nil {
+		return false
+	}
+	modelSt := apiSt.Models[modelName]
+	if modelSt == nil {
+		return false
+	}
+
+	s.decrementCounters(detail, apiSt, modelSt, modelName)
+	if len(modelSt.Details) > 0 {
+		target := dedupKey(apiName, modelName, detail)
+		for i := len(modelSt.Details) - 1; i >= 0; i-- {
+			if dedupKey(apiName, modelName, modelSt.Details[i]) != target {
+				continue
+			}
+			modelSt.Details = append(modelSt.Details[:i], modelSt.Details[i+1:]...)
+			break
+		}
+	}
+	if modelSt.TotalRequests <= 0 && len(modelSt.Details) == 0 {
+		delete(apiSt.Models, modelName)
+	}
+	if apiSt.TotalRequests <= 0 && len(apiSt.Models) == 0 {
+		delete(s.apis, apiName)
+	}
+	return true
+}
+
+func (s *RequestStatistics) applyRetentionRemovalsLocked(details []RequestDetail) []RequestDetail {
+	if s == nil || len(details) == 0 {
+		return nil
+	}
+	removed := make([]RequestDetail, 0, len(details))
+	for _, detail := range details {
+		apiName := strings.TrimSpace(detail.UpstreamAPI)
+		modelName := normalizeModelName(detail.Model)
+		if s.removeDetailLocked(apiName, modelName, detail) {
+			removed = append(removed, detail)
+		}
+	}
+	if len(removed) > 0 {
+		s.invalidateSummaryLocked()
+	}
+	return removed
+}
+
 func (s *RequestStatistics) decrementCounters(d RequestDetail, apiSt *apiStats, modelSt *modelStats, modelName string) {
 	totals := detailTotalsFromRequest(d)
 	s.totalRequests--
@@ -4107,9 +4381,18 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		return result
 	}
 
+	s.storageControlMu.Lock()
+	defer s.storageControlMu.Unlock()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.snapshotLocked()
+	store := s.eventStore
+	result = s.snapshotLocked()
+	s.mu.RUnlock()
+	if store != nil {
+		if err := store.populateSnapshotDetails(context.Background(), &result); err != nil {
+			s.recordEventStoreFailure(err, false)
+		}
+	}
+	return result
 }
 
 func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
@@ -4216,12 +4499,185 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	if s == nil {
 		return result
 	}
+	s.storageControlMu.Lock()
+	defer s.storageControlMu.Unlock()
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store != nil {
+		return s.mergeSnapshotSQLite(store, snapshot, time.Now())
+	}
 
 	s.mu.Lock()
 	result, persisted := s.mergeSnapshotLocked(snapshot, true, time.Now())
 	s.mu.Unlock()
-	for _, detail := range persisted {
-		s.enqueueStorageDetail(detail)
+	_ = persisted
+	return result
+}
+
+// pruneSQLiteLocked applies the current SQL retention policy and aggregate
+// state update as one transaction. The caller must hold storageControlMu and
+// s.mu.
+func (s *RequestStatistics) pruneSQLiteLocked(store *eventStore, now time.Time) error {
+	if s == nil || store == nil {
+		return nil
+	}
+	db, err := store.database()
+	if err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite prune: %w", err)
+	}
+	defer tx.Rollback()
+	pruneResult, err := store.pruneTx(context.Background(), tx, s.maxDetailsPerModel, s.retention, now)
+	if err != nil {
+		return err
+	}
+	previousLastRecordedAt := s.lastRecordedAt
+	previousEvictedTotal := s.evictedTotal
+	previousSummaryVersion := s.summaryVersion
+	retentionRemoved := s.applyRetentionRemovalsLocked(pruneResult.RetentionDetails)
+	if pruneResult.Removed > 0 {
+		s.evictedTotal += pruneResult.Removed
+	}
+	aggregate := s.snapshotLocked()
+	rollback := func() {
+		for _, removed := range retentionRemoved {
+			s.recordDetailLocked(strings.TrimSpace(removed.UpstreamAPI), normalizeModelName(removed.Model), removed, requestDedupKey{}, now, false, false)
+		}
+		s.lastRecordedAt = previousLastRecordedAt
+		s.evictedTotal = previousEvictedTotal
+		s.invalidateSummaryLocked()
+		s.summaryVersion = previousSummaryVersion
+	}
+	if err := store.saveAggregateTx(context.Background(), tx, aggregate); err != nil {
+		rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		rollback()
+		return fmt.Errorf("commit sqlite prune: %w", err)
+	}
+	return nil
+}
+
+func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot StatisticsSnapshot, now time.Time) MergeResult {
+	result := MergeResult{}
+	if store == nil {
+		return result
+	}
+	s.mu.RLock()
+	maxDetails := s.maxDetailsPerModel
+	retention := s.retention
+	s.mu.RUnlock()
+	var cutoff time.Time
+	if retention > 0 {
+		cutoff = now.Add(-retention)
+	}
+	db, err := store.database()
+	if err != nil {
+		s.recordEventStoreFailure(err, false)
+		return result
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		s.recordEventStoreFailure(fmt.Errorf("begin snapshot import: %w", err), false)
+		return result
+	}
+	defer tx.Rollback()
+	type importedEvent struct {
+		api    string
+		model  string
+		detail RequestDetail
+	}
+	addedEvents := make([]importedEvent, 0)
+	for apiName, apiSnapshot := range snapshot.APIs {
+		apiName = strings.TrimSpace(apiName)
+		if apiName == "" {
+			continue
+		}
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelName = normalizeModelName(modelName)
+			for _, detail := range modelSnapshot.Details {
+				detail.Model = normalizeDetailModelName(modelName, detail.Model)
+				if detail.Timestamp.IsZero() {
+					detail.Timestamp = now
+				}
+				if detail.LatencyMs < 0 {
+					detail.LatencyMs = 0
+				}
+				if detail.TTFTMs < 0 {
+					detail.TTFTMs = 0
+				}
+				detail.Tokens.TotalTokens = detailTotalTokensForRequest(detail)
+				detail.Source = cleanImportedDetailSource(detail)
+				apiKey := usageGroupKeyFromDetail(apiName, detail)
+				detail = normalizeImportedClientAPIIdentity(detail)
+				if !cutoff.IsZero() && detail.Timestamp.Before(cutoff) {
+					result.IgnoredByRetention++
+					continue
+				}
+				row := eventRowFromDetail(apiKey, detail.Model, detail)
+				fingerprint := eventFingerprint(apiKey, detail.Model, detail)
+				if _, added, err := store.insertEventTx(context.Background(), tx, row, fingerprint, true, cutoff); err != nil {
+					s.recordEventStoreFailure(err, false)
+					return MergeResult{}
+				} else if !added {
+					result.Skipped++
+					continue
+				}
+				addedEvents = append(addedEvents, importedEvent{api: apiKey, model: detail.Model, detail: detail})
+				result.Added++
+			}
+		}
+	}
+	pruneResult, err := store.pruneTx(context.Background(), tx, maxDetails, retention, now)
+	if err != nil {
+		s.recordEventStoreFailure(err, false)
+		return MergeResult{}
+	}
+
+	s.mu.Lock()
+	previousLastRecordedAt := s.lastRecordedAt
+	previousEvictedTotal := s.evictedTotal
+	previousSummaryVersion := s.summaryVersion
+	for _, added := range addedEvents {
+		s.recordDetailLocked(added.api, added.model, added.detail, requestDedupKey{}, now, false, false)
+	}
+	retentionRemoved := s.applyRetentionRemovalsLocked(pruneResult.RetentionDetails)
+	if pruneResult.Removed > 0 {
+		s.evictedTotal += pruneResult.Removed
+	}
+	aggregate := s.snapshotLocked()
+	s.mu.Unlock()
+
+	rollback := func() {
+		s.mu.Lock()
+		for _, removed := range retentionRemoved {
+			s.recordDetailLocked(strings.TrimSpace(removed.UpstreamAPI), normalizeModelName(removed.Model), removed, requestDedupKey{}, now, false, false)
+		}
+		for i := len(addedEvents) - 1; i >= 0; i-- {
+			added := addedEvents[i]
+			s.removeDetailLocked(added.api, added.model, added.detail)
+		}
+		s.lastRecordedAt = previousLastRecordedAt
+		s.evictedTotal = previousEvictedTotal
+		s.invalidateSummaryLocked()
+		s.summaryVersion = previousSummaryVersion
+		s.mu.Unlock()
+	}
+
+	if err := store.saveAggregateTx(context.Background(), tx, aggregate); err != nil {
+		rollback()
+		s.recordEventStoreFailure(err, false)
+		return MergeResult{}
+	}
+	if err := tx.Commit(); err != nil {
+		rollback()
+		s.recordEventStoreFailure(fmt.Errorf("commit snapshot import: %w", err), false)
+		return MergeResult{}
 	}
 	return result
 }
@@ -4306,7 +4762,7 @@ func (s *RequestStatistics) mergeSnapshotLocked(snapshot StatisticsSnapshot, per
 }
 
 func (s *RequestStatistics) recordImported(apiName, modelName string, detail RequestDetail, dedup requestDedupKey, now time.Time) bool {
-	return s.recordDetailLocked(apiName, modelName, detail, dedup, now, false)
+	return s.recordDetailLocked(apiName, modelName, detail, dedup, now, false, false)
 }
 
 func snapshotImportDetailCapacity(snapshot StatisticsSnapshot, cutoff time.Time, now time.Time) int64 {
@@ -4718,6 +5174,8 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 		return s.SummaryWithoutDetailsAt(now)
 	}
 
+	s.storageControlMu.Lock()
+	defer s.storageControlMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -4736,7 +5194,7 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 	}
 
 	s.summaryCacheMisses++
-	summary := s.buildSummaryWithoutDetailsForRangeLocked(now, healthWindow, cutoff, clientAPI)
+	summary := s.buildSummaryWithoutDetailsForRangeLocked(now, healthWindow, cutoff, rangeKey, clientAPI)
 	s.summaryRangeCache[cacheKey] = cloneDashboardSummary(summary)
 	s.summaryRangeCacheWindow[cacheKey] = healthWindow
 	s.pruneSummaryRangeCacheLocked(cacheKey)
@@ -5044,7 +5502,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 	// Metadata
 	summary.Meta.RetentionDays = int(s.retention.Hours() / 24)
 	summary.Meta.MaxDetailsPerModel = s.maxDetailsPerModel
-	summary.Meta.CurrentDetailCount = s.countDetailsLocked()
+	summary.Meta.CurrentDetailCount = s.currentDetailCountLocked()
 	summary.Meta.CurrentHour = now.Hour()
 	summary.Meta.EvictedTotal = s.evictedTotal
 	summary.Meta.SummaryVersion = s.summaryVersion
@@ -5065,8 +5523,9 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 }
 
 // buildSummaryWithoutDetailsForRangeLocked scans all events within the cutoff window
-// and builds a fresh DashboardSummary. Caller must hold s.mu.
-func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Time, healthWindow time.Time, cutoff time.Time, clientAPI string) DashboardSummary {
+// and builds a fresh DashboardSummary. Caller must hold s.mu and the storage
+// control lock when a SQLite store is configured.
+func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Time, healthWindow time.Time, cutoff time.Time, rangeKey string, clientAPI string) DashboardSummary {
 	summary := DashboardSummary{}
 
 	// Usage accumulators
@@ -5088,159 +5547,185 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	clientAPIAgg := make(map[string]*clientAPIStatAccumulator)
 	apiAgg := make(map[string]*apiRangeAgg)
 
-	for apiName, apiSt := range s.apis {
-		if apiSt == nil {
-			continue
+	accumulateDetail := func(apiName, modelName string, detail RequestDetail) {
+		totals := detailTotalsFromRequest(detail)
+		dModel := detailModel(modelName, detail)
+
+		// Global usage
+		totalRequests++
+		if detail.Failed {
+			failureCount++
+		} else {
+			successCount++
 		}
-		for modelName, modelSt := range apiSt.Models {
-			if modelSt == nil {
+		totalTokens += totals.totalTokens
+		inputTokens += totals.inputTokens
+		outputTokens += totals.outputTokens
+		cachedTokens += totals.cachedTokens
+		cacheWriteTokens += totals.cacheWriteTokens
+		reasoningTokens += totals.reasoningTokens
+		if detail.LatencyMs > 0 {
+			latencySum += detail.LatencyMs
+			latencyN++
+		}
+
+		// Day/hour time series
+		dayKey := detail.Timestamp.Format("2006-01-02")
+		hourKey := detail.Timestamp.Hour()
+		cost := s.detailCostLocked(modelName, detail, totals)
+		requestsByDay[dayKey]++
+		requestsByHour[hourKey]++
+		tokensByDay[dayKey] += totals.totalTokens
+		tokensByHour[hourKey] += totals.totalTokens
+		costByDay[dayKey] += cost
+		costByHour[hourKey] += cost
+
+		// Per-API aggregation
+		api := getOrCreateAPIRangeAgg(apiAgg, apiName)
+		api.TotalRequests++
+		if detail.Failed {
+			api.FailureCount++
+		} else {
+			api.SuccessCount++
+		}
+		api.TotalTokens += totals.totalTokens
+		api.InputTokens += totals.inputTokens
+		api.OutputTokens += totals.outputTokens
+		api.CachedTokens += totals.cachedTokens
+		api.CacheWriteTokens += totals.cacheWriteTokens
+		api.ReasoningTokens += totals.reasoningTokens
+		if detail.LatencyMs > 0 {
+			api.latencySum += detail.LatencyMs
+			api.latencyN++
+		}
+		rangeIncrementAPIModel(api, dModel, detail, totals)
+
+		// Model summary stats
+		ms, ok := modelAgg[dModel]
+		if !ok {
+			ms = &ModelStat{Model: dModel}
+			modelAgg[dModel] = ms
+		}
+		ms.TotalRequests++
+		if detail.Failed {
+			ms.FailureCount++
+		} else {
+			ms.SuccessCount++
+		}
+		ms.TotalTokens += totals.totalTokens
+		ms.InputTokens += totals.inputTokens
+		ms.OutputTokens += totals.outputTokens
+		ms.CachedTokens += totals.cachedTokens
+		ms.CacheWriteTokens += totals.cacheWriteTokens
+		ms.ReasoningTokens += totals.reasoningTokens
+		ms.providerStats = incrementModelProviderStats(ms.providerStats, detail.Provider, detail.Failed, totals)
+		if detail.LatencyMs > 0 {
+			ms.latencySum += detail.LatencyMs
+			ms.latencyN++
+		}
+
+		// Source stats
+		source := summarySourceKey(detail)
+		src, ok := sourceAgg[source]
+		if !ok {
+			src = &sourceStatAccumulator{
+				stat:      SourceStat{Source: source, Provider: detail.Provider},
+				providers: make(map[string]int64),
+			}
+			sourceAgg[source] = src
+		}
+		if src.stat.Provider == "" {
+			src.stat.Provider = detail.Provider
+		}
+		src.stat.TotalRequests++
+		if detail.Failed {
+			src.stat.FailureCount++
+		} else {
+			src.stat.SuccessCount++
+		}
+		src.stat.TotalTokens += totals.totalTokens
+
+		// Credential stats
+		credKey := summaryCredentialKey(detail)
+		cred, ok := credentialAgg[credKey]
+		if !ok {
+			cred = &CredentialStat{AuthIndex: credKey}
+			credentialAgg[credKey] = cred
+		}
+		cred.TotalRequests++
+		if detail.Failed {
+			cred.FailureCount++
+		} else {
+			cred.SuccessCount++
+		}
+		cred.TotalTokens += totals.totalTokens
+
+		// Client API stats
+		clientKey := clientAPIGroupKey(detail)
+		client, ok := clientAPIAgg[clientKey]
+		if !ok {
+			client = &clientAPIStatAccumulator{
+				stat: ClientAPIStat{
+					APIKey:     clientAPIGroupLabel(detail),
+					APIKeyHash: detail.APIKeyHash,
+				},
+				models: make(map[string]*ClientAPIModelStat),
+			}
+			clientAPIAgg[clientKey] = client
+		}
+		client.stat.TotalRequests++
+		if detail.Failed {
+			client.stat.FailureCount++
+		} else {
+			client.stat.SuccessCount++
+		}
+		client.stat.TotalTokens += totals.totalTokens
+		client.stat.InputTokens += totals.inputTokens
+		client.stat.OutputTokens += totals.outputTokens
+		client.stat.CachedTokens += totals.cachedTokens
+		client.stat.CacheWriteTokens += totals.cacheWriteTokens
+		client.stat.ReasoningTokens += totals.reasoningTokens
+		rangeIncrementClientModel(client, dModel, detail, totals)
+	}
+
+	if s.eventStore != nil {
+		q := EventsQuery{Range: rangeKey, ClientAPI: clientAPI}
+		if err := s.eventStore.forEachEvent(context.Background(), q, now, func(detail RequestDetail) error {
+			if !cutoff.IsZero() && (detail.Timestamp.IsZero() || detail.Timestamp.Before(cutoff)) {
+				return nil
+			}
+			if !clientAPISelectorMatchesDetail(clientAPI, detail) {
+				return nil
+			}
+			apiName := strings.TrimSpace(detail.UpstreamAPI)
+			if apiName == "" {
+				apiName = usageGroupKey(UsageRecord{})
+			}
+			accumulateDetail(apiName, normalizeModelName(detail.Model), detail)
+			return nil
+		}); err != nil {
+			s.eventStoreLastError = err.Error()
+		} else {
+			s.eventStoreLastError = ""
+		}
+	} else {
+		for apiName, apiSt := range s.apis {
+			if apiSt == nil {
 				continue
 			}
-			for _, detail := range modelSt.Details {
-				if !cutoff.IsZero() && (detail.Timestamp.IsZero() || detail.Timestamp.Before(cutoff)) {
+			for modelName, modelSt := range apiSt.Models {
+				if modelSt == nil {
 					continue
 				}
-				if !clientAPISelectorMatchesDetail(clientAPI, detail) {
-					continue
-				}
-				totals := detailTotalsFromRequest(detail)
-				dModel := detailModel(modelName, detail)
-
-				// Global usage
-				totalRequests++
-				if detail.Failed {
-					failureCount++
-				} else {
-					successCount++
-				}
-				totalTokens += totals.totalTokens
-				inputTokens += totals.inputTokens
-				outputTokens += totals.outputTokens
-				cachedTokens += totals.cachedTokens
-				cacheWriteTokens += totals.cacheWriteTokens
-				reasoningTokens += totals.reasoningTokens
-				if detail.LatencyMs > 0 {
-					latencySum += detail.LatencyMs
-					latencyN++
-				}
-
-				// Day/hour time series
-				dayKey := detail.Timestamp.Format("2006-01-02")
-				hourKey := detail.Timestamp.Hour()
-				cost := s.detailCostLocked(modelName, detail, totals)
-				requestsByDay[dayKey]++
-				requestsByHour[hourKey]++
-				tokensByDay[dayKey] += totals.totalTokens
-				tokensByHour[hourKey] += totals.totalTokens
-				costByDay[dayKey] += cost
-				costByHour[hourKey] += cost
-
-				// Per-API aggregation
-				api := getOrCreateAPIRangeAgg(apiAgg, apiName)
-				api.TotalRequests++
-				if detail.Failed {
-					api.FailureCount++
-				} else {
-					api.SuccessCount++
-				}
-				api.TotalTokens += totals.totalTokens
-				api.InputTokens += totals.inputTokens
-				api.OutputTokens += totals.outputTokens
-				api.CachedTokens += totals.cachedTokens
-				api.CacheWriteTokens += totals.cacheWriteTokens
-				api.ReasoningTokens += totals.reasoningTokens
-				if detail.LatencyMs > 0 {
-					api.latencySum += detail.LatencyMs
-					api.latencyN++
-				}
-				rangeIncrementAPIModel(api, dModel, detail, totals)
-
-				// Model summary stats
-				ms, ok := modelAgg[dModel]
-				if !ok {
-					ms = &ModelStat{Model: dModel}
-					modelAgg[dModel] = ms
-				}
-				ms.TotalRequests++
-				if detail.Failed {
-					ms.FailureCount++
-				} else {
-					ms.SuccessCount++
-				}
-				ms.TotalTokens += totals.totalTokens
-				ms.InputTokens += totals.inputTokens
-				ms.OutputTokens += totals.outputTokens
-				ms.CachedTokens += totals.cachedTokens
-				ms.CacheWriteTokens += totals.cacheWriteTokens
-				ms.ReasoningTokens += totals.reasoningTokens
-				ms.providerStats = incrementModelProviderStats(ms.providerStats, detail.Provider, detail.Failed, totals)
-				if detail.LatencyMs > 0 {
-					ms.latencySum += detail.LatencyMs
-					ms.latencyN++
-				}
-
-				// Source stats
-				source := summarySourceKey(detail)
-				src, ok := sourceAgg[source]
-				if !ok {
-					src = &sourceStatAccumulator{
-						stat:      SourceStat{Source: source, Provider: detail.Provider},
-						providers: make(map[string]int64),
+				for _, detail := range modelSt.Details {
+					if !cutoff.IsZero() && (detail.Timestamp.IsZero() || detail.Timestamp.Before(cutoff)) {
+						continue
 					}
-					sourceAgg[source] = src
-				}
-				if src.stat.Provider == "" {
-					src.stat.Provider = detail.Provider
-				}
-				src.stat.TotalRequests++
-				if detail.Failed {
-					src.stat.FailureCount++
-				} else {
-					src.stat.SuccessCount++
-				}
-				src.stat.TotalTokens += totals.totalTokens
-
-				// Credential stats
-				credKey := summaryCredentialKey(detail)
-				cred, ok := credentialAgg[credKey]
-				if !ok {
-					cred = &CredentialStat{AuthIndex: credKey}
-					credentialAgg[credKey] = cred
-				}
-				cred.TotalRequests++
-				if detail.Failed {
-					cred.FailureCount++
-				} else {
-					cred.SuccessCount++
-				}
-				cred.TotalTokens += totals.totalTokens
-
-				// Client API stats
-				clientKey := clientAPIGroupKey(detail)
-				client, ok := clientAPIAgg[clientKey]
-				if !ok {
-					client = &clientAPIStatAccumulator{
-						stat: ClientAPIStat{
-							APIKey:     clientAPIGroupLabel(detail),
-							APIKeyHash: detail.APIKeyHash,
-						},
-						models: make(map[string]*ClientAPIModelStat),
+					if !clientAPISelectorMatchesDetail(clientAPI, detail) {
+						continue
 					}
-					clientAPIAgg[clientKey] = client
+					accumulateDetail(apiName, modelName, detail)
 				}
-				client.stat.TotalRequests++
-				if detail.Failed {
-					client.stat.FailureCount++
-				} else {
-					client.stat.SuccessCount++
-				}
-				client.stat.TotalTokens += totals.totalTokens
-				client.stat.InputTokens += totals.inputTokens
-				client.stat.OutputTokens += totals.outputTokens
-				client.stat.CachedTokens += totals.cachedTokens
-				client.stat.CacheWriteTokens += totals.cacheWriteTokens
-				client.stat.ReasoningTokens += totals.reasoningTokens
-				rangeIncrementClientModel(client, dModel, detail, totals)
 			}
 		}
 	}
@@ -5379,7 +5864,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	// Metadata (uses global counters, not range-scoped).
 	summary.Meta.RetentionDays = int(s.retention.Hours() / 24)
 	summary.Meta.MaxDetailsPerModel = s.maxDetailsPerModel
-	summary.Meta.CurrentDetailCount = s.countDetailsLocked()
+	summary.Meta.CurrentDetailCount = s.currentDetailCountLocked()
 	summary.Meta.CurrentHour = now.Hour()
 	summary.Meta.EvictedTotal = s.evictedTotal
 	summary.Meta.SummaryVersion = s.summaryVersion
@@ -6339,17 +6824,40 @@ func dashboardEventMatches(d RequestDetail, params EventsQuery, cutoff time.Time
 }
 
 // QueryEvents returns paginated, filtered event details.
+// The SQLite path intentionally queries the live table with LIMIT/OFFSET;
+// newly recorded events can therefore move later page contents, matching the
+// existing dashboard pagination behavior.
 func (s *RequestStatistics) QueryEvents(params EventsQuery) EventsResult {
 	return s.QueryEventsAt(params, time.Now())
 }
 
 func (s *RequestStatistics) QueryEventsAt(params EventsQuery, now time.Time) EventsResult {
+	if s != nil {
+		s.mu.RLock()
+		store := s.eventStore
+		s.mu.RUnlock()
+		if store != nil {
+			startedAt := time.Now()
+			result, err := store.queryEvents(context.Background(), params, now)
+			if err != nil {
+				s.recordEventStoreFailure(err, false)
+				return EventsResult{}
+			}
+			s.mu.Lock()
+			result.dashboardVersion = s.summaryVersion
+			s.lastEventsQueryDuration = time.Since(startedAt)
+			s.lastEventsQueryTotal = result.Total
+			s.eventStoreLastError = ""
+			s.mu.Unlock()
+			return result
+		}
+	}
 	return s.queryEventsAt(params, true, 0, now)
 }
 
 // QueryAllEvents returns every matching event for backend-generated exports.
 func (s *RequestStatistics) QueryAllEvents(params EventsQuery) EventsResult {
-	return s.queryEventsAt(params, false, 0, time.Now())
+	return s.QueryExportEventsAt(params, 0, time.Now())
 }
 
 // QueryExportEvents returns matching events up to maxRecords while still
@@ -6359,6 +6867,29 @@ func (s *RequestStatistics) QueryExportEvents(params EventsQuery, maxRecords int
 }
 
 func (s *RequestStatistics) QueryExportEventsAt(params EventsQuery, maxRecords int, now time.Time) EventsResult {
+	if s != nil {
+		s.mu.RLock()
+		store := s.eventStore
+		s.mu.RUnlock()
+		if store != nil {
+			startedAt := time.Now()
+			params = normalizeEventsQuery(params, false)
+			result, err := store.queryEventsPage(context.Background(), params, now, maxRecords, 0)
+			if err != nil {
+				s.recordEventStoreFailure(err, false)
+				return EventsResult{}
+			}
+			result.Limit = exportResultLimit(result.Total, maxRecords)
+			result.Truncated = maxRecords > 0 && result.Total > maxRecords
+			s.mu.Lock()
+			result.dashboardVersion = s.summaryVersion
+			s.lastEventsQueryDuration = time.Since(startedAt)
+			s.lastEventsQueryTotal = result.Total
+			s.eventStoreLastError = ""
+			s.mu.Unlock()
+			return result
+		}
+	}
 	return s.queryEventsAt(params, false, maxRecords, now)
 }
 
@@ -6379,6 +6910,29 @@ func (s *RequestStatistics) QueryExportEventsPage(params EventsQuery, offset int
 	params = normalizeEventsQuery(params, false)
 	if snapshotAt.IsZero() {
 		snapshotAt = startedAt
+	}
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store != nil {
+		params = normalizeEventsQuery(params, false)
+		params.Before = snapshotAt
+		pageCapacity := exportPageEventCapacity(pageLimit, offset, maxRecords)
+		result, err := store.queryEventsPage(context.Background(), params, snapshotAt, pageCapacity, offset)
+		if err != nil {
+			s.recordEventStoreFailure(err, false)
+			return EventsResult{}
+		}
+		result.Offset = offset
+		result.Limit = exportResultLimit(result.Total, maxRecords)
+		result.Truncated = maxRecords > 0 && result.Total > maxRecords
+		s.mu.Lock()
+		result.dashboardVersion = s.summaryVersion
+		s.lastEventsQueryDuration = time.Since(startedAt)
+		s.lastEventsQueryTotal = result.Total
+		s.eventStoreLastError = ""
+		s.mu.Unlock()
+		return result
 	}
 
 	s.mu.Lock()
@@ -6623,7 +7177,54 @@ func (s *RequestStatistics) QueryAPIDetailAt(api string, rangeKey string, recent
 	return s.QueryAPIDetailForClientAPIAt(api, rangeKey, "", recentLimit, errorLimit, now)
 }
 
+// QueryAPIDetailPageAt reads the aggregate and recent request page from the
+// SQLite event store. Only the bounded recent page and dimension aggregates are
+// materialized in Go; the full request-event table never enters the heap.
+func (s *RequestStatistics) QueryAPIDetailPageAt(api, rangeKey, clientAPI string, recentLimit, recentOffset, errorLimit int, now time.Time) APIDetailResponse {
+	if s == nil {
+		return APIDetailResponse{}
+	}
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store == nil {
+		result := s.QueryAPIDetailForClientAPIAt(api, rangeKey, clientAPI, recentLimit, errorLimit, now)
+		result.RecentTotal = result.TotalEvents
+		result.RecentLimit = recentLimit
+		result.RecentOffset = recentOffset
+		if recentOffset > 0 && recentOffset < len(result.RecentEvents) {
+			result.RecentEvents = result.RecentEvents[recentOffset:]
+		} else if recentOffset >= len(result.RecentEvents) {
+			result.RecentEvents = []RequestDetail{}
+		}
+		return result
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	startedAt := time.Now()
+	result, err := store.queryAPIDetail(context.Background(), api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now)
+	if err != nil {
+		s.recordEventStoreFailure(err, false)
+		return APIDetailResponse{API: api, RecentLimit: recentLimit, RecentOffset: recentOffset, GeneratedAt: now.UTC().Format(time.RFC3339)}
+	}
+	s.mu.Lock()
+	result.dashboardVersion = s.summaryVersion
+	s.apiDetailQueries++
+	s.lastAPIDetailDuration = time.Since(startedAt)
+	s.lastAPIDetailTotal = result.TotalEvents
+	s.eventStoreLastError = ""
+	s.mu.Unlock()
+	return result
+}
+
 func (s *RequestStatistics) QueryAPIDetailForClientAPIAt(api string, rangeKey string, clientAPI string, recentLimit int, errorLimit int, now time.Time) APIDetailResponse {
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store != nil {
+		return s.QueryAPIDetailPageAt(api, rangeKey, clientAPI, recentLimit, 0, errorLimit, now)
+	}
 	startedAt := time.Now()
 	if now.IsZero() {
 		now = startedAt
@@ -6902,9 +7503,31 @@ func (s *RequestStatistics) countDetailsLocked() int64 {
 	return count
 }
 
+func (s *RequestStatistics) currentDetailCountLocked() int64 {
+	if s == nil {
+		return 0
+	}
+	if s.eventStore != nil {
+		if count, err := s.eventStore.count(context.Background()); err == nil {
+			return count
+		}
+	}
+	return s.countDetailsLocked()
+}
+
 func (s *RequestStatistics) DetailCount() int64 {
 	if s == nil {
 		return 0
+	}
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store != nil {
+		count, err := store.count(context.Background())
+		if err == nil {
+			return count
+		}
+		s.recordEventStoreFailure(err, false)
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -6935,9 +7558,16 @@ func (s *RequestStatistics) Close() {
 	}
 	s.stopStorageWorker()
 	s.stopModelsDevPriceWorker()
+	s.storageControlMu.Lock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	store := s.eventStore
+	s.eventStore = nil
 	s.closeStorageLocked()
+	s.mu.Unlock()
+	if store != nil {
+		_ = store.close()
+	}
+	s.storageControlMu.Unlock()
 }
 
 func (s *RequestStatistics) ConfigSnapshot() ExportConfig {
@@ -6947,22 +7577,17 @@ func (s *RequestStatistics) ConfigSnapshot() ExportConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return ExportConfig{
-		RetentionDays:                 int(s.retention.Hours() / 24),
-		MaxDetailsPerModel:            s.maxDetailsPerModel,
-		DedupWindowMinutes:            int(s.dedupWindow.Minutes()),
-		LogResponseHeaders:            s.logResponseHeaders.String(),
-		StorageEnabled:                s.storageEnabled,
-		StoragePath:                   s.storagePath,
-		StorageFlushSeconds:           int(s.storageFlush.Seconds()),
-		StorageSnapshotSeconds:        int(s.storageSnapshotInterval.Seconds()),
-		StorageSnapshotRecordInterval: s.storageSnapshotRecordInterval,
-		StorageSyncSeconds:            int(s.storageSyncInterval.Seconds()),
-		StorageSyncRecordInterval:     s.storageSyncRecordInterval,
-		ExportMaxRecords:              s.exportMaxRecords,
-		PriceStoragePath:              s.priceStoragePath,
-		ModelsDevPricesEnabled:        s.modelsDevPricesEnabled,
-		ModelsDevPricesURL:            s.modelsDevPricesURL,
-		ModelsDevRefreshSeconds:       int(s.modelsDevRefresh.Seconds()),
+		RetentionDays:           int(s.retention.Hours() / 24),
+		MaxDetailsPerModel:      s.maxDetailsPerModel,
+		DedupWindowMinutes:      int(s.dedupWindow.Minutes()),
+		LogResponseHeaders:      s.logResponseHeaders.String(),
+		StorageEnabled:          s.storageEnabled,
+		StoragePath:             s.storagePath,
+		ExportMaxRecords:        s.exportMaxRecords,
+		PriceStoragePath:        s.priceStoragePath,
+		ModelsDevPricesEnabled:  s.modelsDevPricesEnabled,
+		ModelsDevPricesURL:      s.modelsDevPricesURL,
+		ModelsDevRefreshSeconds: int(s.modelsDevRefresh.Seconds()),
 	}
 }
 
@@ -6985,54 +7610,24 @@ func (s *RequestStatistics) StorageStatus() StorageStatus {
 }
 
 func (s *RequestStatistics) storageStatusLocked() StorageStatus {
-	queueLength, queueCapacity := 0, 0
-	writePressure := ""
-	if s.storageEnabled {
-		queueLength = s.storageWriteQueueLength
-		queueCapacity = s.storageWriteQueueCapacity
-		writePressure = storageWritePressure(queueLength, queueCapacity, s.storageWriteQueueWaitAvg)
-	}
 	status := StorageStatus{
-		Enabled:                       s.storageEnabled,
-		Path:                          s.storagePath,
-		LoadedPath:                    s.storageLoadedPath,
-		LastError:                     s.storageLastError,
-		PendingBufferedRecords:        s.storageBuffered,
-		PendingSnapshotRecords:        s.storageSnapshotRecords,
-		PendingUnsyncedRecords:        s.storageUnsyncedRecords,
-		WriteQueueLength:              queueLength,
-		WriteQueueCapacity:            queueCapacity,
-		LastWriteBatchRecords:         s.storageLastWriteBatchRecords,
-		LastWriteBatchDurationMs:      storageDurationMilliseconds(s.storageLastWriteBatchDuration),
-		LastWriteQueueWaitMs:          storageDurationMilliseconds(s.storageLastWriteQueueWait),
-		WriteBatchesTotal:             s.storageWriteBatchesTotal,
-		WriteRecordsTotal:             s.storageWriteRecordsTotal,
-		WriteBatchAvgDurationMs:       storageDurationMilliseconds(s.storageWriteBatchDurationAvg),
-		WriteBatchP95DurationMs:       storageDurationMilliseconds(storageDurationPercentile(s.storageWriteBatchDurations, 0.95)),
-		WriteBatchP99DurationMs:       storageDurationMilliseconds(storageDurationPercentile(s.storageWriteBatchDurations, 0.99)),
-		WriteQueueWaitAvgMs:           storageDurationMilliseconds(s.storageWriteQueueWaitAvg),
-		WriteQueueWaitP95Ms:           storageDurationMilliseconds(storageDurationPercentile(s.storageWriteQueueWaits, 0.95)),
-		WriteQueueWaitP99Ms:           storageDurationMilliseconds(storageDurationPercentile(s.storageWriteQueueWaits, 0.99)),
-		WriteQueueWaitMaxMs:           storageDurationMilliseconds(s.storageWriteQueueWaitMax),
-		WritePressure:                 writePressure,
-		LastCompactedShards:           s.storageLastCompactedShards,
-		CompactedShardsTotal:          s.storageCompactedShardsTotal,
-		SnapshotIntervalSeconds:       int(s.storageSnapshotInterval.Seconds()),
-		SnapshotRecordIntervalRecords: s.storageSnapshotRecordInterval,
-		SyncIntervalSeconds:           int(s.storageSyncInterval.Seconds()),
-		SyncRecordIntervalRecords:     s.storageSyncRecordInterval,
+		Backend:       "sqlite",
+		Enabled:       s.storageEnabled,
+		Path:          s.storagePath,
+		LastError:     s.eventStoreLastError,
+		DroppedEvents: s.droppedEvents,
 	}
-	if !s.storageLastFlush.IsZero() {
-		status.LastFlushAt = s.storageLastFlush.UTC().Format(time.RFC3339)
+	if s.eventStore != nil {
+		status.DatabasePath = s.eventStore.path
+		if count, err := s.eventStore.count(context.Background()); err == nil {
+			status.EventCount = count
+		}
+		if info, err := os.Stat(s.eventStore.path); err == nil {
+			status.DatabaseSizeBytes = info.Size()
+		}
 	}
-	if !s.storageLastSnapshot.IsZero() {
-		status.LastSnapshotAt = s.storageLastSnapshot.UTC().Format(time.RFC3339)
-	}
-	if !s.storageLastCompaction.IsZero() {
-		status.LastCompactionAt = s.storageLastCompaction.UTC().Format(time.RFC3339)
-	}
-	if !s.storageLastSync.IsZero() {
-		status.LastSyncAt = s.storageLastSync.UTC().Format(time.RFC3339)
+	if !s.eventStoreLastWrite.IsZero() {
+		status.LastWriteAt = s.eventStoreLastWrite.UTC().Format(time.RFC3339)
 	}
 	return status
 }

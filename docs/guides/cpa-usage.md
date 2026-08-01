@@ -55,8 +55,7 @@ plugins:
 
 把下面这些文件复制一份到别的地方：
 - `config.yaml`（CPA 配置文件）
-- `data/usage-statistics/` 目录（历史统计数据）
-- `data/usage-statistics.jsonl`（如果用的是单文件模式）
+- `data/usage-statistics.db`（SQLite 统计数据库）
 - 价格配置文件（通常叫 `usage-statistics-prices.json`）
 
 **第 2 步：关掉 CPA**
@@ -67,7 +66,7 @@ plugins:
 
 去 `plugins/` 目录下，删除所有文件名带 `usage-statistics` 的 `.so` / `.dylib` / `.dll` 文件。
 
-> ⚠️ **注意**：`data/usage-statistics/` 数据目录**不要删**！里面是你的历史统计数据，新插件还能继续用。
+> ⚠️ **注意**：`data/usage-statistics.db` 数据库文件**不要删**！里面是你的历史统计数据，新插件会直接使用它。旧 JSONL 文件不会被运行时读取或迁移，如需保留请单独备份。
 
 **第 4 步：改配置**
 
@@ -99,7 +98,7 @@ plugins:
     usage-dashboard-zduu:
       enabled: true
       storage_enabled: true
-      storage_path: data/usage-statistics.jsonl
+      storage_path: data/usage-statistics.db
       price_storage_path: data/usage-statistics-prices.json
       models_dev_prices_enabled: true
 ```
@@ -268,30 +267,20 @@ plugins:
         version: "2.5.3"
         release-tag: "v2.5.3"
         repository: "https://github.com/zduu/cpa-usage-plugin"
-      # 每个上游接口/模型最多保留的请求明细条数。默认 5000。
-      max_details_per_model: 5000
-      # 内存统计最多保留的天数，0 表示不按时间淘汰。默认 30。
-      retention_days: 30
-      # 兼容旧配置；导入会跳过精确重复记录，实时 usage 记录和持久化重放不会按窗口去重。默认 1440（24小时）。
+      # 每个上游接口/模型最多保留的请求明细条数。默认 1000。
+      max_details_per_model: 1000
+      # SQLite 事件和内存统计最多保留的天数，0 表示不按时间淘汰。默认 7。
+      retention_days: 7
+      # 兼容旧配置；导入会跳过精确重复记录，实时 SQLite 事件写入不会按窗口去重。默认 1440（24小时）。
       dedup_window_minutes: 1440
       # 可选：允许记录的响应头名称列表（逗号分隔），* 表示全部。留空不记录。
       log_response_headers: ""
       # 可选：API key 分组 hash salt。留空使用插件默认稳定 salt；固定后可使用实例自定义 hash。
       api_key_hash_salt: ""
-      # 推荐生产开启 JSONL 事件持久化，避免重启丢失统计。插件默认 false。
+      # 是否启用 SQLite 事件持久化。关闭时使用关闭后自动删除的临时数据库。
       storage_enabled: true
-      # 可选：JSONL 持久化路径。相对路径基于 CPA 工作目录；*.jsonl 旧单文件会兼容读取。
-      storage_path: data/usage-statistics.jsonl
-      # 推荐生产使用 5 秒 flush；插件默认 30。
-      storage_flush_interval_seconds: 5
-      # 可选：持久化 snapshot 最大写入间隔秒数。默认 300，0 表示只按记录数触发。
-      storage_snapshot_interval_seconds: 300
-      # 可选：每新增多少条持久化记录写一次 snapshot。默认 1000，0 表示只按时间触发。
-      storage_snapshot_record_interval: 1000
-      # 可选：持久化文件 fsync 最大间隔秒数。默认 0，不按时间强制同步。
-      storage_sync_interval_seconds: 0
-      # 可选：每新增多少条持久化记录执行一次 fsync。默认 0，不按记录数强制同步。
-      storage_sync_record_interval: 0
+      # SQLite 数据库路径。相对路径基于 CPA 工作目录，父目录会自动创建。
+      storage_path: data/usage-statistics.db
       # 可选：看板事件导出最多返回的明细条数。默认 100000，0 表示不限制。
       export_max_records: 100000
       # 可选：模型价格表 JSON 文件路径。相对路径基于 CPA 工作目录。
@@ -365,7 +354,7 @@ pluginhost: plugin registered plugin_id=usage-dashboard-zduu plugin_name=用量�
 - **上游接口统计**：按上游接口聚合，点击查看模型分布和最近请求详情；最近请求会在有数据时显示推理强度、请求端点和生成速度。
 - **模型统计**：跨接口的模型汇总，包含请求数、token、平均延迟、成功率和费用。
 - **模型价格查询与设置**：查询和设置位于同一个默认收起的展开区。查询框支持按模型名或 `provider/model` 输入匹配，会搜索完整价格表但一次最多显示 100 项，超过时提示匹配总数；选择后只读查看输入、输出、缓存读取和缓存写入价格（US$/M token）。设置输入会列出实际用量中出现过的 `provider/model` 上游组合，也允许直接输入新的组合；裸模型名仍可手动输入，作为所有上游的回退价格。使用 `provider/modelname` 可为不同上游的同名模型分别定价。价格跨设备共享，可启用 models.dev 默认价格源并由后端定时拉取 `input`/`output`/`cache_read`/`cache_write` 基础价格；缺少 `cache_write` 时视为价格未知并默认使用 0，不自动推算写入费率。手动价格覆盖默认价格，模型名匹配大小写不敏感；收费模型需显式填写实际写入价格，免费模型填写 0。models.dev 的分层价格需要当前请求上下文长度等字段，CPA v7 当前 usage 插件接口未提供这些字段，因此本插件暂不使用 `tiers`/`context_over_200k`。
-- **请求事件明细**：按模型、来源、凭证筛选，滚动表格查看。默认最多显示 500 条。
+- **请求事件明细**：按模型、来源、凭证筛选，使用服务端分页表格查看。默认每页 50 条，最多显示当前页。
 - **导出**：当前接口明细或全量事件的 CSV/JSON 导出。
 - **导入**：上传 JSON 文件导入统计数据，完成后显示新增/跳过/过期忽略的明细数；导入后摘要会重新聚合客户端 API、模型、来源和健康网格。
 
@@ -375,7 +364,7 @@ pluginhost: plugin registered plugin_id=usage-dashboard-zduu plugin_name=用量�
 - 事件明细表格通过 `/dashboard-events` 加载，页面以滚动表格展示，单次最多 500 条。
 - 事件明细刷新会复用 ETag 条件请求缓存；如果遇到等价的 304 空响应、临时网络错误或 5xx 响应，内置看板会保留上一次成功加载的明细和总数，避免短暂失败后误显示为 0 条。
 - 保留策略自动控制内存占用：`retention_days` 定义统计保留窗口，`max_details_per_model` 只限制每个上游接口/模型保留的最近请求明细数量。
-- 可选 JSONL 持久化通过 `storage_enabled` 开启，重启后会 replay 持久化事件并继续应用保留策略。
+- SQLite 事件持久化通过 `storage_enabled` 开启；重启后恢复累计统计和事件明细，并继续应用保留策略。
 - 页面底部 `_meta` 区域可见当前保留配置、已存储明细数和累积淘汰数。
 
 ## 6. 管理 API 使用
@@ -470,7 +459,7 @@ curl http://127.0.0.1:8317/v0/management/plugins/usage-dashboard-zduu/health \
 
 `dashboard-events-export` 和后台导出任务默认最多返回 `export_max_records` 条明细，也可以用 `limit` 为单次导出指定更小上限；JSON 响应会带 `truncated`，CSV/JSONL 响应头会带 `X-Total-Count`、`X-Exported-Count` 和 `X-Export-Truncated`。需要完全不限制时可配置 `export_max_records: 0`，但超大导出会增加 CPA 管理接口内存和响应体压力。
 
-顶层 `status` 会在无告警时为 `ok`，存在持久化写入压力、持久化错误、最近导出截断、最近导出耗时超过 5 秒、writer p99 写入/排队超过 1 秒，或条件请求样本不少于 20 次且 304 命中率低于 20% 时变为 `warn`/`error`，并在 `alerts` 中返回结构化 `severity`、`code` 和 `message`，便于外部监控直接告警。`storage` 字段会返回持久化状态、后台写入队列长度、最近 writer 批次指标、writer 滑动平均、p95/p99 长尾指标和 `write_pressure`、最近和累计清理旧分片数量、待 flush/sync/snapshot 记录数和最近错误；`runtime` 字段会返回摘要缓存命中/未命中、事件缓存命中/未命中、事件索引条目数、条件请求 304 命中率、事件导出请求数/gzip 数/截断数/最近耗时/响应大小，以及最近 summary/events/api-detail 查询耗时，便于观察看板压力、筛选性能和大导出压力。
+顶层 `status` 会在无告警时为 `ok`；SQLite 错误会变为 `error`，最近导出截断、最近导出耗时超过 5 秒，或条件请求样本不少于 20 次且 304 命中率低于 20% 时会产生 `warn`，并在 `alerts` 中返回结构化 `severity`、`code` 和 `message`。`storage` 字段返回 `backend`、`database_path`、`event_count`、`database_size_bytes`、`last_write_at`、`last_error` 和 `dropped_events`；`runtime` 字段返回摘要/事件缓存、事件查询、条件请求和导出指标，便于观察看板压力与大导出压力。
 
 ### 数据导出
 
@@ -491,9 +480,9 @@ curl -X POST http://127.0.0.1:8317/v0/management/plugins/usage-dashboard-zduu/us
 导入响应包含 `added`（新增条数）、`skipped`（去重跳过）、`ignored_by_retention`（超出保留窗口忽略）。导入去重会区分上游分组、模型、时间、来源、上游凭证、客户端 API 身份、延迟、TTFT、失败状态码、错误文本和 token 统计，避免不同客户端 API key 或不同失败结果的同形请求被误合并。
 同时包含 `input_records`（输入记录数）、`accepted_records`（被处理记录数）、`rejected_records`（校验拒绝数）、`total_requests` 和 `failed_requests`，便于核对导入结果。
 
-## 7. 数据持久化（可选）
+## 7. 数据持久化
 
-默认 `storage_enabled: false`，统计只保存在插件进程内存中，重启 CPA/容器后会清零。需要重启或更新插件后保留数据时，开启 JSONL 持久化，并把 `storage_path` 放到宿主机挂载目录中。
+插件使用 SQLite 保存请求事件明细和版本化累计统计。默认 `storage_enabled: true`，数据库路径默认为 `data/usage-statistics.db`；`storage_enabled: false` 时仍使用 SQLite，但数据库是插件关闭后自动删除的临时文件。关闭持久化不会切换回 JSONL 或内存明细模式。
 
 推荐在 `docker-compose.yml` 的 `volumes` 中增加数据目录挂载：
 
@@ -517,27 +506,17 @@ plugins:
     usage-dashboard-zduu:
       enabled: true
       storage_enabled: true
-      storage_path: data/usage-statistics.jsonl
-      storage_flush_interval_seconds: 5
-      storage_snapshot_interval_seconds: 300
-      storage_snapshot_record_interval: 1000
-      storage_sync_interval_seconds: 0
-      storage_sync_record_interval: 0
+      storage_path: data/usage-statistics.db
 ```
 
 说明：
 
-- 不配置或保持 `storage_enabled: false` 时，就是原来的内存模式，重启清零。
-- 开启后每条新请求会进入后台写入队列，由后台 writer 批量追加写入日期分片，例如 `data/usage-statistics/usage-2026-06-28.jsonl`；插件启动时只 replay 保留窗口内的日期分片。
-- 如果 `storage_path` 配置为历史单文件路径（如 `data/usage-statistics.jsonl`），插件会继续读取该旧文件作为兼容输入，新数据会写入同名目录 `data/usage-statistics/` 下的日期分片。
-- 插件正常关闭、日期分片切换、达到 `storage_snapshot_interval_seconds` 或达到 `storage_snapshot_record_interval` 时会写入 `snapshot.json`；snapshot 成功后会清理 snapshot 日期之前的旧 JSONL 分片。下次启动会先加载 snapshot，再 replay snapshot 当天及之后的分片增量。
-- `storage_path` 是相对 CPA 工作目录的路径；Docker 中建议放到已挂载的 `/CLIProxyAPI/data` 或其他宿主机 volume。
-- 当 `retention_days` 大于 0 时，保留窗口外的日期分片会被清理；旧单文件不会自动删除。
-- `storage_flush_interval_seconds` 越小，异常退出时最多丢失的数据越少；默认 30 秒，想更稳可以设为 5 或 1。
-- `storage_snapshot_interval_seconds` 和 `storage_snapshot_record_interval` 控制启动恢复成本；默认 300 秒或 1000 条写一次快照，高请求量实例可降低记录间隔，低频实例可保持默认。
-- `storage_sync_interval_seconds` 和 `storage_sync_record_interval` 默认关闭；如果需要更强的异常断电保护，可配置如 `storage_sync_interval_seconds: 30` 或 `storage_sync_record_interval: 1000`，但会增加磁盘 I/O。
-- `/health` 的 `storage.write_queue_length` 和 `storage.write_queue_capacity` 可观察后台写入队列积压；`storage.last_write_batch_records`、`storage.last_write_batch_duration_ms`、`storage.last_write_queue_wait_ms` 可观察最近 writer 批次规模、写入耗时和最长排队时长；`storage.write_batch_avg_duration_ms`、`storage.write_batch_p95_duration_ms`、`storage.write_batch_p99_duration_ms`、`storage.write_queue_wait_avg_ms`、`storage.write_queue_wait_p95_ms`、`storage.write_queue_wait_p99_ms` 和 `storage.write_pressure` 可观察持续磁盘压力与长尾抖动。看板底部出现"持久化排队中"或"持久化写入偏慢"时，说明磁盘写入速度短时间低于请求记录速度。
-- 如果已经有内存数据，建议先导出；开启持久化并重启后，再把导出的 JSON 导入一次，后续数据才会继续写入持久化文件。
+- `storage_path` 是相对 CPA 工作目录的 SQLite 数据库路径；Docker 中建议放到已挂载的 `/CLIProxyAPI/data` 或其他宿主机 volume。
+- `storage_path` 不接受 `.jsonl`、日期分片目录或 `snapshot.json`。旧 JSONL 文件不会被读取、迁移、删除或继续写入。
+- `retention_days` 大于 0 时，SQLite 会删除保留窗口外的事件行，并同步清理待补充的元数据；`max_details_per_model` 会按 `api + model` 删除最老的明细，但不会扣减累计请求和 token。
+- 每条实时 usage、导入事件和累计统计在同一 SQLite 写事务中提交；异常退出后不会依赖 flush、snapshot 或 fsync 配置恢复。
+- `/health` 的 `storage.backend` 固定为 `sqlite`，并返回 `database_path`、`event_count`、`database_size_bytes`、`last_write_at`、`last_error` 和 `dropped_events`。
+- 如果已经有旧 JSONL 数据，插件不会自动转换。可以保留旧文件作为归档；新的统计从 SQLite 数据库开始，JSON/CSV/JSONL 仅作为当前系统的导出格式。
 
 ## 8. 更新插件
 
@@ -641,7 +620,7 @@ CPA 主程序负责在请求完成后把 usage 记录下发给插件。CPA `v7.2
 
 ## 注意
 
-- 默认仅使用插件进程内存；如需 CPA 重启后自动恢复统计，请开启 `storage_enabled` 并将 `storage_path` 放在持久化目录。未开启持久化时，重启前请先导出数据。
+- 默认使用内存聚合和 SQLite 事件库；如需 CPA 重启后自动恢复统计，请开启 `storage_enabled` 并将 `storage_path` 放在持久化目录。关闭持久化时使用临时 SQLite 库，插件关闭后删除。
 - 多实例部署时，每个实例独立统计。
 - token 是否完整取决于上游返回的 usage 信息；CPA 主程序需向插件传递可解析的 usage 字段。SSE 中同一事件内的多条独立 `data:` JSON 行会分别解析，插件会选择信息最完整的 usage。
 - 实时请求不会被去重窗口合并；`max_details_per_model` 只裁剪请求明细，不会扣减总请求、token、成功率等累计统计。`retention_days` 超出窗口的记录会被淘汰并从窗口统计中扣除。

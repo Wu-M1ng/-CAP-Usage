@@ -20,8 +20,10 @@ let filteredSummaryError = null;
 let trendMetric = 'tokens'; // 'cost' | 'requests' | 'tokens' | 'rpm'
 let pollTimer = null, pollFailures = 0;
 let currentRange = '';
-const eventsLimit = 500;
-const apiDetailRecentLimit = 120;
+const eventsPageSize = 50;
+const eventsLimit = eventsPageSize;
+const apiDetailRecentPageSize = 50;
+const apiDetailRecentLimit = apiDetailRecentPageSize;
 const priceReferenceResultLimit = 100;
 const visiblePollDelayMs = 30000;
 const hiddenPollDelayMs = 300000;
@@ -29,7 +31,21 @@ let apiDetailSeq = 0;
 const apiDetailCache = new Map();
 const conditionalPayloadCache = new Map();
 let apiDetailLastRender = null;
+let eventsPageOffset = 0;
+let apiDetailRecentOffset = 0;
 let updatedState = { type: 'loading', generatedAt: null, message: '' };
+
+function resetPaginationOffsets() {
+  eventsPageOffset = 0;
+  apiDetailRecentOffset = 0;
+}
+
+function updatePaginationButtonLabel(button, key) {
+  if (!button) return;
+  const label = t(key);
+  button.setAttribute('aria-label', label);
+  button.title = label;
+}
 
 function dashboardPanelData() {
   return selectedClientApi ? filteredSummaryData : summaryData;
@@ -403,45 +419,19 @@ function renderStats() {
   drawSpark('costSpark', reqByHour.length ? reqByHour.map(v => (cost > 0 ? v / Math.max(u.total_requests || 1, 1) * cost : 0)) : [0], '#f59e0b');
 }
 
-function storageBatchTitle(storage) {
-  const records = num(storage && storage.last_write_batch_records);
-  if (records <= 0) return '';
-  const parts = [t('storage_batch_title', formatInteger(records))];
-  const duration = num(storage.last_write_batch_duration_ms);
-  if (duration > 0) parts.push(t('storage_batch_duration') + ' ' + formatMs(duration));
-  const avgDuration = num(storage.write_batch_avg_duration_ms);
-  if (avgDuration > 0) parts.push(t('storage_batch_avg') + ' ' + formatMs(avgDuration));
-  const p95Duration = num(storage.write_batch_p95_duration_ms);
-  const p99Duration = num(storage.write_batch_p99_duration_ms);
-  if (p95Duration > 0) parts.push(t('storage_batch_p95') + ' ' + formatMs(p95Duration) + (p99Duration > 0 ? ' / p99 ' + formatMs(p99Duration) : ''));
-  const wait = num(storage.last_write_queue_wait_ms);
-  if (wait > 0) parts.push(t('storage_batch_wait') + ' ' + formatMs(wait));
-  const avgWait = num(storage.write_queue_wait_avg_ms);
-  if (avgWait > 0) parts.push(t('storage_batch_avg_wait') + ' ' + formatMs(avgWait));
-  const p95Wait = num(storage.write_queue_wait_p95_ms);
-  const p99Wait = num(storage.write_queue_wait_p99_ms);
-  if (p95Wait > 0) parts.push(t('storage_batch_wait_p95') + ' ' + formatMs(p95Wait) + (p99Wait > 0 ? ' / p99 ' + formatMs(p99Wait) : ''));
-  return parts.join(typeof I18N_LANG === 'string' && I18N_LANG.startsWith('zh') ? '，' : ', ');
-}
-
-function storagePressureLabel(value) {
-  switch (String(value || '')) {
-    case 'full': return t('write_queue_full');
-    case 'backlog': return t('write_queue_backlog');
-    case 'queued': return t('write_queued');
-    case 'slow': return t('write_slow');
-    case 'normal': return t('write_normal');
-    default: return '';
-  }
-}
-
-function storagePressureTitle(storage) {
-  const label = storagePressureLabel(storage && storage.write_pressure);
-  return label ? withLabel('write_pressure', label) : '';
-}
-
 function storageTitle() {
   return Array.from(arguments).filter(Boolean).join(' | ');
+}
+
+function formatStorageBytes(value) {
+  let bytes = Math.max(0, num(value));
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let unit = 0;
+  while (bytes >= 1024 && unit < units.length - 1) {
+    bytes /= 1024;
+    unit++;
+  }
+  return (unit === 0 ? formatInteger(bytes) : trimFixed(bytes, bytes >= 10 ? 1 : 2)) + ' ' + units[unit];
 }
 
 function renderStorageStatus() {
@@ -466,27 +456,17 @@ function renderStorageStatus() {
     el.title = storage.last_error;
     return;
   }
-  const titleParts = [storage.last_snapshot_at || storage.loaded_path || storage.path || ''];
-  const queued = num(storage.write_queue_length);
-  if (queued > 0) {
-    const capacity = num(storage.write_queue_capacity);
-    titleParts.push(formatInteger(queued) + (capacity > 0 ? t('storage_pending_queue', formatInteger(capacity)) : t('storage_pending_queue_no_capacity')));
-  }
-  const pending = num(storage.pending_buffered_records);
-  if (pending > 0) {
-    titleParts.push(formatInteger(pending) + t('storage_pending_flush'));
-  }
-  const pendingSync = num(storage.pending_unsynced_records);
-  if (pendingSync > 0) {
-    titleParts.push(formatInteger(pendingSync) + t('storage_pending_sync'));
-  }
-  const pendingSnapshot = num(storage.pending_snapshot_records);
-  if (pendingSnapshot > 0) {
-    titleParts.push(formatInteger(pendingSnapshot) + t('storage_pending_snapshot'));
-  }
+  const titleParts = [];
+  const databasePath = storage.database_path || storage.path || '';
+  if (databasePath) titleParts.push(withLabel('storage_database_path', databasePath));
+  titleParts.push(withLabel('storage_event_count', formatInteger(storage.event_count)));
+  titleParts.push(withLabel('storage_database_size', formatStorageBytes(storage.database_size_bytes)));
+  if (storage.last_write_at) titleParts.push(withLabel('storage_last_write', formatDateTime(storage.last_write_at)));
+  const dropped = num(storage.dropped_events);
+  if (dropped > 0) titleParts.push(withLabel('storage_dropped_events', formatInteger(dropped)));
   el.textContent = t('storage_enabled');
   el.classList.add('ok');
-  el.title = storageTitle(...titleParts, storagePressureTitle(storage), storageBatchTitle(storage));
+  el.title = storageTitle(...titleParts);
 }
 
 function renderHealth() {
@@ -899,6 +879,7 @@ async function selectClientApiCard(selector, rows) {
     filteredSummaryError = null;
     await refreshFilteredSummary();
   }
+  resetPaginationOffsets();
   await rerender({ refreshEvents: true, refreshApiDetail: true });
 }
 
@@ -946,14 +927,32 @@ function renderApiStats() {
     successRate: a.total_requests ? a.success_count / a.total_requests * 100 : 100,
     modelCount: Object.keys(a.models || {}).length
   })).sort((a, b) => b.requests - a.requests);
-  if (rows.length && (!selectedApi || !rows.some((r) => r.api === selectedApi))) selectedApi = rows[0].api;
-  if (!rows.length) selectedApi = '';
+  if (rows.length && (!selectedApi || !rows.some((r) => r.api === selectedApi))) {
+    selectedApi = rows[0].api;
+    apiDetailRecentOffset = 0;
+  }
+  if (!rows.length && selectedApi) {
+    selectedApi = '';
+    apiDetailRecentOffset = 0;
+  }
   $('apiSelect').innerHTML = rows.length ? rows.map((r) => '<option value="' + esc(r.api) + '">' + esc(friendlyApiName(r.api)) + '</option>').join('') : '<option value="">' + t('upstream_select_none') + '</option>';
   $('apiSelect').value = selectedApi;
   $('apiSelect').disabled = !rows.length;
-  $('apiSelect').onchange = () => { selectedApi = $('apiSelect').value; renderApiStats(); renderApiDetail() };
+  $('apiSelect').onchange = () => {
+    const nextApi = $('apiSelect').value;
+    if (nextApi !== selectedApi) apiDetailRecentOffset = 0;
+    selectedApi = nextApi;
+    renderApiStats();
+    renderApiDetail();
+  };
   $('apiStats').innerHTML = rows.length ? '<table><thead><tr><th>' + t('col_api') + '</th><th>' + t('col_requests') + '</th><th>' + t('col_success_rate') + '</th><th>' + t('col_tokens') + '</th><th>' + t('col_avg_latency') + '</th><th>' + t('col_models') + '</th></tr></thead><tbody>' + rows.map((r) => '<tr class="clickableRow ' + (r.api === selectedApi ? 'selectedRow' : '') + '" data-api="' + esc(r.api) + '"><td class="nameCell">' + esc(friendlyApiName(r.api)) + '</td><td>' + formatInteger(r.requests) + ' <span class="ok">(' + formatInteger(r.success) + '</span> <span class="bad">' + formatInteger(r.failure) + ')</span></td><td class="' + (r.successRate >= 95 ? 'ok' : r.successRate >= 80 ? 'neutral' : 'bad') + '">' + pct(r.successRate) + '</td><td>' + compact(r.tokens) + '</td><td>' + formatMs(r.avgLatency) + '</td><td>' + formatInteger(r.modelCount) + ' ' + t('model_count') + '</td></tr>').join('') + '</tbody></table>' : '<div class="empty">' + t('no_upstream_data') + '</div>';
-  document.querySelectorAll('[data-api]').forEach((row) => row.onclick = () => { selectedApi = row.getAttribute('data-api') || ''; renderApiStats(); renderApiDetail() });
+  document.querySelectorAll('[data-api]').forEach((row) => row.onclick = () => {
+    const nextApi = row.getAttribute('data-api') || '';
+    if (nextApi !== selectedApi) apiDetailRecentOffset = 0;
+    selectedApi = nextApi;
+    renderApiStats();
+    renderApiDetail();
+  });
 }
 
 function metricHtml(label, value, extra) {
@@ -982,11 +981,13 @@ function normalizeApiDetailEvent(d) {
   });
 }
 
-async function fetchApiDetailData(api) {
+async function fetchApiDetailData(api, recentOffset) {
+  if (!Number.isFinite(Number(recentOffset)) || recentOffset < 0) recentOffset = 0;
   const params = new URLSearchParams();
   params.set('range', $('range').value);
   params.set('api', api);
   params.set('recent_limit', String(apiDetailRecentLimit));
+  params.set('recent_offset', String(recentOffset));
   if (selectedClientApiSelector()) params.set('client_api', selectedClientApiSelector());
   const url = pluginEndpoint('dashboard-api-detail') + '?' + params.toString();
   const data = requireObjectPayload(await fetchConditionalJsonPayload('dashboard-api-detail:' + url, url, pluginFetchOptions({ cache: 'no-store' })), 'dashboard-api-detail');
@@ -994,8 +995,9 @@ async function fetchApiDetailData(api) {
   return data;
 }
 
-function apiDetailCacheKey(api) {
-  return api + '|' + $('range').value + '|' + selectedClientApiSelector();
+function apiDetailCacheKey(api, recentOffset) {
+  const offset = Number.isFinite(Number(recentOffset)) && recentOffset >= 0 ? recentOffset : 0;
+  return api + '|' + $('range').value + '|' + selectedClientApiSelector() + '|' + apiDetailRecentLimit + '|' + offset;
 }
 
 function apiDetailErrorHtml(errorRows, loading, error, knownFailureCount) {
@@ -1021,11 +1023,28 @@ function generationSpeedText(detail) {
   return (tokens * 1000 / generationMs).toFixed(1) + ' t/s';
 }
 
-function apiDetailRecentHtml(rows, loading, error) {
+function apiDetailRecentTotal(detail) {
+  if (detail && Object.prototype.hasOwnProperty.call(detail, 'recent_total')) return num(detail.recent_total);
+  return num(detail && detail.total_events);
+}
+
+function apiDetailRecentHtml(rows, loading, error, detail) {
+  const total = apiDetailRecentTotal(detail);
+  const limit = Math.max(1, num(detail && detail.recent_limit) || apiDetailRecentLimit);
+  const offset = Math.max(0, num(detail && detail.recent_offset));
+  const pageCount = total > 0 ? Math.ceil(total / limit) : 0;
+  const page = pageCount > 0 ? Math.floor(offset / limit) + 1 : 0;
+  const start = total > 0 ? offset + 1 : 0;
+  const end = total > 0 ? Math.min(offset + rows.length, total) : 0;
+  const pagination = '<div class="pagination apiDetailPagination" id="apiDetailRecentPagination">' +
+    '<button id="apiDetailRecentPrev" class="btn" type="button" aria-label="' + esc(t('pagination_previous')) + '"' + (offset <= 0 ? ' disabled' : '') + '>&larr;</button>' +
+    '<span id="apiDetailRecentPageLabel">' + esc(t('events_page', start, end, total, page, pageCount)) + '</span>' +
+    '<button id="apiDetailRecentNext" class="btn" type="button" aria-label="' + esc(t('pagination_next')) + '"' + (offset + rows.length >= total || total === 0 ? ' disabled' : '') + '>&rarr;</button>' +
+    '</div>';
   if (loading && !rows.length) return '<div><div class="subtle" style="margin-bottom:8px">' + t('recent_requests') + '</div><div class="empty">' + t('loading_api_detail') + '</div></div>';
-  if (error && !rows.length) return '<div><div class="subtle" style="margin-bottom:8px">' + t('recent_requests') + '</div><div class="empty">' + t('detail_load_failed') + '</div></div>';
+  if (error && !rows.length) return '<div><div class="subtle" style="margin-bottom:8px">' + t('recent_requests') + '</div><div class="empty">' + t('detail_load_failed') + '</div>' + pagination + '</div>';
   return '<div><div class="subtle" style="margin-bottom:8px">' + t('recent_requests') + '</div>' +
-    (rows.length ? '<div class="tableWrap"><table><thead><tr><th>' + t('col_time') + '</th><th>' + t('col_model') + '</th><th>' + t('col_reasoning_effort') + '</th><th>' + t('col_endpoint') + '</th><th>' + t('col_generation_speed') + '</th><th>' + t('col_result') + '</th><th>' + t('col_latency') + '</th><th>' + t('col_tokens') + '</th><th>' + t('col_source') + '</th></tr></thead><tbody>' + rows.slice(0, apiDetailRecentLimit).map((d) => '<tr><td>' + formatDateTime(d.timestamp_ms) + '</td><td class="nameCell">' + esc(d.model) + '</td><td>' + esc(reasoningEffortText(d)) + '</td><td class="nameCell">' + esc(d.endpoint || '-') + '</td><td>' + esc(generationSpeedText(d)) + '</td><td class="' + (d.failed ? 'bad' : 'ok') + '">' + statusText(d.failed) + '</td><td>' + formatDurationAndTTFT(d.latency_ms, d.ttft_ms) + '</td><td>' + formatInteger(d.total_tokens) + '</td><td class="nameCell">' + esc(sourceLabel(d)) + '</td></tr>').join('') + '</tbody></table></div>' : '<div class="empty">' + t('no_detail') + '</div>') +
+    (rows.length ? '<div class="tableWrap"><table><thead><tr><th>' + t('col_time') + '</th><th>' + t('col_model') + '</th><th>' + t('col_reasoning_effort') + '</th><th>' + t('col_endpoint') + '</th><th>' + t('col_generation_speed') + '</th><th>' + t('col_result') + '</th><th>' + t('col_latency') + '</th><th>' + t('col_tokens') + '</th><th>' + t('col_source') + '</th></tr></thead><tbody>' + rows.map((d) => '<tr><td>' + formatDateTime(d.timestamp_ms) + '</td><td class="nameCell">' + esc(d.model) + '</td><td>' + esc(reasoningEffortText(d)) + '</td><td class="nameCell">' + esc(d.endpoint || '-') + '</td><td>' + esc(generationSpeedText(d)) + '</td><td class="' + (d.failed ? 'bad' : 'ok') + '">' + statusText(d.failed) + '</td><td>' + formatDurationAndTTFT(d.latency_ms, d.ttft_ms) + '</td><td>' + formatInteger(d.total_tokens) + '</td><td class="nameCell">' + esc(sourceLabel(d)) + '</td></tr>').join('') + '</tbody></table></div>' : '<div class="empty">' + t('no_detail') + '</div>') + pagination +
     '</div>';
 }
 
@@ -1058,7 +1077,18 @@ function renderApiDetailContent(apiData, detailState) {
     barsHtml(t('model_distribution'), models, requests, t('no_model_data'), true) +
     barsHtml(t('source_distribution'), sources, requests, loading ? t('loading_source_data') : t('no_source_data')) +
     '</div>' +
-    '<div class="splitGrid detailActivityGrid">' + (showErrorStats ? apiDetailErrorHtml(errorRows, loading, error, knownFailureCount) : '') + apiDetailRecentHtml(rows, loading, error) + '</div>';
+    '<div class="splitGrid detailActivityGrid">' + (showErrorStats ? apiDetailErrorHtml(errorRows, loading, error, knownFailureCount) : '') + apiDetailRecentHtml(rows, loading, error, detail) + '</div>';
+  const previousButton = $('apiDetailRecentPrev');
+  const nextButton = $('apiDetailRecentNext');
+  if (previousButton) previousButton.onclick = () => {
+    apiDetailRecentOffset = Math.max(0, apiDetailRecentOffset - apiDetailRecentPageSize);
+    renderApiDetail();
+  };
+  if (nextButton) nextButton.onclick = () => {
+    if (!detail || apiDetailRecentOffset + rows.length >= apiDetailRecentTotal(detail)) return;
+    apiDetailRecentOffset += apiDetailRecentPageSize;
+    renderApiDetail();
+  };
 }
 
 async function renderApiDetail() {
@@ -1068,17 +1098,24 @@ async function renderApiDetail() {
   if (!apiData) { apiDetailSeq++; apiDetailLastRender = null; setText('apiDetailTitle', t('upstream_detail_select_hint')); $('apiDetail').innerHTML = '<div class="empty">' + t('no_detail_data') + '</div>'; return }
   const api = selectedApi;
   const seq = ++apiDetailSeq;
-  const cacheKey = apiDetailCacheKey(api);
+  const requestedOffset = apiDetailRecentOffset;
+  const cacheKey = apiDetailCacheKey(api, requestedOffset);
   const cached = apiDetailCache.get(cacheKey);
   setText('apiDetailTitle', friendlyApiName(api));
   renderApiDetailContent(apiData, cached ? { detail: cached, loading: true } : { loading: true });
   try {
-    const result = await fetchApiDetailData(api);
-    if (seq !== apiDetailSeq || api !== selectedApi) return;
+    const result = await fetchApiDetailData(api, requestedOffset);
+    if (seq !== apiDetailSeq || api !== selectedApi || requestedOffset !== apiDetailRecentOffset) return;
+    const total = apiDetailRecentTotal(result);
+    const limit = Math.max(1, num(result && result.recent_limit) || apiDetailRecentPageSize);
+    if (total > 0 && requestedOffset >= total) {
+      apiDetailRecentOffset = Math.floor((total - 1) / limit) * limit;
+      if (apiDetailRecentOffset !== requestedOffset) return renderApiDetail();
+    }
     apiDetailCache.set(cacheKey, result);
     renderApiDetailContent(apiData, { detail: result });
   } catch (e) {
-    if (seq !== apiDetailSeq || api !== selectedApi) return;
+    if (seq !== apiDetailSeq || api !== selectedApi || requestedOffset !== apiDetailRecentOffset) return;
     renderApiDetailContent(apiData, cached ? { detail: cached, error: e } : { error: e });
   }
 }
@@ -1099,7 +1136,7 @@ function renderApiDetailFromCache() {
     renderApiDetailContent(apiData, apiDetailLastRender.detailState);
     return;
   }
-  const cached = apiDetailCache.get(apiDetailCacheKey(selectedApi));
+  const cached = apiDetailCache.get(apiDetailCacheKey(selectedApi, apiDetailRecentOffset));
   renderApiDetailContent(apiData, cached ? { detail: cached } : { loading: true });
 }
 
@@ -1314,14 +1351,33 @@ function renderEventsContent() {
   const total = data.total;
   setText('eventsCount', t('events_count', formatInteger(total), formatInteger(Math.min(rows.length, eventsLimit))));
   $('events').innerHTML = rows.length ? '<table><thead><tr><th>' + t('col_time') + '</th><th>' + t('col_model') + '</th><th>' + t('col_source') + '</th><th>' + t('col_credential') + '</th><th>' + t('col_result') + '</th><th>' + t('col_latency') + '</th><th>' + t('col_input') + '</th><th>' + t('col_output') + '</th><th>' + t('col_thinking') + '</th><th>' + t('col_cache') + '</th><th>' + t('col_cache_write') + '</th><th>' + t('col_total') + '</th></tr></thead><tbody>' + rows.map((d) => '<tr><td>' + formatDateTime(timestampMs(d.timestamp)) + '</td><td class="nameCell">' + esc(d.model) + '</td><td class="nameCell">' + esc(sourceLabel(d)) + '</td><td>' + esc(d.auth_index || '-') + '</td><td class="' + (d.failed ? 'bad' : 'ok') + '">' + statusText(d.failed) + '</td><td>' + formatDurationAndTTFT(d.latency_ms, d.ttft_ms) + '</td><td>' + formatInteger(uncachedInputTokens(d)) + '</td><td>' + formatInteger(num(d.tokens && d.tokens.output_tokens)) + '</td><td>' + formatInteger(num(d.tokens && d.tokens.reasoning_tokens)) + '</td><td>' + formatInteger(cacheReadTokens(d.tokens)) + '</td><td>' + formatInteger(num(d.tokens && d.tokens.cache_write_tokens)) + '</td><td>' + formatInteger(totalTokens(d)) + '</td></tr>').join('') + '</tbody></table>' : '<div class="empty">' + t('no_events') + '</div>';
+  const limit = Math.max(1, data.limit || eventsPageSize);
+  const offset = Math.max(0, data.offset || eventsPageOffset);
+  const pageCount = total > 0 ? Math.ceil(total / limit) : 0;
+  const page = pageCount > 0 ? Math.floor(offset / limit) + 1 : 0;
+  const start = total > 0 ? offset + 1 : 0;
+  const end = total > 0 ? Math.min(offset + rows.length, total) : 0;
+  setText('eventsPageLabel', t('events_page', start, end, total, page, pageCount));
+  const previousButton = $('eventsPrev');
+  const nextButton = $('eventsNext');
+  if (previousButton) previousButton.disabled = offset <= 0;
+  if (nextButton) nextButton.disabled = total === 0 || offset + rows.length >= total;
+  if (previousButton) previousButton.onclick = () => {
+    eventsPageOffset = Math.max(0, offset - limit);
+    renderEvents();
+  };
+  if (nextButton) nextButton.onclick = () => {
+    if (total === 0 || offset + rows.length >= total) return;
+    eventsPageOffset = offset + limit;
+    renderEvents();
+  };
   renderFilters();
 }
 
 async function renderEvents() {
-  // Fetch paginated events from server
   const params = new URLSearchParams();
   params.set('limit', String(eventsLimit));
-  params.set('offset', '0');
+  params.set('offset', String(eventsPageOffset));
   params.set('range', $('range').value);
   const fm = $('filterModel').value; if (fm) params.set('model', fm);
   const fs = $('filterSource').value; if (fs) params.set('source', fs);
@@ -1334,9 +1390,15 @@ async function renderEvents() {
   } catch (e) {
     const url = pluginEndpoint('dashboard-events') + '?' + params.toString();
     if (!eventsData || eventsDataUrl !== url) {
-      eventsData = { events: [], total: 0, limit: eventsLimit, offset: 0 };
+      eventsData = { events: [], total: 0, limit: eventsLimit, offset: eventsPageOffset };
       eventsDataUrl = url;
     }
+  }
+  const normalized = normalizeEventsPayload(eventsData);
+  const effectiveLimit = Math.max(1, normalized.limit || eventsPageSize);
+  if (normalized.total > 0 && eventsPageOffset >= normalized.total) {
+    eventsPageOffset = Math.floor((normalized.total - 1) / effectiveLimit) * effectiveLimit;
+    if (eventsPageOffset !== normalized.offset) return renderEvents();
   }
   renderEventsContent();
 }
@@ -1962,7 +2024,7 @@ function handleVisibilityChange() {
 
 // Event bindings
 $('range').value = localStorage.getItem(rangeKey) || '24h';
-$('range').onchange = () => { localStorage.setItem(rangeKey, $('range').value); load({ forceDetails: true }) };
+$('range').onchange = () => { localStorage.setItem(rangeKey, $('range').value); resetPaginationOffsets(); load({ forceDetails: true }) };
 $('refreshBtn').onclick = () => load({ forceDetails: true });
 $('savePrice').onclick = async () => {
   const m = $('priceModel').value.trim(); if (!m) return;
@@ -2013,12 +2075,13 @@ document.querySelectorAll('[data-api-sort]').forEach((btn) => btn.onclick = asyn
   filteredSummaryData = null;
   filteredSummaryContext = '';
   filteredSummaryError = null;
+  resetPaginationOffsets();
   await rerender({ refreshEvents: true, refreshApiDetail: true });
 });
 const clientApiSelectButton = document.querySelectorAll('[data-client-api-select]')[0];
 if (clientApiSelectButton) clientApiSelectButton.onclick = () => { clientApiSelectMode = true; renderClientApiStats() };
-['filterModel', 'filterSource', 'filterAuth'].forEach((id) => $(id).onchange = renderEvents);
-$('clearFilters').onclick = () => { ['filterModel', 'filterSource', 'filterAuth'].forEach((id) => $(id).value = ''); renderEvents() };
+['filterModel', 'filterSource', 'filterAuth'].forEach((id) => $(id).onchange = () => { resetPaginationOffsets(); renderEvents() });
+$('clearFilters').onclick = () => { ['filterModel', 'filterSource', 'filterAuth'].forEach((id) => $(id).value = ''); resetPaginationOffsets(); renderEvents() };
 $('exportRowsCsv').onclick = () => exportRows('csv'); $('exportRowsJson').onclick = () => exportRows('json');
 $('exportApiCsv').onclick = () => exportApiRows('csv'); $('exportApiJson').onclick = () => exportApiRows('json');
 $('exportBtn').onclick = async () => {

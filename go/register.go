@@ -11,7 +11,7 @@ import (
 
 const pluginID = "usage-dashboard-zduu"
 const legacyPluginID = "usage-statistics"
-const pluginVersion = "2.5.4"
+const pluginVersion = "2.5.5"
 
 func handleRegister(requestBody []byte) ([]byte, error) {
 	applyRuntimeConfig(requestBody)
@@ -35,13 +35,13 @@ func handleRegister(requestBody []byte) ([]byte, error) {
 					Name:        "retention_days",
 					Type:        "integer",
 					Default:     defaultRetentionDays,
-					Description: "内存统计最多保留的天数，0 表示不按时间淘汰。",
+					Description: "SQLite 事件和内存统计最多保留的天数，0 表示不按时间淘汰。",
 				},
 				{
 					Name:        "dedup_window_minutes",
 					Type:        "integer",
 					Default:     defaultDedupWindowMinutes,
-					Description: "兼容旧配置；导入会跳过精确重复记录，实时 usage 记录和持久化重放不会按窗口去重。",
+					Description: "兼容旧配置；导入会跳过精确重复记录，实时 SQLite 事件写入不会按窗口去重。",
 				},
 				{
 					Name:        "log_response_headers",
@@ -58,44 +58,14 @@ func handleRegister(requestBody []byte) ([]byte, error) {
 				{
 					Name:        "storage_enabled",
 					Type:        "boolean",
-					Default:     false,
-					Description: "是否启用 JSONL 事件持久化。默认关闭。",
+					Default:     true,
+					Description: "是否启用 SQLite 事件持久化。关闭时使用可删除的临时数据库。",
 				},
 				{
 					Name:        "storage_path",
 					Type:        "string",
-					Default:     "usage-statistics.jsonl",
-					Description: "JSONL 持久化路径。*.jsonl 旧单文件会兼容读取，新数据写入同名目录的日期分片。",
-				},
-				{
-					Name:        "storage_flush_interval_seconds",
-					Type:        "integer",
-					Default:     defaultStorageFlushSeconds,
-					Description: "持久化文件 flush 间隔秒数。",
-				},
-				{
-					Name:        "storage_snapshot_interval_seconds",
-					Type:        "integer",
-					Default:     defaultStorageSnapshotSeconds,
-					Description: "持久化快照最大写入间隔秒数，0 表示只按记录数触发。",
-				},
-				{
-					Name:        "storage_snapshot_record_interval",
-					Type:        "integer",
-					Default:     defaultStorageSnapshotRecords,
-					Description: "每新增多少条持久化记录写一次 snapshot，0 表示只按时间触发。",
-				},
-				{
-					Name:        "storage_sync_interval_seconds",
-					Type:        "integer",
-					Default:     defaultStorageSyncSeconds,
-					Description: "持久化文件 fsync 最大间隔秒数，0 表示不按时间强制同步。",
-				},
-				{
-					Name:        "storage_sync_record_interval",
-					Type:        "integer",
-					Default:     defaultStorageSyncRecords,
-					Description: "每新增多少条持久化记录执行一次 fsync，0 表示不按记录数强制同步。",
+					Default:     defaultEventStorePath,
+					Description: "SQLite 持久化路径。必须使用 .db 文件，父目录会自动创建。",
 				},
 				{
 					Name:        "export_max_records",
@@ -189,21 +159,6 @@ func parseRuntimeConfig(requestBody []byte) runtimeConfig {
 	if patch.StoragePath != nil {
 		cfg.StoragePath = *patch.StoragePath
 	}
-	if patch.StorageFlushSeconds != nil {
-		cfg.StorageFlushSeconds = *patch.StorageFlushSeconds
-	}
-	if patch.StorageSnapshotSeconds != nil {
-		cfg.StorageSnapshotSeconds = *patch.StorageSnapshotSeconds
-	}
-	if patch.StorageSnapshotRecordInterval != nil {
-		cfg.StorageSnapshotRecordInterval = *patch.StorageSnapshotRecordInterval
-	}
-	if patch.StorageSyncSeconds != nil {
-		cfg.StorageSyncSeconds = *patch.StorageSyncSeconds
-	}
-	if patch.StorageSyncRecordInterval != nil {
-		cfg.StorageSyncRecordInterval = *patch.StorageSyncRecordInterval
-	}
 	if patch.ExportMaxRecords != nil {
 		cfg.ExportMaxRecords = *patch.ExportMaxRecords
 	}
@@ -231,25 +186,20 @@ func parseRuntimeConfig(requestBody []byte) runtimeConfig {
 func parseRuntimeConfigPatch(requestBody []byte) runtimeConfigPatch {
 	defaults := defaultRuntimeConfig()
 	patch := runtimeConfigPatch{
-		MaxDetailsPerModel:            intPtr(defaults.MaxDetailsPerModel),
-		RetentionDays:                 intPtr(defaults.RetentionDays),
-		DedupWindowMinutes:            intPtr(defaults.DedupWindowMinutes),
-		LogResponseHeaders:            stringPtr(defaults.LogResponseHeaders),
-		APIKeyHashSalt:                stringPtr(defaults.APIKeyHashSalt),
-		StorageEnabled:                boolPtr(defaults.StorageEnabled),
-		StoragePath:                   stringPtr(defaults.StoragePath),
-		StorageFlushSeconds:           intPtr(defaults.StorageFlushSeconds),
-		StorageSnapshotSeconds:        intPtr(defaults.StorageSnapshotSeconds),
-		StorageSnapshotRecordInterval: intPtr(defaults.StorageSnapshotRecordInterval),
-		StorageSyncSeconds:            intPtr(defaults.StorageSyncSeconds),
-		StorageSyncRecordInterval:     intPtr(defaults.StorageSyncRecordInterval),
-		ExportMaxRecords:              intPtr(defaults.ExportMaxRecords),
-		PriceStoragePath:              stringPtr(defaults.PriceStoragePath),
-		ModelsDevPricesEnabled:        boolPtr(defaults.ModelsDevPricesEnabled),
-		ModelsDevPricesURL:            stringPtr(defaults.ModelsDevPricesURL),
-		ModelsDevRefreshSeconds:       intPtr(defaults.ModelsDevRefreshSeconds),
-		UpdateEnabled:                 boolPtr(defaults.UpdateEnabled),
-		UpdateVersion:                 stringPtr(defaults.UpdateVersion),
+		MaxDetailsPerModel:      intPtr(defaults.MaxDetailsPerModel),
+		RetentionDays:           intPtr(defaults.RetentionDays),
+		DedupWindowMinutes:      intPtr(defaults.DedupWindowMinutes),
+		LogResponseHeaders:      stringPtr(defaults.LogResponseHeaders),
+		APIKeyHashSalt:          stringPtr(defaults.APIKeyHashSalt),
+		StorageEnabled:          boolPtr(defaults.StorageEnabled),
+		StoragePath:             stringPtr(defaults.StoragePath),
+		ExportMaxRecords:        intPtr(defaults.ExportMaxRecords),
+		PriceStoragePath:        stringPtr(defaults.PriceStoragePath),
+		ModelsDevPricesEnabled:  boolPtr(defaults.ModelsDevPricesEnabled),
+		ModelsDevPricesURL:      stringPtr(defaults.ModelsDevPricesURL),
+		ModelsDevRefreshSeconds: intPtr(defaults.ModelsDevRefreshSeconds),
+		UpdateEnabled:           boolPtr(defaults.UpdateEnabled),
+		UpdateVersion:           stringPtr(defaults.UpdateVersion),
 	}
 	var req struct {
 		ConfigYAML []byte `json:"config_yaml"`
@@ -278,21 +228,6 @@ func parseRuntimeConfigPatch(requestBody []byte) runtimeConfigPatch {
 	}
 	if s, ok := stringConfig(values, "storage_path"); ok {
 		patch.StoragePath = stringPtr(s)
-	}
-	if v, ok := intConfig(values, "storage_flush_interval_seconds"); ok {
-		patch.StorageFlushSeconds = intPtr(v)
-	}
-	if v, ok := intConfig(values, "storage_snapshot_interval_seconds"); ok {
-		patch.StorageSnapshotSeconds = intPtr(v)
-	}
-	if v, ok := intConfig(values, "storage_snapshot_record_interval"); ok {
-		patch.StorageSnapshotRecordInterval = intPtr(v)
-	}
-	if v, ok := intConfig(values, "storage_sync_interval_seconds"); ok {
-		patch.StorageSyncSeconds = intPtr(v)
-	}
-	if v, ok := intConfig(values, "storage_sync_record_interval"); ok {
-		patch.StorageSyncRecordInterval = intPtr(v)
 	}
 	if v, ok := intConfig(values, "export_max_records"); ok {
 		patch.ExportMaxRecords = intPtr(v)

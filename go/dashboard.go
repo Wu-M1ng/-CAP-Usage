@@ -40,12 +40,10 @@ type HealthAlert struct {
 
 const (
 	healthSlowEventsExportDurationMs     = 5000
-	healthStorageWriterTailLatencyMs     = 1000
-	healthStorageWriterTailMinBatches    = 20
 	healthConditionalLowHitMinRequests   = 20
 	healthConditionalLowHitRateThreshold = 0.20
 
-	dashboardAPIDetailDefaultRecentLimit = 120
+	dashboardAPIDetailDefaultRecentLimit = 50
 	dashboardAPIDetailMaxRecentLimit     = 500
 	dashboardAPIDetailDefaultErrorLimit  = 20
 	dashboardAPIDetailMaxErrorLimit      = 100
@@ -482,6 +480,12 @@ func handleDashboardAPIDetail(query map[string][]string, headers map[string][]st
 			recentLimit = n
 		}
 	}
+	recentOffset := 0
+	if v, ok := query["recent_offset"]; ok && len(v) > 0 {
+		if n, err := strconv.Atoi(v[0]); err == nil && n >= 0 {
+			recentOffset = n
+		}
+	}
 	errorLimit := dashboardAPIDetailDefaultErrorLimit
 	if v, ok := query["error_limit"]; ok && len(v) > 0 {
 		if n, err := strconv.Atoi(v[0]); err == nil && n > 0 {
@@ -491,12 +495,12 @@ func handleDashboardAPIDetail(query map[string][]string, headers map[string][]st
 	recentLimit, errorLimit = normalizeDashboardAPIDetailLimits(recentLimit, errorLimit)
 
 	now := time.Now()
-	etag := dashboardAPIDetailETagForClientAPI(api, rangeKey, clientAPI, recentLimit, errorLimit, now)
+	etag := dashboardAPIDetailETagForClientAPIPage(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now)
 	if dashboardConditionalMatch("dashboard-api-detail", headers, etag) {
 		return dashboardNotModified(etag)
 	}
-	result := stats.QueryAPIDetailForClientAPIAt(api, rangeKey, clientAPI, recentLimit, errorLimit, now)
-	etag = dashboardAPIDetailETagForClientAPIVersion(api, rangeKey, clientAPI, recentLimit, errorLimit, now, result.dashboardVersion)
+	result := stats.QueryAPIDetailPageAt(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now)
+	etag = dashboardAPIDetailETagForClientAPIVersionPage(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now, result.dashboardVersion)
 	sanitizeAPIDetailAPIKeysForOutput(&result)
 	responseJSON, err := json.Marshal(result)
 	if err != nil {
@@ -518,11 +522,19 @@ func dashboardAPIDetailETagForVersion(api string, rangeKey string, recentLimit i
 	return dashboardAPIDetailETagForClientAPIVersion(api, rangeKey, "", recentLimit, errorLimit, now, version)
 }
 
-func dashboardAPIDetailETagForClientAPI(api string, rangeKey string, clientAPI string, recentLimit int, errorLimit int, now time.Time) string {
-	return dashboardAPIDetailETagForClientAPIVersion(api, rangeKey, clientAPI, recentLimit, errorLimit, now, stats.DashboardVersion())
+func dashboardAPIDetailETagForClientAPI(api string, rangeKey string, clientAPI string, recentLimit, errorLimit int, now time.Time) string {
+	return dashboardAPIDetailETagForClientAPIPage(api, rangeKey, clientAPI, recentLimit, 0, errorLimit, now)
 }
 
-func dashboardAPIDetailETagForClientAPIVersion(api string, rangeKey string, clientAPI string, recentLimit int, errorLimit int, now time.Time, version uint64) string {
+func dashboardAPIDetailETagForClientAPIVersion(api string, rangeKey string, clientAPI string, recentLimit, errorLimit int, now time.Time, version uint64) string {
+	return dashboardAPIDetailETagForClientAPIVersionPage(api, rangeKey, clientAPI, recentLimit, 0, errorLimit, now, version)
+}
+
+func dashboardAPIDetailETagForClientAPIPage(api string, rangeKey string, clientAPI string, recentLimit, recentOffset, errorLimit int, now time.Time) string {
+	return dashboardAPIDetailETagForClientAPIVersionPage(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now, stats.DashboardVersion())
+}
+
+func dashboardAPIDetailETagForClientAPIVersionPage(api string, rangeKey string, clientAPI string, recentLimit, recentOffset, errorLimit int, now time.Time, version uint64) string {
 	recentLimit, errorLimit = normalizeDashboardAPIDetailLimits(recentLimit, errorLimit)
 	timeBucket := int64(0)
 	if rangeKey != "" && rangeKey != "all" {
@@ -537,6 +549,7 @@ func dashboardAPIDetailETagForClientAPIVersion(api string, rangeKey string, clie
 		rangeKey,
 		clientAPI,
 		strconv.Itoa(recentLimit),
+		strconv.Itoa(recentOffset),
 		strconv.Itoa(errorLimit),
 	)
 }
@@ -688,26 +701,6 @@ func healthAlerts(storage StorageStatus, runtime RuntimeStatus) []HealthAlert {
 			Message:  storage.LastError,
 		})
 	}
-	switch storage.WritePressure {
-	case "full":
-		alerts = append(alerts, HealthAlert{
-			Severity: "error",
-			Code:     "storage_writer_full",
-			Message:  "持久化写入队列已满",
-		})
-	case "backlog":
-		alerts = append(alerts, HealthAlert{
-			Severity: "warn",
-			Code:     "storage_writer_backlog",
-			Message:  "持久化写入队列积压",
-		})
-	case "slow":
-		alerts = append(alerts, HealthAlert{
-			Severity: "warn",
-			Code:     "storage_writer_slow",
-			Message:  "持久化写入偏慢",
-		})
-	}
 	if runtime.LastEventsExportTruncated {
 		alerts = append(alerts, HealthAlert{
 			Severity: "warn",
@@ -720,20 +713,6 @@ func healthAlerts(storage StorageStatus, runtime RuntimeStatus) []HealthAlert {
 			Severity: "warn",
 			Code:     "events_export_slow",
 			Message:  "最近一次事件导出耗时过高",
-		})
-	}
-	if storage.WriteBatchesTotal >= healthStorageWriterTailMinBatches && storage.WriteBatchP99DurationMs >= healthStorageWriterTailLatencyMs {
-		alerts = append(alerts, HealthAlert{
-			Severity: "warn",
-			Code:     "storage_writer_p99_slow",
-			Message:  "持久化 writer p99 写入耗时过高",
-		})
-	}
-	if storage.WriteBatchesTotal >= healthStorageWriterTailMinBatches && storage.WriteQueueWaitP99Ms >= healthStorageWriterTailLatencyMs {
-		alerts = append(alerts, HealthAlert{
-			Severity: "warn",
-			Code:     "storage_writer_queue_p99_slow",
-			Message:  "持久化 writer p99 排队等待过高",
 		})
 	}
 	alerts = append(alerts, lowConditionalRequestAlerts(runtime)...)

@@ -1518,98 +1518,6 @@ func TestPendingInterceptorMetadataEnrichesLaterNativeUsage(t *testing.T) {
 	}
 }
 
-func TestReplayStorageAppliesMetadataOnlyUpdate(t *testing.T) {
-	requestedAt := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
-	base := RequestDetail{
-		Model:      "gpt-5.5",
-		Timestamp:  requestedAt,
-		LatencyMs:  11000,
-		TTFTMs:     1000,
-		Source:     "openai",
-		Provider:   "openai",
-		Tokens:     TokenStats{InputTokens: 100, OutputTokens: 358, TotalTokens: 458},
-		StatusCode: 200,
-	}
-	update := base
-	update.Endpoint = "/v1/responses"
-	update.Stream = true
-	update.Thinking = UsageThinking{Intensity: "xhigh", Level: "xhigh"}
-	baseLine, err := json.Marshal(persistedDetail{API: "openai", Model: "gpt-5.5", Detail: base})
-	if err != nil {
-		t.Fatalf("marshal base detail: %v", err)
-	}
-	updateLine, err := json.Marshal(persistedDetail{API: "openai", Model: "gpt-5.5", Detail: update, MetadataOnly: true})
-	if err != nil {
-		t.Fatalf("marshal metadata update: %v", err)
-	}
-	path := filepath.Join(t.TempDir(), "usage.jsonl")
-	if err := os.WriteFile(path, append(append(baseLine, '\n'), append(updateLine, '\n')...), 0o600); err != nil {
-		t.Fatalf("write storage fixture: %v", err)
-	}
-
-	replayed := NewRequestStatistics()
-	replayed.mu.Lock()
-	err = replayed.replayStorageLocked(path)
-	replayed.mu.Unlock()
-	if err != nil {
-		t.Fatalf("replayStorageLocked() error = %v", err)
-	}
-	detail := replayed.QueryAPIDetail("openai", "all", 10, 10)
-	if len(detail.RecentEvents) != 1 {
-		t.Fatalf("recent events = %d, want 1", len(detail.RecentEvents))
-	}
-	event := detail.RecentEvents[0]
-	if event.Endpoint != "/v1/responses" || event.Thinking.Intensity != "xhigh" || !event.Stream {
-		t.Fatalf("replayed endpoint/thinking/stream = %q/%#v/%t", event.Endpoint, event.Thinking, event.Stream)
-	}
-}
-
-func TestReplayStorageAppliesMetadataOnlyUpdateBeforeBaseDetail(t *testing.T) {
-	requestedAt := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
-	base := RequestDetail{
-		Model:      "gpt-5.5",
-		Timestamp:  requestedAt,
-		LatencyMs:  11000,
-		TTFTMs:     1000,
-		Source:     "openai",
-		Provider:   "openai",
-		Tokens:     TokenStats{InputTokens: 100, OutputTokens: 358, TotalTokens: 458},
-		StatusCode: 200,
-	}
-	update := base
-	update.Endpoint = "/v1/responses"
-	update.Stream = true
-	update.Thinking = UsageThinking{Intensity: "xhigh", Level: "xhigh"}
-	baseLine, err := json.Marshal(persistedDetail{API: "openai", Model: "gpt-5.5", Detail: base})
-	if err != nil {
-		t.Fatalf("marshal base detail: %v", err)
-	}
-	updateLine, err := json.Marshal(persistedDetail{API: "openai", Model: "gpt-5.5", Detail: update, MetadataOnly: true})
-	if err != nil {
-		t.Fatalf("marshal metadata update: %v", err)
-	}
-	path := filepath.Join(t.TempDir(), "usage.jsonl")
-	if err := os.WriteFile(path, append(append(updateLine, '\n'), append(baseLine, '\n')...), 0o600); err != nil {
-		t.Fatalf("write storage fixture: %v", err)
-	}
-
-	replayed := NewRequestStatistics()
-	replayed.mu.Lock()
-	err = replayed.replayStorageLocked(path)
-	replayed.mu.Unlock()
-	if err != nil {
-		t.Fatalf("replayStorageLocked() error = %v", err)
-	}
-	detail := replayed.QueryAPIDetail("openai", "all", 10, 10)
-	if len(detail.RecentEvents) != 1 {
-		t.Fatalf("recent events = %d, want 1", len(detail.RecentEvents))
-	}
-	event := detail.RecentEvents[0]
-	if event.Endpoint != "/v1/responses" || event.Thinking.Intensity != "xhigh" || !event.Stream {
-		t.Fatalf("replayed endpoint/thinking/stream = %q/%#v/%t", event.Endpoint, event.Thinking, event.Stream)
-	}
-}
-
 func TestHandleImportUsageAcceptsV120ExportFixture(t *testing.T) {
 	fixture := filepath.Join("testdata", "usage-export-v1.2.0.json")
 	body, err := os.ReadFile(fixture)
@@ -1787,84 +1695,10 @@ func TestHealthCheckReportsAlertsForRuntimePressure(t *testing.T) {
 	}
 }
 
-func TestHealthAlertsClassifyStoragePressure(t *testing.T) {
-	alerts := healthAlerts(StorageStatus{WritePressure: "slow"}, RuntimeStatus{})
-	if healthStatus(alerts) != "warn" || len(alerts) != 1 || alerts[0].Code != "storage_writer_slow" {
-		t.Fatalf("slow storage alerts = status %q alerts %#v, want warn/storage_writer_slow", healthStatus(alerts), alerts)
-	}
-
-	alerts = healthAlerts(StorageStatus{WritePressure: "full"}, RuntimeStatus{})
-	if healthStatus(alerts) != "error" || len(alerts) != 1 || alerts[0].Code != "storage_writer_full" {
-		t.Fatalf("full storage alerts = status %q alerts %#v, want error/storage_writer_full", healthStatus(alerts), alerts)
-	}
-
-	alerts = healthAlerts(StorageStatus{LastError: "disk full"}, RuntimeStatus{})
+func TestHealthAlertsClassifyStorageError(t *testing.T) {
+	alerts := healthAlerts(StorageStatus{LastError: "disk full"}, RuntimeStatus{})
 	if healthStatus(alerts) != "error" || len(alerts) != 1 || alerts[0].Code != "storage_error" {
 		t.Fatalf("storage error alerts = status %q alerts %#v, want error/storage_error", healthStatus(alerts), alerts)
-	}
-}
-
-func TestHealthAlertsReportRuntimeAndTailPressure(t *testing.T) {
-	alerts := healthAlerts(StorageStatus{
-		WriteBatchesTotal:       healthStorageWriterTailMinBatches,
-		WriteBatchP99DurationMs: healthStorageWriterTailLatencyMs,
-		WriteQueueWaitP99Ms:     healthStorageWriterTailLatencyMs,
-	}, RuntimeStatus{
-		EventsExportRequests:       1,
-		LastEventsExportDurationMs: healthSlowEventsExportDurationMs,
-		ConditionalRequests: map[string]ConditionalRequestStatus{
-			"dashboard-events": {
-				Requests:    healthConditionalLowHitMinRequests,
-				NotModified: 1,
-				Misses:      healthConditionalLowHitMinRequests - 1,
-				HitRate:     0.05,
-			},
-			"dashboard-summary": {
-				Requests:    healthConditionalLowHitMinRequests,
-				NotModified: healthConditionalLowHitMinRequests,
-				HitRate:     1,
-			},
-		},
-	})
-
-	if healthStatus(alerts) != "warn" {
-		t.Fatalf("health status = %q alerts %#v, want warn", healthStatus(alerts), alerts)
-	}
-	wantCodes := map[string]bool{
-		"events_export_slow":                 true,
-		"storage_writer_p99_slow":            true,
-		"storage_writer_queue_p99_slow":      true,
-		"dashboard_conditional_low_hit_rate": true,
-	}
-	if len(alerts) != len(wantCodes) {
-		t.Fatalf("alerts = %#v, want codes %#v", alerts, wantCodes)
-	}
-	for _, alert := range alerts {
-		if !wantCodes[alert.Code] || alert.Severity != "warn" {
-			t.Fatalf("unexpected alert = %#v, want warn in %#v", alert, wantCodes)
-		}
-	}
-}
-
-func TestHealthAlertsIgnoreLowSignalThresholds(t *testing.T) {
-	alerts := healthAlerts(StorageStatus{
-		WriteBatchesTotal:       healthStorageWriterTailMinBatches - 1,
-		WriteBatchP99DurationMs: healthStorageWriterTailLatencyMs,
-		WriteQueueWaitP99Ms:     healthStorageWriterTailLatencyMs,
-	}, RuntimeStatus{
-		EventsExportRequests:       1,
-		LastEventsExportDurationMs: healthSlowEventsExportDurationMs - 1,
-		ConditionalRequests: map[string]ConditionalRequestStatus{
-			"dashboard-events": {
-				Requests: healthConditionalLowHitMinRequests - 1,
-				Misses:   healthConditionalLowHitMinRequests - 1,
-				HitRate:  0,
-			},
-		},
-	})
-
-	if len(alerts) != 0 || healthStatus(alerts) != "ok" {
-		t.Fatalf("alerts = %#v status %q, want no alerts/ok", alerts, healthStatus(alerts))
 	}
 }
 
@@ -2300,14 +2134,13 @@ func TestMergeSnapshotDedupSeparatesFailureStatusAndLatency(t *testing.T) {
 }
 
 func TestStorageReplayRestoresRecords(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage-statistics.jsonl")
+	path := filepath.Join(t.TempDir(), "usage-statistics.db")
 	cfg := runtimeConfig{
-		MaxDetailsPerModel:  100,
-		RetentionDays:       0,
-		DedupWindowMinutes:  0,
-		StorageEnabled:      true,
-		StoragePath:         path,
-		StorageFlushSeconds: 1,
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     true,
+		StoragePath:        path,
 	}
 
 	first := NewRequestStatistics()
@@ -2337,7 +2170,7 @@ func TestStorageReplayRestoresRecords(t *testing.T) {
 	if detail.Tokens.CachedTokens != 2 || detail.Tokens.CacheTokens != 5 || detail.Tokens.CacheWriteTokens != 3 {
 		t.Fatalf("replayed detail cache tokens = %#v, want read/total/write 2/5/3", detail.Tokens)
 	}
-	if status := second.StorageStatus(); !status.Enabled || status.LoadedPath == "" || status.LastError != "" {
+	if status := second.StorageStatus(); !status.Enabled || status.DatabasePath == "" || status.EventCount != 1 || status.LastError != "" {
 		t.Fatalf("storage status after replay = %#v", status)
 	}
 }
@@ -3154,82 +2987,6 @@ func TestRecordCanonicalizesBearerClientAPIKeyForAggregation(t *testing.T) {
 	}
 }
 
-func TestStorageWritesDateShards(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage-statistics.jsonl")
-	cfg := runtimeConfig{
-		MaxDetailsPerModel:  100,
-		RetentionDays:       0,
-		DedupWindowMinutes:  0,
-		StorageEnabled:      true,
-		StoragePath:         path,
-		StorageFlushSeconds: 1,
-	}
-
-	stats := NewRequestStatistics()
-	stats.Configure(cfg)
-	stats.Record(UsageRecord{
-		Provider: "openai",
-		Model:    "gpt-4",
-		Detail:   UsageDetail{TotalTokens: 11},
-	})
-	status := stats.StorageStatus()
-	stats.Close()
-
-	shardPath := status.LoadedPath
-	if !strings.Contains(shardPath, string(filepath.Separator)+"usage-statistics"+string(filepath.Separator)+"usage-") {
-		t.Fatalf("loaded storage path %q does not look like a date shard", shardPath)
-	}
-	if _, err := os.Stat(shardPath); err != nil {
-		t.Fatalf("date shard %q was not written: %v", shardPath, err)
-	}
-	snapshotPath := storageSnapshotPath(filepath.Dir(shardPath))
-	if _, err := os.Stat(snapshotPath); err != nil {
-		t.Fatalf("snapshot %q was not written on close: %v", snapshotPath, err)
-	}
-
-	reloaded := NewRequestStatistics()
-	reloaded.Configure(cfg)
-	defer reloaded.Close()
-	if got := reloaded.Snapshot().TotalRequests; got != 1 {
-		t.Fatalf("replayed date shard requests = %d, want 1", got)
-	}
-}
-
-func TestStorageStatusReportsPendingBufferedRecords(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage-statistics.jsonl")
-	stats := NewRequestStatistics()
-	stats.Configure(runtimeConfig{
-		MaxDetailsPerModel:  100,
-		RetentionDays:       0,
-		DedupWindowMinutes:  0,
-		StorageEnabled:      true,
-		StoragePath:         path,
-		StorageFlushSeconds: 3600,
-	})
-	defer stats.Close()
-
-	stats.Record(UsageRecord{
-		Provider: "openai",
-		Model:    "gpt-4",
-		Detail:   UsageDetail{TotalTokens: 1},
-	})
-	waitForTestCondition(t, func() bool { return stats.StorageStatus().LastFlushAt != "" })
-	stats.Record(UsageRecord{
-		Provider: "openai",
-		Model:    "gpt-4",
-		Detail:   UsageDetail{TotalTokens: 2},
-	})
-
-	waitForTestCondition(t, func() bool { return stats.StorageStatus().PendingBufferedRecords == 1 })
-	if status := stats.StorageStatus(); status.WriteQueueCapacity != defaultStorageWriteQueueSize {
-		t.Fatalf("write queue capacity = %d, want %d", status.WriteQueueCapacity, defaultStorageWriteQueueSize)
-	}
-	stats.Close()
-	if status := stats.StorageStatus(); status.PendingBufferedRecords != 0 {
-		t.Fatalf("pending buffered records after close = %d, want 0", status.PendingBufferedRecords)
-	}
-}
-
 func TestStorageWorkerCollectsQueuedBatches(t *testing.T) {
 	queue := make(chan persistedDetail, defaultStorageWriteBatchSize+4)
 	first := persistedDetail{API: "api-0", Model: "gpt-4"}
@@ -3250,78 +3007,6 @@ func TestStorageWorkerCollectsQueuedBatches(t *testing.T) {
 	}
 	if remaining := len(queue); remaining != 4 {
 		t.Fatalf("remaining queue length = %d, want 4", remaining)
-	}
-}
-
-func TestStorageStatusReportsWriteBatchMetrics(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage-statistics.jsonl")
-	stats := NewRequestStatistics()
-	stats.Configure(runtimeConfig{
-		MaxDetailsPerModel:  100,
-		RetentionDays:       0,
-		DedupWindowMinutes:  0,
-		StorageEnabled:      true,
-		StoragePath:         path,
-		StorageFlushSeconds: 3600,
-	})
-	defer stats.Close()
-
-	for i := 0; i < 16; i++ {
-		stats.Record(UsageRecord{
-			Provider:    "openai",
-			Model:       "gpt-4",
-			RequestedAt: time.Now().Add(time.Duration(i) * time.Millisecond),
-			Detail:      UsageDetail{TotalTokens: int64(i + 1)},
-		})
-	}
-
-	waitForTestCondition(t, func() bool { return stats.StorageStatus().LastWriteBatchRecords > 0 })
-	status := stats.StorageStatus()
-	if status.LastWriteBatchRecords <= 0 {
-		t.Fatalf("last write batch records = %d, want > 0", status.LastWriteBatchRecords)
-	}
-	if status.LastWriteBatchDurationMs <= 0 {
-		t.Fatalf("last write batch duration = %f, want > 0", status.LastWriteBatchDurationMs)
-	}
-	if status.LastWriteQueueWaitMs < 0 {
-		t.Fatalf("last write queue wait = %f, want >= 0", status.LastWriteQueueWaitMs)
-	}
-	if status.WriteBatchesTotal <= 0 {
-		t.Fatalf("write batches total = %d, want > 0", status.WriteBatchesTotal)
-	}
-	if status.WriteRecordsTotal <= 0 {
-		t.Fatalf("write records total = %d, want > 0", status.WriteRecordsTotal)
-	}
-	if status.WriteBatchAvgDurationMs <= 0 {
-		t.Fatalf("write batch avg duration = %f, want > 0", status.WriteBatchAvgDurationMs)
-	}
-	if status.WritePressure == "" {
-		t.Fatalf("write pressure should be reported when storage is enabled: %#v", status)
-	}
-}
-
-func TestStorageStatusReportsWriteBatchPercentiles(t *testing.T) {
-	stats := NewRequestStatistics()
-	stats.mu.Lock()
-	stats.storageEnabled = true
-	stats.mu.Unlock()
-
-	for i := 1; i <= 100; i++ {
-		stats.updateStorageWriteBatchMetrics(1, time.Duration(i)*time.Millisecond, time.Duration(i*2)*time.Millisecond)
-	}
-
-	status := stats.StorageStatus()
-	if status.WriteBatchP95DurationMs != 95 {
-		t.Fatalf("write batch p95 = %f, want 95", status.WriteBatchP95DurationMs)
-	}
-	if status.WriteBatchP99DurationMs != 99 {
-		t.Fatalf("write batch p99 = %f, want 99", status.WriteBatchP99DurationMs)
-	}
-	if status.WriteQueueWaitP95Ms != 190 {
-		t.Fatalf("write queue wait p95 = %f, want 190", status.WriteQueueWaitP95Ms)
-	}
-	if status.WriteQueueWaitP99Ms != 198 {
-		t.Fatalf("write queue wait p99 = %f, want 198", status.WriteQueueWaitP99Ms)
 	}
 }
 
@@ -3361,126 +3046,14 @@ func TestStorageWritePressureClassification(t *testing.T) {
 	}
 }
 
-func TestStorageSnapshotWritesByRecordInterval(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "usage-statistics")
-	cfg := runtimeConfig{
-		MaxDetailsPerModel:            100,
-		RetentionDays:                 0,
-		DedupWindowMinutes:            0,
-		StorageEnabled:                true,
-		StoragePath:                   dir,
-		StorageFlushSeconds:           3600,
-		StorageSnapshotSeconds:        3600,
-		StorageSnapshotRecordInterval: 2,
-	}
-
-	stats := NewRequestStatistics()
-	stats.Configure(cfg)
-	defer stats.Close()
-	snapshotPath := storageSnapshotPath(dir)
-
-	stats.Record(UsageRecord{
-		Provider: "openai",
-		Model:    "gpt-4",
-		Detail:   UsageDetail{TotalTokens: 1},
-	})
-	if _, err := os.Stat(snapshotPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("snapshot should not exist after one record, stat err = %v", err)
-	}
-
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-4",
-		RequestedAt: time.Now().Add(time.Second),
-		Detail:      UsageDetail{TotalTokens: 2},
-	})
-	var status StorageStatus
-	waitForTestCondition(t, func() bool {
-		if _, err := os.Stat(snapshotPath); err != nil {
-			return false
-		}
-		status = stats.StorageStatus()
-		return status.LastSnapshotAt != "" && status.PendingSnapshotRecords == 0
-	})
-	if status.LastSnapshotAt == "" {
-		t.Fatalf("last snapshot time should be reported: %#v", status)
-	}
-	if status.PendingSnapshotRecords != 0 {
-		t.Fatalf("pending snapshot records = %d, want 0", status.PendingSnapshotRecords)
-	}
-	if status.SnapshotRecordIntervalRecords != 2 {
-		t.Fatalf("snapshot record interval = %d, want 2", status.SnapshotRecordIntervalRecords)
-	}
-	stats.Close()
-
-	reloaded := NewRequestStatistics()
-	reloaded.Configure(cfg)
-	defer reloaded.Close()
-	if got := reloaded.Snapshot().TotalRequests; got != 2 {
-		t.Fatalf("reloaded requests = %d, want 2", got)
-	}
-}
-
-func TestStorageSyncsByRecordInterval(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "usage-statistics")
-	cfg := runtimeConfig{
-		MaxDetailsPerModel:        100,
-		RetentionDays:             0,
-		DedupWindowMinutes:        0,
-		StorageEnabled:            true,
-		StoragePath:               dir,
-		StorageFlushSeconds:       3600,
-		StorageSyncRecordInterval: 2,
-	}
-
-	stats := NewRequestStatistics()
-	stats.Configure(cfg)
-	defer stats.Close()
-	stats.Record(UsageRecord{
-		Provider: "openai",
-		Model:    "gpt-4",
-		Detail:   UsageDetail{TotalTokens: 1},
-	})
-	waitForTestCondition(t, func() bool {
-		status := stats.StorageStatus()
-		return status.PendingUnsyncedRecords == 1 && status.LastSyncAt == ""
-	})
-
-	stats.Record(UsageRecord{
-		Provider:    "openai",
-		Model:       "gpt-4",
-		RequestedAt: time.Now().Add(time.Second),
-		Detail:      UsageDetail{TotalTokens: 2},
-	})
-	waitForTestCondition(t, func() bool {
-		status := stats.StorageStatus()
-		return status.PendingUnsyncedRecords == 0 && status.PendingBufferedRecords == 0 && status.LastSyncAt != ""
-	})
-	status := stats.StorageStatus()
-	if status.PendingUnsyncedRecords != 0 {
-		t.Fatalf("pending unsynced records = %d, want 0", status.PendingUnsyncedRecords)
-	}
-	if status.PendingBufferedRecords != 0 {
-		t.Fatalf("pending buffered records = %d, want 0 after sync flush", status.PendingBufferedRecords)
-	}
-	if status.LastSyncAt == "" {
-		t.Fatalf("last sync time should be reported: %#v", status)
-	}
-	if status.SyncRecordIntervalRecords != 2 {
-		t.Fatalf("sync record interval = %d, want 2", status.SyncRecordIntervalRecords)
-	}
-	stats.Close()
-}
-
 func TestStoragePersistsImportedSnapshotThroughBackgroundWriter(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "usage-statistics")
+	dir := filepath.Join(t.TempDir(), "usage-statistics.db")
 	cfg := runtimeConfig{
-		MaxDetailsPerModel:  100,
-		RetentionDays:       0,
-		DedupWindowMinutes:  0,
-		StorageEnabled:      true,
-		StoragePath:         dir,
-		StorageFlushSeconds: 3600,
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     true,
+		StoragePath:        dir,
 	}
 	when := time.Now().Add(-time.Minute).UTC()
 	imported := StatisticsSnapshot{
@@ -4174,12 +3747,7 @@ func TestStorageConfigParsing(t *testing.T) {
 configs:
   usage-statistics:
     storage_enabled: true
-    storage_path: "/tmp/usage-statistics.jsonl"
-    storage_flush_interval_seconds: 3
-    storage_snapshot_interval_seconds: 7
-    storage_snapshot_record_interval: 11
-    storage_sync_interval_seconds: 13
-    storage_sync_record_interval: 17
+    storage_path: "/tmp/usage-statistics.db"
     price_storage_path: "/tmp/usage-statistics-prices.json"
     models_dev_prices_enabled: true
     models_dev_prices_url: "https://example.test/models-dev.json"
@@ -4191,23 +3759,8 @@ configs:
 	if !cfg.StorageEnabled {
 		t.Fatal("storage_enabled should be true")
 	}
-	if cfg.StoragePath != "/tmp/usage-statistics.jsonl" {
+	if cfg.StoragePath != "/tmp/usage-statistics.db" {
 		t.Fatalf("storage_path = %q", cfg.StoragePath)
-	}
-	if cfg.StorageFlushSeconds != 3 {
-		t.Fatalf("storage_flush_interval_seconds = %d, want 3", cfg.StorageFlushSeconds)
-	}
-	if cfg.StorageSnapshotSeconds != 7 {
-		t.Fatalf("storage_snapshot_interval_seconds = %d, want 7", cfg.StorageSnapshotSeconds)
-	}
-	if cfg.StorageSnapshotRecordInterval != 11 {
-		t.Fatalf("storage_snapshot_record_interval = %d, want 11", cfg.StorageSnapshotRecordInterval)
-	}
-	if cfg.StorageSyncSeconds != 13 {
-		t.Fatalf("storage_sync_interval_seconds = %d, want 13", cfg.StorageSyncSeconds)
-	}
-	if cfg.StorageSyncRecordInterval != 17 {
-		t.Fatalf("storage_sync_record_interval = %d, want 17", cfg.StorageSyncRecordInterval)
 	}
 	if cfg.PriceStoragePath != "/tmp/usage-statistics-prices.json" {
 		t.Fatalf("price_storage_path = %q", cfg.PriceStoragePath)
@@ -4252,17 +3805,16 @@ func TestRegisterResponseExposesUpdateConfigFields(t *testing.T) {
 	if !strings.Contains(string(raw), `"Name":"storage_enabled"`) {
 		t.Fatalf("register response missing storage_enabled: %s", raw)
 	}
-	if !strings.Contains(string(raw), `"Name":"storage_snapshot_interval_seconds"`) {
-		t.Fatalf("register response missing storage_snapshot_interval_seconds: %s", raw)
-	}
-	if !strings.Contains(string(raw), `"Name":"storage_snapshot_record_interval"`) {
-		t.Fatalf("register response missing storage_snapshot_record_interval: %s", raw)
-	}
-	if !strings.Contains(string(raw), `"Name":"storage_sync_interval_seconds"`) {
-		t.Fatalf("register response missing storage_sync_interval_seconds: %s", raw)
-	}
-	if !strings.Contains(string(raw), `"Name":"storage_sync_record_interval"`) {
-		t.Fatalf("register response missing storage_sync_record_interval: %s", raw)
+	for _, removed := range []string{
+		`"Name":"storage_flush_interval_seconds"`,
+		`"Name":"storage_snapshot_interval_seconds"`,
+		`"Name":"storage_snapshot_record_interval"`,
+		`"Name":"storage_sync_interval_seconds"`,
+		`"Name":"storage_sync_record_interval"`,
+	} {
+		if strings.Contains(string(raw), removed) {
+			t.Fatalf("register response exposes removed storage field %s: %s", removed, raw)
+		}
 	}
 	if !strings.Contains(string(raw), `"Name":"price_storage_path"`) {
 		t.Fatalf("register response missing price_storage_path: %s", raw)

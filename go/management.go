@@ -416,7 +416,7 @@ func handleImportUsage(body []byte) ([]byte, error) {
 	}
 
 	result := stats.MergeSnapshot(importPayload.Usage)
-	snapshot := stats.Snapshot()
+	summary := stats.SummaryWithoutDetails()
 
 	responseData := ImportResponse{
 		InputRecords:       recordCount,
@@ -425,8 +425,8 @@ func handleImportUsage(body []byte) ([]byte, error) {
 		Added:              result.Added,
 		Skipped:            result.Skipped,
 		IgnoredByRetention: result.IgnoredByRetention,
-		TotalRequests:      snapshot.TotalRequests,
-		FailedRequests:     snapshot.FailureCount,
+		TotalRequests:      summary.Usage.TotalRequests,
+		FailedRequests:     summary.Usage.FailureCount,
 	}
 
 	// Track last import result

@@ -1,6 +1,7 @@
 # 服务绑定的主机/网卡地址。默认留空（""）表示绑定所有接口（IPv4 + IPv6）。
 # 如需仅允许本机访问，可使用 "127.0.0.1" 或 "localhost"。
 host: ""
+
 # 服务端口
 port: 8317
 
@@ -78,23 +79,18 @@ plugins:
       # priority: 1
       # CPA 插件宿主通用字段：插件商店安装元数据。手动放置插件文件时可省略。
       # store:
-      #   version: "2.5.6"
-      #   release-tag: "v2.5.6"
+      #   version: "2.5.5"
+      #   release-tag: "v2.5.5"
       #   repository: "https://github.com/zduu/cpa-usage-plugin"
 
       # 以下为用量统计插件自己的配置字段
-      max_details_per_model: 5000
-      retention_days: 30
+      max_details_per_model: 1000
+      retention_days: 7
       dedup_window_minutes: 1440
       log_response_headers: ""
       api_key_hash_salt: ""
       storage_enabled: true
-      storage_path: "data/usage-statistics.jsonl"
-      storage_flush_interval_seconds: 5
-      storage_snapshot_interval_seconds: 300
-      storage_snapshot_record_interval: 1000
-      storage_sync_interval_seconds: 0
-      storage_sync_record_interval: 0
+      storage_path: "data/usage-statistics.db"
       export_max_records: 100000
       price_storage_path: "usage-statistics-prices.json"
       models_dev_prices_enabled: false

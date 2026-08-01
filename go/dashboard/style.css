@@ -379,6 +379,9 @@ tbody td{transition:background-color .12s}
 /* ---- 筛选器 ---- */
 .filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 .eventsMeta{display:flex;justify-content:space-between;color:var(--cpa-text-tertiary);font-size:12px;margin-bottom:6px;gap:8px;flex-wrap:wrap}
+.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:10px;min-width:0;color:var(--cpa-text-tertiary);font-size:12px}
+.pagination .btn{width:auto;min-width:34px;flex:0 0 auto;padding:6px 9px;line-height:1.2}
+.pagination>span{min-width:0;max-width:100%;flex:0 1 auto;text-align:center;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}
 .nowrap{white-space:nowrap}
 
