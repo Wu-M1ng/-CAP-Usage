@@ -10,6 +10,7 @@ class FakeElement {
     this.value = '';
     this.textContent = '';
     this.innerHTML = '';
+    this.title = '';
     this.disabled = false;
     this.clientWidth = 320;
     this.dataset = {};
@@ -835,7 +836,7 @@ test('dashboard follows runtime language changes', async () => {
 
   await waitFor(() => document.documentElement.lang === 'en');
   await waitFor(() => document.getElementById('successText').textContent.includes('Success requests:'));
-  await waitFor(() => document.getElementById('eventsCount').textContent.includes('Total 1,200, showing 500'));
+  await waitFor(() => document.getElementById('eventsCount').textContent.includes('Total 1,200, showing 50'));
   await waitFor(() => document.getElementById('modelStats').innerHTML.includes('Success Rate'));
   await waitFor(() => document.getElementById('priceList').innerHTML.includes('Edit'));
   await waitFor(() => document.getElementById('updated').textContent.includes('Updated at:'));

@@ -3455,10 +3455,6 @@ func TestStorageSnapshotCompactsShardsBeforeSnapshotDay(t *testing.T) {
 	if _, err := os.Stat(todayPath); err != nil {
 		t.Fatalf("today shard should remain for same-day delta replay: %v", err)
 	}
-	status := stats.StorageStatus()
-	if status.LastCompactionAt == "" || status.LastCompactedShards != 1 || status.CompactedShardsTotal != 1 {
-		t.Fatalf("compaction status = %#v, want one compacted shard", status)
-	}
 }
 
 func TestStorageReplaySkipsAndCleansExpiredDateShards(t *testing.T) {

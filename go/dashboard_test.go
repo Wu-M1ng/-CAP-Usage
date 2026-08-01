@@ -1521,7 +1521,7 @@ func TestDashboardEventsRangeExcludesZeroTimestampEvents(t *testing.T) {
 		Provider:  "openai",
 		Timestamp: time.Time{},
 		Tokens:    TokenStats{TotalTokens: 100},
-	}, requestDedupKey{}, time.Now(), false)
+	}, requestDedupKey{}, time.Now(), false, true)
 	stats.mu.Unlock()
 
 	all := stats.QueryEvents(EventsQuery{Limit: 50, Range: "all"})
@@ -1703,7 +1703,7 @@ func TestDashboardAPIDetailRangeExcludesZeroTimestampEvents(t *testing.T) {
 		Provider:  "openai",
 		Timestamp: time.Time{},
 		Tokens:    TokenStats{TotalTokens: 100},
-	}, requestDedupKey{}, time.Now(), false)
+	}, requestDedupKey{}, time.Now(), false, true)
 	stats.mu.Unlock()
 
 	all := stats.QueryAPIDetail("openai", "all", 10, 10)
@@ -1833,7 +1833,7 @@ func TestDashboardAPIDetailRangePreservesCacheWriteTokens(t *testing.T) {
 		},
 	}
 	stats.mu.Lock()
-	if !stats.recordDetailLocked("anthropic", "model", detail, requestDedupKey{}, now, false) {
+	if !stats.recordDetailLocked("anthropic", "model", detail, requestDedupKey{}, now, false, true) {
 		stats.mu.Unlock()
 		t.Fatal("record detail failed")
 	}
@@ -1875,7 +1875,7 @@ func TestStorageSnapshotPreservesProviderAggregatesAfterDetailTrimming(t *testin
 				TotalTokens:      1_000,
 			},
 		}
-		if !stats.recordDetailLocked("anthropic", "model", detail, requestDedupKey{}, now, false) {
+		if !stats.recordDetailLocked("anthropic", "model", detail, requestDedupKey{}, now, false, true) {
 			stats.mu.Unlock()
 			t.Fatal("record detail failed")
 		}
@@ -2659,7 +2659,7 @@ func TestSummaryRangeExcludesZeroTimestampEvents(t *testing.T) {
 		Provider:  "openai",
 		Timestamp: time.Time{},
 		Tokens:    TokenStats{TotalTokens: 100},
-	}, requestDedupKey{}, time.Now(), false)
+	}, requestDedupKey{}, time.Now(), false, true)
 	stats.mu.Unlock()
 
 	fullSummary := stats.SummaryWithoutDetails()
