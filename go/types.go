@@ -733,6 +733,8 @@ type StatisticsSnapshot struct {
 
 	APIs map[string]APISnapshot `json:"apis"`
 
+	EndpointStats []EndpointStat `json:"endpoint_stats,omitempty"`
+
 	RequestsByDay    map[string]int64                 `json:"requests_by_day"`
 	RequestsByHour   map[string]int64                 `json:"requests_by_hour"`
 	TokensByDay      map[string]int64                 `json:"tokens_by_day"`
@@ -813,6 +815,8 @@ type StatisticsSnapshotWithoutDetails struct {
 	TokensByHour     map[string]int64                     `json:"tokens_by_hour"`
 	CostByDay        map[string]float64                   `json:"cost_by_day,omitempty"`
 	CostByHour       map[string]float64                   `json:"cost_by_hour,omitempty"`
+	TokenPartsByDay  map[string]TokenPartStat             `json:"token_parts_by_day,omitempty"`
+	TokenPartsByHour map[string]TokenPartStat             `json:"token_parts_by_hour,omitempty"`
 }
 
 type APISnapshotWithoutDetails struct {
@@ -861,6 +865,31 @@ type SourceStat struct {
 	SuccessCount  int64  `json:"success_count"`
 	FailureCount  int64  `json:"failure_count"`
 	TotalTokens   int64  `json:"total_tokens"`
+}
+
+// TokenPartStat separates the token categories used by the dashboard trend.
+type TokenPartStat struct {
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+}
+
+// EndpointStat aggregates request stats by the request endpoint. Models are
+// included so the dashboard can apply provider-specific model prices.
+type EndpointStat struct {
+	Endpoint         string      `json:"endpoint"`
+	TotalRequests    int64       `json:"total_requests"`
+	SuccessCount     int64       `json:"success_count"`
+	FailureCount     int64       `json:"failure_count"`
+	TotalTokens      int64       `json:"total_tokens"`
+	InputTokens      int64       `json:"input_tokens"`
+	OutputTokens     int64       `json:"output_tokens"`
+	CachedTokens     int64       `json:"cached_tokens"`
+	CacheWriteTokens int64       `json:"cache_write_tokens"`
+	ReasoningTokens  int64       `json:"reasoning_tokens"`
+	Models           []ModelStat `json:"models,omitempty"`
 }
 
 // CredentialStat aggregates request stats by CPA credential (auth_index).
@@ -945,6 +974,7 @@ type DashboardSummary struct {
 	Usage           StatisticsSnapshotWithoutDetails `json:"usage"`
 	HealthGrid      []HealthGridSlot                 `json:"health_grid"`
 	SourceStats     []SourceStat                     `json:"source_stats"`
+	EndpointStats   []EndpointStat                   `json:"endpoint_stats"`
 	CredentialStats []CredentialStat                 `json:"credential_stats"`
 	ClientAPIStats  []ClientAPIStat                  `json:"client_api_stats"`
 

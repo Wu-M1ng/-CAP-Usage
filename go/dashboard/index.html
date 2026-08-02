@@ -32,6 +32,31 @@
     <div class="stat green"><div class="label" data-i18n="rpm">每分钟请求</div><div class="value" id="rpm">-</div><div class="meta"><span id="rpmMeta">-</span></div><svg id="rpmSpark" class="spark"></svg></div>
     <div class="stat amber"><div class="label" data-i18n="total_cost">总花费</div><div class="value" id="totalCost">-</div><div class="meta"><span id="costMeta">-</span></div><svg id="costSpark" class="spark"></svg></div>
   </section>
+  <section class="panel full distributionDashboard" id="distributionDashboard">
+    <div class="panelHead">
+      <div><h2 data-i18n="distribution_title">用量分布</h2><div class="subtle" data-i18n="distribution_subtle">按 Token 查看模型、上游接口、端点和分项趋势。</div></div>
+      <span class="subtle" data-i18n="distribution_token_mode">按 Token</span>
+    </div>
+    <div class="distributionGrid">
+      <article class="distributionBlock">
+        <div class="distributionBlockHead"><h3 data-i18n="model_distribution_title">模型分布</h3><span class="subtle" data-i18n="distribution_requests_share">按请求数</span></div>
+        <div class="distributionBody"><div class="distributionDonutWrap"><svg id="modelDistributionDonut" class="distributionDonut" role="img"></svg><div id="modelDistributionTotal" class="distributionDonutTotal"></div></div><div class="distributionTableWrap" id="modelDistribution"></div></div>
+      </article>
+      <article class="distributionBlock">
+        <div class="distributionBlockHead"><h3 data-i18n="upstream_distribution_title">上游接口使用分布</h3><span class="subtle" data-i18n="distribution_requests_share">按请求数</span></div>
+        <div class="distributionBody"><div class="distributionDonutWrap"><svg id="upstreamDistributionDonut" class="distributionDonut" role="img"></svg><div id="upstreamDistributionTotal" class="distributionDonutTotal"></div></div><div class="distributionTableWrap" id="upstreamDistribution"></div></div>
+      </article>
+      <article class="distributionBlock">
+        <div class="distributionBlockHead"><h3 data-i18n="endpoint_distribution_title">端点分布</h3><span class="subtle" data-i18n="distribution_requests_share">按请求数</span></div>
+        <div class="distributionBody"><div class="distributionDonutWrap"><svg id="endpointDistributionDonut" class="distributionDonut" role="img"></svg><div id="endpointDistributionTotal" class="distributionDonutTotal"></div></div><div class="distributionTableWrap" id="endpointDistribution"></div></div>
+      </article>
+      <article class="distributionBlock tokenTrendBlock">
+        <div class="distributionBlockHead"><h3 data-i18n="token_distribution_title">Token 使用趋势</h3><span class="subtle" data-i18n="token_distribution_subtle">输入、输出与缓存分项</span></div>
+        <div class="tokenTrendWrap"><svg id="tokenUsageTrend" class="tokenTrendSvg" role="img"></svg></div>
+        <div id="tokenTrendLegend" class="tokenTrendLegend"></div>
+      </article>
+    </div>
+  </section>
   <section class="panel full">
     <div class="panelHead">
       <div><h2 data-i18n="health_title">服务健康监测</h2><div class="subtle" data-i18n="health_subtle">最近5天，15分钟一个网格；绿色代表成功率高，红色代表失败较多。</div></div>

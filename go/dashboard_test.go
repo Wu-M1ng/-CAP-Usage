@@ -173,6 +173,77 @@ func TestDashboardSummaryHasSourceStats(t *testing.T) {
 	}
 }
 
+func TestDashboardSummaryHasEndpointStatsAndTokenParts(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, RetentionDays: 0})
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-time.Hour)
+	stats.Record(UsageRecord{
+		Provider:    "openai",
+		Model:       "gpt-4.1",
+		Endpoint:    "/v1/chat/completions",
+		RequestedAt: old,
+		Detail: UsageDetail{
+			InputTokens: 100, OutputTokens: 20, CachedTokens: 30,
+			CacheCreationTokens: 4, TotalTokens: 120,
+		},
+	})
+	stats.Record(UsageRecord{
+		Provider:    "anthropic",
+		Model:       "claude-3-7-sonnet",
+		Endpoint:    "/v1/messages",
+		RequestedAt: recent,
+		Detail: UsageDetail{
+			InputTokens: 40, OutputTokens: 10, CacheReadTokens: 5,
+			CacheCreationTokens: 2, TotalTokens: 57,
+		},
+	})
+
+	summary := stats.SummaryWithoutDetails()
+	if len(summary.EndpointStats) != 2 {
+		t.Fatalf("endpoint stats = %#v, want two endpoints", summary.EndpointStats)
+	}
+	if summary.EndpointStats[0].Endpoint != "/v1/chat/completions" || summary.EndpointStats[0].TotalRequests != 1 {
+		t.Fatalf("first endpoint stat = %#v", summary.EndpointStats[0])
+	}
+	if len(summary.EndpointStats[0].Models) != 1 || summary.EndpointStats[0].Models[0].Providers[0].Provider != "openai" {
+		t.Fatalf("endpoint model/provider stats = %#v", summary.EndpointStats[0].Models)
+	}
+	day, hour := dashboardLocalDayHour(recent)
+	oldDay, oldHour := dashboardLocalDayHour(old)
+	parts := summary.Usage.TokenPartsByHour[hourKeys[hour]]
+	if parts.InputTokens != 40 || parts.OutputTokens != 10 || parts.CacheReadTokens != 5 || parts.CacheWriteTokens != 2 {
+		t.Fatalf("recent hourly token parts = %#v, want 40/10/5/2", parts)
+	}
+	oldParts := summary.Usage.TokenPartsByHour[hourKeys[oldHour]]
+	if oldParts.InputTokens != 100 || oldParts.OutputTokens != 20 || oldParts.CacheReadTokens != 30 || oldParts.CacheWriteTokens != 4 {
+		t.Fatalf("old hourly token parts = %#v, want 100/20/30/4", oldParts)
+	}
+	dailyParts := summary.Usage.TokenPartsByDay[day]
+	if dailyParts.InputTokens != 40 || dailyParts.OutputTokens != 10 || dailyParts.CacheReadTokens != 5 || dailyParts.CacheWriteTokens != 2 {
+		t.Fatalf("daily token parts = %#v, want 40/10/5/2", dailyParts)
+	}
+	if summary.Usage.TokenPartsByDay[oldDay].InputTokens != 100 {
+		t.Fatalf("old daily token parts = %#v, want old request", summary.Usage.TokenPartsByDay[oldDay])
+	}
+
+	ranged := stats.SummaryWithoutDetailsForRangeAt("24h", now)
+	if len(ranged.EndpointStats) != 1 || ranged.EndpointStats[0].Endpoint != "/v1/messages" || ranged.EndpointStats[0].TotalTokens != 57 {
+		t.Fatalf("range endpoint stats = %#v, want only recent endpoint", ranged.EndpointStats)
+	}
+	if ranged.Usage.TokenPartsByHour[hourKeys[hour]].CacheReadTokens != 5 {
+		t.Fatalf("range token parts = %#v, want recent cache read", ranged.Usage.TokenPartsByHour)
+	}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"details"`) {
+		t.Fatal("lightweight summary contains request details")
+	}
+}
+
 func TestDashboardSummaryHasModelStats(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0})

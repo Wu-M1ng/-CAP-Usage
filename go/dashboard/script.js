@@ -1154,6 +1154,181 @@ function renderModelStats() {
   }).join('') + '</tbody></table>' : '<div class="empty">' + t('no_model_data') + '</div>';
 }
 
+const distributionColors = ['#2563eb', '#14b8a6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#94a3b8'];
+
+function distributionCost(row) {
+  if (Array.isArray(row && row.models)) {
+    return row.models.reduce((sum, model) => sum + aggregateCost(model, modelPrices, manualModelPrices), 0);
+  }
+  return aggregateCost(row, modelPrices, manualModelPrices);
+}
+
+function distributionRowsForPanel(panelData) {
+  const usage = panelData && panelData.usage || {};
+  const modelRows = (panelData && panelData.model_stats || []).map((row) => ({
+    name: row.model || t('unknown_model'),
+    requests: num(row.total_requests),
+    tokens: num(row.total_tokens),
+    cost: distributionCost(row),
+  }));
+  const upstreamRows = Object.entries(usage.apis || {}).map(([name, row]) => ({
+    name,
+    requests: num(row.total_requests),
+    tokens: num(row.total_tokens),
+    cost: distributionCost({ models: Object.entries(row.models || {}).map(([model, stat]) => Object.assign({ model }, stat)) }),
+  }));
+  const endpointRows = (panelData && panelData.endpoint_stats || []).map((row) => ({
+    name: row.endpoint === 'unknown' ? t('unknown_endpoint') : (row.endpoint || t('unknown_endpoint')),
+    requests: num(row.total_requests),
+    tokens: num(row.total_tokens),
+    cost: distributionCost(row),
+  }));
+  return { modelRows, upstreamRows, endpointRows };
+}
+
+function renderDistributionDonut(svgId, totalId, rows) {
+  const svg = $(svgId);
+  const totalEl = $(totalId);
+  if (!svg || !totalEl) return;
+  const sorted = (rows || []).slice().sort((a, b) => b.tokens - a.tokens || b.requests - a.requests);
+  const totalTokens = sorted.reduce((sum, row) => sum + Math.max(row.tokens, 0), 0);
+  totalEl.textContent = totalTokens > 0 ? compact(totalTokens) : '-';
+  if (!sorted.length || totalTokens <= 0) {
+    svg.setAttribute('viewBox', '0 0 120 120');
+    svg.innerHTML = '<circle cx="60" cy="60" r="43" fill="none" stroke="var(--cpa-border-light)" stroke-width="18"/>';
+    return;
+  }
+  const visible = sorted.slice(0, 6);
+  const other = sorted.slice(6).reduce((row, item) => ({
+    name: t('distribution_other'),
+    requests: row.requests + item.requests,
+    tokens: row.tokens + item.tokens,
+    cost: row.cost + item.cost,
+  }), { name: t('distribution_other'), requests: 0, tokens: 0, cost: 0 });
+  if (other.tokens > 0) visible.push(other);
+  let offset = 0;
+  const rings = visible.map((row, index) => {
+    const share = row.tokens / totalTokens * 100;
+    const color = distributionColors[index % distributionColors.length];
+    const title = esc(row.name + ': ' + compact(row.tokens));
+    const ring = '<circle cx="60" cy="60" r="43" fill="none" stroke="' + color + '" stroke-width="18" pathLength="100" stroke-dasharray="' + share.toFixed(3) + ' ' + (100 - share).toFixed(3) + '" stroke-dashoffset="-' + offset.toFixed(3) + '" transform="rotate(-90 60 60)"><title>' + title + '</title></circle>';
+    offset += share;
+    return ring;
+  }).join('');
+  svg.setAttribute('viewBox', '0 0 120 120');
+  svg.innerHTML = '<circle cx="60" cy="60" r="43" fill="none" stroke="var(--cpa-border-light)" stroke-width="18"/>' + rings;
+}
+
+function renderDistributionTable(elementId, rows) {
+  const el = $(elementId);
+  if (!el) return;
+  const sorted = (rows || []).slice().sort((a, b) => b.tokens - a.tokens || b.requests - a.requests);
+  if (!sorted.length) {
+    el.innerHTML = '<div class="distributionEmpty">' + esc(t('distribution_empty')) + '</div>';
+    return;
+  }
+  const visible = sorted.slice(0, 6);
+  const other = sorted.slice(6).reduce((row, item) => ({
+    name: t('distribution_other'),
+    requests: row.requests + item.requests,
+    tokens: row.tokens + item.tokens,
+    cost: row.cost + item.cost,
+  }), { name: t('distribution_other'), requests: 0, tokens: 0, cost: 0 });
+  if (other.tokens > 0) visible.push(other);
+  el.innerHTML = '<table><thead><tr><th>' + t('distribution_name') + '</th><th>' + t('col_requests') + '</th><th>' + t('col_tokens') + '</th><th>' + t('distribution_cost') + '</th></tr></thead><tbody>' + visible.map((row, index) => {
+    const color = distributionColors[index % distributionColors.length];
+    return '<tr><td class="nameCell" title="' + esc(row.name) + '"><span class="distributionLegendDot" style="background:' + color + '"></span>' + esc(row.name) + '</td><td>' + formatInteger(row.requests) + '</td><td>' + compact(row.tokens) + '</td><td>' + formatUsd(row.cost) + '</td></tr>';
+  }).join('') + '</tbody></table>';
+}
+
+function tokenTrendPoints(panelData) {
+  const usage = panelData && panelData.usage || {};
+  const hourly = $('range').value === '7h' || $('range').value === '24h';
+  const source = hourly ? usage.token_parts_by_hour : usage.token_parts_by_day;
+  let keys = Object.keys(source || {});
+  if (hourly) keys = orderedRecentHours(keys, dashboardCurrentHour(panelData));
+  else {
+    keys.sort();
+    if ($('range').value === 'all' && keys.length > 30) keys = keys.slice(-30);
+  }
+  if (!keys.length) {
+    const totals = hourly ? usage.tokens_by_hour || {} : usage.tokens_by_day || {};
+    keys = Object.keys(totals);
+    if (hourly) keys = orderedRecentHours(keys, dashboardCurrentHour(panelData));
+    else {
+      keys.sort();
+      if ($('range').value === 'all' && keys.length > 30) keys = keys.slice(-30);
+    }
+    return keys.map((key) => ({ label: hourly ? String(key).padStart(2, '0') + ':00' : (key.length > 7 ? key.slice(5) : key), input: num(totals[key]), output: 0, cacheCreation: 0, cacheRead: 0, cacheRate: 0 }));
+  }
+  return keys.map((key) => {
+    const row = source[key] || {};
+    const input = num(row.input_tokens);
+    const cacheRead = num(row.cache_read_tokens);
+    return { label: hourly ? String(key).padStart(2, '0') + ':00' : (key.length > 7 ? key.slice(5) : key), input, output: num(row.output_tokens), cacheCreation: num(row.cache_write_tokens), cacheRead, cacheRate: input > 0 ? cacheRead / input * 100 : 0 };
+  });
+}
+
+function renderTokenUsageChart(panelData) {
+  const svg = $('tokenUsageTrend');
+  const legend = $('tokenTrendLegend');
+  if (!svg || !legend) return;
+  const points = tokenTrendPoints(panelData);
+  const series = [
+    { key: 'input', label: t('token_input'), color: '#2563eb' },
+    { key: 'output', label: t('token_output'), color: '#14b8a6' },
+    { key: 'cacheCreation', label: t('token_cache_creation'), color: '#f59e0b' },
+    { key: 'cacheRead', label: t('token_cache_read'), color: '#8b5cf6' },
+  ];
+  legend.innerHTML = series.map((item) => '<span class="tokenTrendLegendItem"><span class="distributionLegendDot" style="background:' + item.color + '"></span>' + esc(item.label) + '</span>').join('') + '<span class="tokenTrendLegendItem"><span class="distributionLegendDot" style="background:#64748b"></span>' + esc(t('token_cache_rate')) + '</span>';
+  if (!points.length) {
+    svg.setAttribute('viewBox', '0 0 720 190');
+    svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" class="distributionAxisText">' + esc(t('distribution_empty')) + '</text>';
+    return;
+  }
+  const W = 720, H = 190, PL = 42, PR = 42, PT = 16, PB = 28;
+  const chartW = W - PL - PR, chartH = H - PT - PB;
+  const maxTokens = Math.max(1, ...points.flatMap((point) => series.map((item) => point[item.key])));
+  const count = Math.max(points.length, 2);
+  const x = (index) => PL + (index + 0.5) * chartW / count;
+  const yToken = (value) => PT + chartH - value / maxTokens * chartH;
+  let html = '';
+  for (let i = 0; i <= 3; i++) {
+    const y = PT + chartH - i / 3 * chartH;
+    html += '<line x1="' + PL + '" x2="' + (W - PR) + '" y1="' + y + '" y2="' + y + '" class="distributionAxisLine"/><text x="' + (PL - 6) + '" y="' + (y + 3) + '" text-anchor="end" class="distributionAxisText">' + esc(compact(maxTokens * i / 3)) + '</text><text x="' + (W - PR + 6) + '" y="' + (y + 3) + '" class="distributionAxisText">' + (i * 100 / 3).toFixed(0) + '%</text>';
+  }
+  series.forEach((item) => {
+    const path = points.map((point, index) => (index ? 'L' : 'M') + x(index) + ' ' + yToken(point[item.key])).join(' ');
+    html += '<path d="' + path + '" class="distributionLine" stroke="' + item.color + '"></path>';
+  });
+  const ratePath = points.map((point, index) => (index ? 'L' : 'M') + x(index) + ' ' + (PT + chartH - point.cacheRate / 100 * chartH)).join(' ');
+  html += '<path d="' + ratePath + '" class="distributionLine" stroke="#64748b" stroke-dasharray="4 3"></path>';
+  points.forEach((point, index) => {
+    series.forEach((item) => { html += '<circle cx="' + x(index) + '" cy="' + yToken(point[item.key]) + '" r="2.5" class="distributionPoint" fill="' + item.color + '"><title>' + esc(point.label + ' ' + item.label + ': ' + compact(point[item.key])) + '</title></circle>'; });
+    html += '<circle cx="' + x(index) + '" cy="' + (PT + chartH - point.cacheRate / 100 * chartH) + '" r="2.5" class="distributionPoint" fill="#64748b"><title>' + esc(point.label + ' ' + t('token_cache_rate') + ': ' + pct(point.cacheRate)) + '</title></circle>';
+    if (index % Math.max(1, Math.ceil(points.length / 10)) === 0 || index === points.length - 1) html += '<text x="' + x(index) + '" y="' + (H - 6) + '" text-anchor="middle" class="distributionAxisText">' + esc(point.label) + '</text>';
+  });
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.innerHTML = html;
+}
+
+function renderDistributionDashboard() {
+  const panelData = dashboardPanelData();
+  const containers = ['modelDistributionDonut', 'upstreamDistributionDonut', 'endpointDistributionDonut', 'tokenUsageTrend'];
+  if (!panelData) {
+    containers.forEach((id) => { const element = $(id); if (element) element.innerHTML = ''; });
+    return;
+  }
+  const rows = distributionRowsForPanel(panelData);
+  renderDistributionDonut('modelDistributionDonut', 'modelDistributionTotal', rows.modelRows);
+  renderDistributionTable('modelDistribution', rows.modelRows);
+  renderDistributionDonut('upstreamDistributionDonut', 'upstreamDistributionTotal', rows.upstreamRows);
+  renderDistributionTable('upstreamDistribution', rows.upstreamRows);
+  renderDistributionDonut('endpointDistributionDonut', 'endpointDistributionTotal', rows.endpointRows);
+  renderDistributionTable('endpointDistribution', rows.endpointRows);
+  renderTokenUsageChart(panelData);
+}
+
 function renderTrendChart() {
   var panelData = dashboardPanelData();
   var usage = panelData && panelData.usage;
@@ -1718,6 +1893,73 @@ function addDetailToUsageSeries(usage, d) {
   incrementSeriesValue(usage.tokens_by_hour, bucket.hour, tokens);
   incrementSeriesValue(usage.cost_by_day, bucket.day, cost);
   incrementSeriesValue(usage.cost_by_hour, bucket.hour, cost);
+  addDetailToTokenParts(usage, d, bucket);
+}
+function addDetailToTokenParts(usage, d, bucket) {
+  if (!bucket) return;
+  const addTokenParts = (values, key) => {
+    const row = values[key] || { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0 };
+    row.input_tokens += num(d.tokens && d.tokens.input_tokens);
+    row.output_tokens += num(d.tokens && d.tokens.output_tokens);
+    row.cache_read_tokens += cacheReadTokens(d.tokens || {});
+    row.cache_write_tokens += num(d.tokens && d.tokens.cache_write_tokens);
+    row.reasoning_tokens += num(d.tokens && d.tokens.reasoning_tokens);
+    values[key] = row;
+  };
+  addTokenParts(usage.token_parts_by_day, bucket.day);
+  addTokenParts(usage.token_parts_by_hour, bucket.hour);
+}
+function addDetailToEndpointAgg(endpointAgg, d) {
+  const endpoint = String(d && d.endpoint || '').trim() || 'unknown';
+  const row = endpointAgg.get(endpoint) || {
+    endpoint,
+    total_requests: 0,
+    success_count: 0,
+    failure_count: 0,
+    total_tokens: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_tokens: 0,
+    cache_write_tokens: 0,
+    reasoning_tokens: 0,
+    modelMap: new Map(),
+  };
+  const model = detailModelName('', d);
+  const modelRow = row.modelMap.get(model) || makeCounterRow(model);
+  addDetailToCounter(modelRow, d);
+  row.modelMap.set(model, modelRow);
+  row.total_requests++;
+  d.failed ? row.failure_count++ : row.success_count++;
+  row.total_tokens += totalTokens(d);
+  row.input_tokens += num(d.tokens && d.tokens.input_tokens);
+  row.output_tokens += num(d.tokens && d.tokens.output_tokens);
+  row.cached_tokens += cacheTokenTotal(d.tokens || {});
+  row.cache_write_tokens += num(d.tokens && d.tokens.cache_write_tokens);
+  row.reasoning_tokens += num(d.tokens && d.tokens.reasoning_tokens);
+  endpointAgg.set(endpoint, row);
+}
+function finalizeEndpointAgg(endpointAgg) {
+  return [...endpointAgg.values()].map((row) => {
+    row.models = [...row.modelMap.values()].map(finalizeCounterRow).sort((a, b) => num(b.total_requests) - num(a.total_requests) || String(a.model || '').localeCompare(String(b.model || '')));
+    delete row.modelMap;
+    return row;
+  }).sort((a, b) => num(b.total_requests) - num(a.total_requests) || String(a.endpoint || '').localeCompare(String(b.endpoint || '')));
+}
+function tokenPartsFromCostSeries(values, hourly) {
+  if (!values || typeof values !== 'object') return {};
+  const result = {};
+  Object.entries(values).forEach(([key, rows]) => {
+    const parts = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0 };
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      parts.input_tokens += num(row && row.input_tokens);
+      parts.output_tokens += num(row && row.output_tokens);
+      parts.cache_read_tokens += num(row && row.cached_tokens);
+      parts.cache_write_tokens += num(row && row.cache_write_tokens);
+      parts.reasoning_tokens += num(row && row.reasoning_tokens);
+    });
+    result[hourly ? String(key).padStart(2, '0') : key] = parts;
+  });
+  return result;
 }
 function buildSummaryFromFullUsage(data, rangeKey) {
   data = requireObjectPayload(data, 'dashboard-data');
@@ -1741,9 +1983,11 @@ function buildSummaryFromFullUsage(data, rangeKey) {
     tokens_by_day: rangeScoped ? {} : rawUsage.tokens_by_day || {},
     tokens_by_hour: rangeScoped ? {} : rawUsage.tokens_by_hour || {},
     cost_by_day: rangeScoped ? {} : rawUsage.cost_by_day || {},
-    cost_by_hour: rangeScoped ? {} : rawUsage.cost_by_hour || {}
+    cost_by_hour: rangeScoped ? {} : rawUsage.cost_by_hour || {},
+    token_parts_by_day: {},
+    token_parts_by_hour: {}
   };
-  const modelAgg = new Map(), sourceAgg = new Map(), credentialAgg = new Map(), clientAgg = new Map();
+  const modelAgg = new Map(), sourceAgg = new Map(), endpointAgg = new Map(), credentialAgg = new Map(), clientAgg = new Map();
   const latency = [];
   const healthDetails = [];
   Object.entries(rawUsage.apis || {}).forEach(([api, a]) => {
@@ -1771,12 +2015,15 @@ function buildSummaryFromFullUsage(data, rangeKey) {
           usage.cache_write_tokens += num(tokens.cache_write_tokens);
           usage.reasoning_tokens += num(tokens.reasoning_tokens);
           if (num(d.latency_ms) > 0) latency.push(num(d.latency_ms));
+          addDetailToTokenParts(usage, d, detailSeriesBucket(d));
         }
 
         const src = sourceLabel(d);
         const sourceRow = sourceAgg.get(src) || { source: src, provider: d.provider || '', total_requests: 0, success_count: 0, failure_count: 0, total_tokens: 0 };
         sourceRow.total_requests++; d.failed ? sourceRow.failure_count++ : sourceRow.success_count++; sourceRow.total_tokens += totalTokens(d);
         sourceAgg.set(src, sourceRow);
+
+        addDetailToEndpointAgg(endpointAgg, d);
 
         addDetailToCredentialAgg(credentialAgg, d);
 
@@ -1810,13 +2057,19 @@ function buildSummaryFromFullUsage(data, rangeKey) {
     if (!rangeScoped || finalizedAPI.total_requests) usage.apis[api] = finalizedAPI;
   });
   if (!rangeScoped) applySnapshotCounter(usage, rawUsage);
+  if (!rangeScoped && Object.prototype.hasOwnProperty.call(rawUsage, 'token_parts_by_day')) usage.token_parts_by_day = rawUsage.token_parts_by_day || {};
+  if (!rangeScoped && Object.prototype.hasOwnProperty.call(rawUsage, 'token_parts_by_hour')) usage.token_parts_by_hour = rawUsage.token_parts_by_hour || {};
+  if (!rangeScoped && !Object.keys(usage.token_parts_by_day).length) usage.token_parts_by_day = tokenPartsFromCostSeries(rawUsage.cost_tokens_by_day, false);
+  if (!rangeScoped && !Object.keys(usage.token_parts_by_hour).length) usage.token_parts_by_hour = tokenPartsFromCostSeries(rawUsage.cost_tokens_by_hour, true);
   usage.avg_latency_ms = latency.length ? latency.reduce((a, b) => a + b, 0) / latency.length : 0;
   if (!rangeScoped && Object.prototype.hasOwnProperty.call(rawUsage, 'avg_latency_ms')) usage.avg_latency_ms = num(rawUsage.avg_latency_ms);
   const credentialStats = [...credentialAgg.values()].sort((a, b) => b.total_requests - a.total_requests);
+  const endpointStats = endpointAgg.size ? finalizeEndpointAgg(endpointAgg) : (Array.isArray(data.endpoint_stats) ? data.endpoint_stats : []);
   return {
     usage,
     health_grid: buildHealthGridFromDetails(healthDetails, data.generated_at),
     source_stats: [...sourceAgg.values()].sort((a, b) => b.total_requests - a.total_requests),
+    endpoint_stats: endpointStats,
     credential_stats: rangeScoped ? credentialStats : [],
     client_api_stats: coalesceLegacyHashlessClientApiStats([...clientAgg.values()].map((r) => { r.models = [...r.modelMap.values()].map(finalizeCounterRow).sort((a, b) => b.total_requests - a.total_requests); delete r.modelMap; return r })).sort((a, b) => b.total_requests - a.total_requests),
     model_stats: [...modelAgg.values()].map(finalizeCounterRow).sort((a, b) => b.total_requests - a.total_requests),
@@ -1949,6 +2202,7 @@ async function rerender(options) {
   renderUpdated();
   renderStats();
   renderStorageStatus();
+  renderDistributionDashboard();
   renderHealth();
   renderPrices();
   renderClientApiStats();

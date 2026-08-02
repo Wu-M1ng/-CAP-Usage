@@ -191,6 +191,7 @@ function createDashboardHarness(options = {}) {
   if (options.storage) summary._meta.storage = options.storage;
   if (options.clientApiStats) summary.client_api_stats = options.clientApiStats;
   if (options.credentialStats) summary.credential_stats = options.credentialStats;
+  if (options.endpointStats) summary.endpoint_stats = options.endpointStats;
   if (options.summaryUsage) Object.assign(summary.usage, options.summaryUsage);
 
   function eventsPage(url) {
@@ -1351,6 +1352,87 @@ test('dashboard wide statistic panels span the full layout width', () => {
   assert.match(html, /<div class="panel full">\s*<div class="panelHead"><h2 data-i18n="model_stats_title">/);
   assert.match(css, /\.detailActivityGrid\{grid-template-columns:minmax\(0,1fr\)\}/);
   assert.match(css, /\.barLabel\{[^}]*overflow-wrap:anywhere;[^}]*word-break:break-word/);
+});
+
+test('dashboard distribution section renders token-only charts with one cost column', async () => {
+  const { document } = createDashboardHarness({
+    endpointStats: [{
+      endpoint: '/v1/responses',
+      total_requests: 80,
+      success_count: 78,
+      failure_count: 2,
+      total_tokens: 1600,
+      models: [{
+        model: 'gpt-4.1',
+        total_requests: 80,
+        total_tokens: 1600,
+        input_tokens: 1000,
+        output_tokens: 600,
+        providers: [{ provider: 'openai', total_requests: 80, total_tokens: 1600, input_tokens: 1000, output_tokens: 600 }],
+      }],
+    }],
+    summaryUsage: {
+      token_parts_by_hour: {
+        '12': { input_tokens: 1000, output_tokens: 600, cache_read_tokens: 200, cache_write_tokens: 50, reasoning_tokens: 20 },
+      },
+    },
+  });
+  await waitFor(() => document.getElementById('tokenUsageTrend').innerHTML.includes('distributionLine'));
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  assert.match(html, /id="distributionDashboard"/);
+  assert.match(html, /data-i18n="upstream_distribution_title"/);
+  assert.match(document.getElementById('modelDistribution').innerHTML, /费用/);
+  assert.match(document.getElementById('upstreamDistribution').innerHTML, /费用/);
+  assert.match(document.getElementById('endpointDistribution').innerHTML, /费用/);
+  assert.match(document.getElementById('modelDistribution').innerHTML, /<th>名称<\/th><th>请求<\/th><th>token<\/th><th>费用<\/th>/);
+  assert.match(document.getElementById('modelDistributionDonut').innerHTML, /circle/);
+  assert.match(document.getElementById('upstreamDistributionDonut').innerHTML, /circle/);
+  assert.match(document.getElementById('endpointDistributionDonut').innerHTML, /circle/);
+  assert.match(document.getElementById('tokenUsageTrend').innerHTML, /distributionLine/);
+  assert.doesNotMatch(html, /actual|standard|实际消费|标准消费/i);
+});
+
+test('dashboard distribution translations exist in every supported language', () => {
+  const { context } = createDashboardHarness();
+  const keys = [
+    'distribution_title', 'distribution_subtle', 'distribution_token_mode',
+    'model_distribution_title', 'upstream_distribution_title', 'endpoint_distribution_title',
+    'distribution_requests_share', 'distribution_name', 'distribution_cost',
+    'distribution_other', 'distribution_empty', 'unknown_model', 'unknown_endpoint',
+    'token_distribution_title', 'token_distribution_subtle', 'token_input', 'token_output',
+    'token_cache_creation', 'token_cache_read', 'token_cache_rate',
+  ];
+  for (const language of ['zh-CN', 'zh-TW', 'en', 'ru']) {
+    for (const key of keys) assert.ok(context.I18N_MAP[language][key], language + ' missing ' + key);
+  }
+});
+
+test('dashboard compatibility fallback rebuilds endpoint and token-part aggregates', () => {
+  const { context } = createDashboardHarness();
+  const generatedAt = '2026-08-02T04:00:00Z';
+  const data = {
+    generated_at: generatedAt,
+    usage: {
+      apis: {
+        openai: {
+          models: {
+            'gpt-4.1': {
+              details: [
+                { timestamp: '2026-08-02T03:00:00Z', model: 'gpt-4.1', endpoint: '/v1/responses', provider: 'openai', tokens: { input_tokens: 100, output_tokens: 50, cached_tokens: 20, cache_write_tokens: 5, total_tokens: 150 } },
+                { timestamp: '2026-08-02T03:30:00Z', model: 'gpt-4.1', endpoint: '/v1/chat/completions', provider: 'openai', tokens: { input_tokens: 80, output_tokens: 20, total_tokens: 100 } },
+              ],
+            },
+          },
+        },
+      },
+    },
+  };
+  const summary = context.buildSummaryFromFullUsage(data, '24h');
+  assert.strictEqual(summary.endpoint_stats.length, 2);
+  assert.strictEqual(summary.endpoint_stats[0].models[0].model, 'gpt-4.1');
+  assert.strictEqual(summary.usage.token_parts_by_hour['11'].input_tokens, 180);
+  assert.strictEqual(summary.usage.token_parts_by_hour['11'].cache_read_tokens, 20);
+  assert.strictEqual(summary.usage.token_parts_by_hour['11'].cache_write_tokens, 5);
 });
 
 test('dashboard shows sqlite storage status', async () => {

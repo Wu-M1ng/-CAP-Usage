@@ -66,6 +66,7 @@ type RequestStatistics struct {
 
 	modelSummaryStats map[string]*ModelStat
 	sourceStats       map[string]*sourceStatAccumulator
+	endpointStats     map[string]*endpointStatAccumulator
 	credentialStats   map[string]*CredentialStat
 	clientAPIStats    map[string]*clientAPIStatAccumulator
 
@@ -427,6 +428,156 @@ type sourceStatAccumulator struct {
 	providers map[string]int64
 }
 
+type endpointStatAccumulator struct {
+	stat   EndpointStat
+	models map[string]*ModelStat
+}
+
+func newEndpointStatAccumulator(endpoint string) *endpointStatAccumulator {
+	return &endpointStatAccumulator{
+		stat:   EndpointStat{Endpoint: endpoint},
+		models: make(map[string]*ModelStat),
+	}
+}
+
+func incrementEndpointStat(acc *endpointStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if acc == nil {
+		return
+	}
+	acc.stat.TotalRequests++
+	if detail.Failed {
+		acc.stat.FailureCount++
+	} else {
+		acc.stat.SuccessCount++
+	}
+	acc.stat.TotalTokens += totals.totalTokens
+	acc.stat.InputTokens += totals.inputTokens
+	acc.stat.OutputTokens += totals.outputTokens
+	acc.stat.CachedTokens += totals.cachedTokens
+	acc.stat.CacheWriteTokens += totals.cacheWriteTokens
+	acc.stat.ReasoningTokens += totals.reasoningTokens
+
+	modelName = normalizeModelName(modelName)
+	modelStat := acc.models[modelName]
+	if modelStat == nil {
+		modelStat = &ModelStat{Model: modelName}
+		acc.models[modelName] = modelStat
+	}
+	modelStat.TotalRequests++
+	if detail.Failed {
+		modelStat.FailureCount++
+	} else {
+		modelStat.SuccessCount++
+	}
+	modelStat.TotalTokens += totals.totalTokens
+	modelStat.InputTokens += totals.inputTokens
+	modelStat.OutputTokens += totals.outputTokens
+	modelStat.CachedTokens += totals.cachedTokens
+	modelStat.CacheWriteTokens += totals.cacheWriteTokens
+	modelStat.ReasoningTokens += totals.reasoningTokens
+	modelStat.latencySum += totals.latencySum
+	modelStat.latencyN += totals.latencyN
+	modelStat.providerStats = incrementModelProviderStats(modelStat.providerStats, detail.Provider, detail.Failed, totals)
+}
+
+func decrementEndpointStat(acc *endpointStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if acc == nil {
+		return
+	}
+	acc.stat.TotalRequests--
+	if detail.Failed {
+		acc.stat.FailureCount--
+	} else {
+		acc.stat.SuccessCount--
+	}
+	acc.stat.TotalTokens -= totals.totalTokens
+	acc.stat.InputTokens -= totals.inputTokens
+	acc.stat.OutputTokens -= totals.outputTokens
+	acc.stat.CachedTokens -= totals.cachedTokens
+	acc.stat.CacheWriteTokens -= totals.cacheWriteTokens
+	acc.stat.ReasoningTokens -= totals.reasoningTokens
+
+	modelName = normalizeModelName(modelName)
+	modelStat := acc.models[modelName]
+	if modelStat == nil {
+		return
+	}
+	modelStat.TotalRequests--
+	if detail.Failed {
+		modelStat.FailureCount--
+	} else {
+		modelStat.SuccessCount--
+	}
+	modelStat.TotalTokens -= totals.totalTokens
+	modelStat.InputTokens -= totals.inputTokens
+	modelStat.OutputTokens -= totals.outputTokens
+	modelStat.CachedTokens -= totals.cachedTokens
+	modelStat.CacheWriteTokens -= totals.cacheWriteTokens
+	modelStat.ReasoningTokens -= totals.reasoningTokens
+	modelStat.latencySum -= totals.latencySum
+	modelStat.latencyN -= totals.latencyN
+	decrementModelProviderStats(modelStat.providerStats, detail.Provider, detail.Failed, totals)
+	if modelStat.TotalRequests <= 0 {
+		delete(acc.models, modelName)
+	}
+}
+
+func endpointStatsFromAccumulators(accumulators map[string]*endpointStatAccumulator) []EndpointStat {
+	if len(accumulators) == 0 {
+		return nil
+	}
+	stats := make([]EndpointStat, 0, len(accumulators))
+	for _, acc := range accumulators {
+		if acc == nil || acc.stat.TotalRequests <= 0 {
+			continue
+		}
+		stat := acc.stat
+		stat.Models = make([]ModelStat, 0, len(acc.models))
+		for _, model := range acc.models {
+			if model == nil || model.TotalRequests <= 0 {
+				continue
+			}
+			stat.Models = append(stat.Models, finalizeModelStat(*model))
+		}
+		sort.SliceStable(stat.Models, func(i, j int) bool {
+			if stat.Models[i].TotalRequests != stat.Models[j].TotalRequests {
+				return stat.Models[i].TotalRequests > stat.Models[j].TotalRequests
+			}
+			return stat.Models[i].Model < stat.Models[j].Model
+		})
+		stats = append(stats, stat)
+	}
+	sort.SliceStable(stats, func(i, j int) bool {
+		if stats[i].TotalRequests != stats[j].TotalRequests {
+			return stats[i].TotalRequests > stats[j].TotalRequests
+		}
+		return stats[i].Endpoint < stats[j].Endpoint
+	})
+	return stats
+}
+
+func endpointAccumulatorsFromStats(stats []EndpointStat) map[string]*endpointStatAccumulator {
+	if len(stats) == 0 {
+		return make(map[string]*endpointStatAccumulator)
+	}
+	result := make(map[string]*endpointStatAccumulator, len(stats))
+	for _, stat := range stats {
+		endpoint := strings.TrimSpace(stat.Endpoint)
+		if endpoint == "" {
+			endpoint = "unknown"
+		}
+		acc := newEndpointStatAccumulator(endpoint)
+		acc.stat = stat
+		for _, model := range stat.Models {
+			modelCopy := model
+			modelCopy.providerStats = modelProviderStatsFromSnapshot(model.Providers)
+			acc.models[normalizeModelName(model.Model)] = &modelCopy
+		}
+		result[endpoint] = acc
+	}
+	return result
+}
+
 type clientAPIStatAccumulator struct {
 	stat   ClientAPIStat
 	models map[string]*ClientAPIModelStat
@@ -546,6 +697,7 @@ func NewRequestStatistics() *RequestStatistics {
 		healthBuckets:                 make(map[int64]healthBucket),
 		modelSummaryStats:             make(map[string]*ModelStat),
 		sourceStats:                   make(map[string]*sourceStatAccumulator),
+		endpointStats:                 make(map[string]*endpointStatAccumulator),
 		credentialStats:               make(map[string]*CredentialStat),
 		clientAPIStats:                make(map[string]*clientAPIStatAccumulator),
 		storageEnabled:                defaultRuntimeConfig().StorageEnabled,
@@ -1935,6 +2087,7 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 	s.lastRecordedAt = time.Time{}
 	s.modelSummaryStats = make(map[string]*ModelStat)
 	s.sourceStats = make(map[string]*sourceStatAccumulator)
+	s.endpointStats = make(map[string]*endpointStatAccumulator)
 	s.credentialStats = make(map[string]*CredentialStat)
 	s.clientAPIStats = make(map[string]*clientAPIStatAccumulator)
 
@@ -2025,6 +2178,9 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 		restoreAPIAggregatesFromModels(apiSt)
 		s.mergeRestoredAPIStatsLocked(apiName, apiSt)
 	}
+	if len(snapshot.EndpointStats) > 0 {
+		s.endpointStats = endpointAccumulatorsFromStats(snapshot.EndpointStats)
+	}
 	restoreSnapshotAggregatesFromAPIs(s)
 	if s.totalRequests == 0 && restoredDetails > 0 {
 		s.rebuildAggregatesLocked()
@@ -2046,6 +2202,7 @@ func (s *RequestStatistics) rebuildSQLiteDerivedAggregatesLocked(store *eventSto
 		now = time.Now()
 	}
 	s.sourceStats = make(map[string]*sourceStatAccumulator)
+	s.endpointStats = make(map[string]*endpointStatAccumulator)
 	s.credentialStats = make(map[string]*CredentialStat)
 	s.clientAPIStats = make(map[string]*clientAPIStatAccumulator)
 	s.healthBuckets = make(map[int64]healthBucket)
@@ -4014,6 +4171,17 @@ func (s *RequestStatistics) incrementSummaryDimensionStatsLocked(modelName strin
 	if s.clientAPIStats == nil {
 		s.clientAPIStats = make(map[string]*clientAPIStatAccumulator)
 	}
+	if s.endpointStats == nil {
+		s.endpointStats = make(map[string]*endpointStatAccumulator)
+	}
+
+	endpoint := summaryEndpointKey(detail)
+	endpointAgg, ok := s.endpointStats[endpoint]
+	if !ok {
+		endpointAgg = newEndpointStatAccumulator(endpoint)
+		s.endpointStats[endpoint] = endpointAgg
+	}
+	incrementEndpointStat(endpointAgg, modelName, detail, totals)
 
 	source := summarySourceKey(detail)
 	sourceAgg, ok := s.sourceStats[source]
@@ -4096,6 +4264,14 @@ func (s *RequestStatistics) incrementSummaryDimensionStatsLocked(modelName strin
 }
 
 func (s *RequestStatistics) decrementSummaryDimensionStatsLocked(modelName string, detail RequestDetail, totals detailTotals) {
+	endpoint := summaryEndpointKey(detail)
+	if endpointAgg, ok := s.endpointStats[endpoint]; ok {
+		decrementEndpointStat(endpointAgg, modelName, detail, totals)
+		if endpointAgg.stat.TotalRequests <= 0 {
+			delete(s.endpointStats, endpoint)
+		}
+	}
+
 	if sourceAgg, ok := s.sourceStats[summarySourceKey(detail)]; ok {
 		sourceAgg.stat.TotalRequests--
 		if detail.Failed {
@@ -4425,6 +4601,7 @@ func (s *RequestStatistics) rebuildAggregatesLocked() {
 	s.healthBuckets = make(map[int64]healthBucket)
 	s.modelSummaryStats = make(map[string]*ModelStat)
 	s.sourceStats = make(map[string]*sourceStatAccumulator)
+	s.endpointStats = make(map[string]*endpointStatAccumulator)
 	s.credentialStats = make(map[string]*CredentialStat)
 	s.clientAPIStats = make(map[string]*clientAPIStatAccumulator)
 	for _, apiSt := range s.apis {
@@ -4663,6 +4840,7 @@ func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
 		}
 		result.APIs[apiName] = apiSnapshot
 	}
+	result.EndpointStats = endpointStatsFromAccumulators(s.endpointStats)
 
 	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
 	for k, v := range s.requestsByDay {
@@ -5180,6 +5358,14 @@ func summarySourceKey(detail RequestDetail) string {
 	return source
 }
 
+func summaryEndpointKey(detail RequestDetail) string {
+	endpoint := strings.TrimSpace(detail.Endpoint)
+	if endpoint == "" {
+		return "unknown"
+	}
+	return endpoint
+}
+
 func summaryCredentialKey(detail RequestDetail) string {
 	if detail.AuthIndex == "" {
 		return "(空)"
@@ -5525,6 +5711,7 @@ func cloneDashboardSummary(summary DashboardSummary) DashboardSummary {
 	cloned.Usage = cloneStatisticsSnapshotWithoutDetails(summary.Usage)
 	cloned.HealthGrid = append([]HealthGridSlot(nil), summary.HealthGrid...)
 	cloned.SourceStats = append([]SourceStat(nil), summary.SourceStats...)
+	cloned.EndpointStats = cloneEndpointStats(summary.EndpointStats)
 	cloned.CredentialStats = append([]CredentialStat(nil), summary.CredentialStats...)
 	cloned.ClientAPIStats = make([]ClientAPIStat, len(summary.ClientAPIStats))
 	for i, stat := range summary.ClientAPIStats {
@@ -5557,6 +5744,8 @@ func cloneStatisticsSnapshotWithoutDetails(snapshot StatisticsSnapshotWithoutDet
 	cloned.TokensByHour = cloneInt64Map(snapshot.TokensByHour)
 	cloned.CostByDay = cloneFloat64Map(snapshot.CostByDay)
 	cloned.CostByHour = cloneFloat64Map(snapshot.CostByHour)
+	cloned.TokenPartsByDay = cloneTokenPartMap(snapshot.TokenPartsByDay)
+	cloned.TokenPartsByHour = cloneTokenPartMap(snapshot.TokenPartsByHour)
 	return cloned
 }
 
@@ -5565,6 +5754,15 @@ func cloneModelStats(stats []ModelStat) []ModelStat {
 	for i, stat := range stats {
 		cloned[i] = stat
 		cloned[i].Providers = cloneModelProviderStats(stat.Providers)
+	}
+	return cloned
+}
+
+func cloneEndpointStats(stats []EndpointStat) []EndpointStat {
+	cloned := make([]EndpointStat, len(stats))
+	for i, stat := range stats {
+		cloned[i] = stat
+		cloned[i].Models = cloneModelStats(stat.Models)
 	}
 	return cloned
 }
@@ -5649,6 +5847,67 @@ func timeSeriesTokenStatsSnapshot(values map[string]*TimeSeriesTokenStat) []Time
 	return stats
 }
 
+func tokenPartStatFromSeries(values map[string]*TimeSeriesTokenStat) TokenPartStat {
+	var result TokenPartStat
+	for _, stat := range values {
+		if stat == nil {
+			continue
+		}
+		result.InputTokens += stat.InputTokens
+		result.OutputTokens += stat.OutputTokens
+		result.CacheReadTokens += stat.CachedTokens
+		result.CacheWriteTokens += stat.CacheWriteTokens
+		result.ReasoningTokens += stat.ReasoningTokens
+	}
+	return result
+}
+
+func tokenPartStatsByDaySnapshot(values map[string]map[string]*TimeSeriesTokenStat) map[string]TokenPartStat {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]TokenPartStat, len(values))
+	for key, stats := range values {
+		result[key] = tokenPartStatFromSeries(stats)
+	}
+	return result
+}
+
+func tokenPartStatsByHourSnapshot(values map[int]map[string]*TimeSeriesTokenStat) map[string]TokenPartStat {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]TokenPartStat, len(values))
+	for hour, stats := range values {
+		if hour < 0 || hour >= 24 {
+			continue
+		}
+		result[hourKeys[hour]] = tokenPartStatFromSeries(stats)
+	}
+	return result
+}
+
+func addTokenPartStat(values map[string]TokenPartStat, key string, totals detailTotals) {
+	parts := values[key]
+	parts.InputTokens += totals.inputTokens
+	parts.OutputTokens += totals.outputTokens
+	parts.CacheReadTokens += totals.cachedTokens
+	parts.CacheWriteTokens += totals.cacheWriteTokens
+	parts.ReasoningTokens += totals.reasoningTokens
+	values[key] = parts
+}
+
+func cloneTokenPartMap(values map[string]TokenPartStat) map[string]TokenPartStat {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]TokenPartStat, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
 func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, healthWindow time.Time) DashboardSummary {
 	summary := DashboardSummary{}
 	summary.Usage.TotalRequests = s.totalRequests
@@ -5724,6 +5983,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 	sort.SliceStable(summary.SourceStats, func(i, j int) bool {
 		return summary.SourceStats[i].TotalRequests > summary.SourceStats[j].TotalRequests
 	})
+	summary.EndpointStats = endpointStatsFromAccumulators(s.endpointStats)
 
 	// Build credential stats sorted by requests
 	summary.CredentialStats = make([]CredentialStat, 0, len(s.credentialStats))
@@ -5782,6 +6042,8 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 			summary.Usage.CostByHour[hourKeys[hour]] = v
 		}
 	}
+	summary.Usage.TokenPartsByDay = tokenPartStatsByDaySnapshot(s.costTokensByDay)
+	summary.Usage.TokenPartsByHour = tokenPartStatsByHourSnapshot(s.costTokensByHour)
 
 	// Metadata
 	summary.Meta.RetentionDays = int(s.retention.Hours() / 24)
@@ -5823,10 +6085,13 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	tokensByHour := make(map[int]int64)
 	costByDay := make(map[string]float64)
 	costByHour := make(map[int]float64)
+	tokenPartsByDay := make(map[string]TokenPartStat)
+	tokenPartsByHour := make(map[string]TokenPartStat)
 
 	// Dimension aggregators
 	modelAgg := make(map[string]*ModelStat)
 	sourceAgg := make(map[string]*sourceStatAccumulator)
+	endpointAgg := make(map[string]*endpointStatAccumulator)
 	credentialAgg := make(map[string]*CredentialStat)
 	clientAPIAgg := make(map[string]*clientAPIStatAccumulator)
 	apiAgg := make(map[string]*apiRangeAgg)
@@ -5862,6 +6127,16 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 		tokensByHour[hourKey] += totals.totalTokens
 		costByDay[dayKey] += cost
 		costByHour[hourKey] += cost
+		addTokenPartStat(tokenPartsByDay, dayKey, totals)
+		addTokenPartStat(tokenPartsByHour, hourKeys[hourKey], totals)
+
+		endpoint := summaryEndpointKey(detail)
+		endpointStats, ok := endpointAgg[endpoint]
+		if !ok {
+			endpointStats = newEndpointStatAccumulator(endpoint)
+			endpointAgg[endpoint] = endpointStats
+		}
+		incrementEndpointStat(endpointStats, dModel, detail, totals)
 
 		// Per-API aggregation
 		api := getOrCreateAPIRangeAgg(apiAgg, apiName)
@@ -6094,6 +6369,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	})
 
 	// Build client API stats
+	summary.EndpointStats = endpointStatsFromAccumulators(endpointAgg)
 	summary.ClientAPIStats = clientAPIStatsFromAccumulators(clientAPIAgg)
 
 	// Build health grid from pre-aggregated health buckets (always 5-day window, not scoped by range).
@@ -6143,6 +6419,8 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 			summary.Usage.CostByHour[hourKeys[hour]] = v
 		}
 	}
+	summary.Usage.TokenPartsByDay = tokenPartsByDay
+	summary.Usage.TokenPartsByHour = tokenPartsByHour
 
 	// Metadata (uses global counters, not range-scoped).
 	summary.Meta.RetentionDays = int(s.retention.Hours() / 24)
