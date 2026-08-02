@@ -1752,8 +1752,7 @@ func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail
 	s.reasoningTokens += totals.reasoningTokens
 	s.latencySum += totals.latencySum
 	s.latencyN += totals.latencyN
-	dayKey := detail.Timestamp.Format("2006-01-02")
-	hourKey := detail.Timestamp.Hour()
+	dayKey, hourKey := dashboardLocalDayHour(detail.Timestamp)
 	cost := s.detailCostLocked(modelName, detail, totals)
 	s.requestsByDay[dayKey]++
 	s.requestsByHour[hourKey]++
@@ -1892,6 +1891,7 @@ func (s *RequestStatistics) loadStorageSnapshotLocked(dir string, now time.Time)
 	if persisted.Version < currentStorageSnapshotVersion {
 		migrateLegacySnapshotCacheReads(&persisted.Usage)
 	}
+	migrateLegacyDashboardHourlySeries(&persisted.Usage)
 	if s.hasRecordsLocked() {
 		_, _ = s.mergeSnapshotLocked(persisted.Usage, false, now)
 	} else {
@@ -4376,8 +4376,7 @@ func (s *RequestStatistics) decrementCounters(d RequestDetail, apiSt *apiStats, 
 	modelSt.latencyN -= totals.latencyN
 	decrementModelProviderStats(modelSt.providerStats, d.Provider, d.Failed, totals)
 
-	dayKey := d.Timestamp.Format("2006-01-02")
-	hourKey := d.Timestamp.Hour()
+	dayKey, hourKey := dashboardLocalDayHour(d.Timestamp)
 	cost := s.detailCostLocked(modelName, d, totals)
 	s.requestsByDay[dayKey]--
 	s.requestsByHour[hourKey]--
@@ -4494,8 +4493,7 @@ func (s *RequestStatistics) rebuildAggregatesLocked() {
 				modelSt.latencySum += totals.latencySum
 				modelSt.latencyN += totals.latencyN
 				modelSt.providerStats = incrementModelProviderStats(modelSt.providerStats, detail.Provider, detail.Failed, totals)
-				dayKey := detail.Timestamp.Format("2006-01-02")
-				hourKey := detail.Timestamp.Hour()
+				dayKey, hourKey := dashboardLocalDayHour(detail.Timestamp)
 				cost := s.detailCostLocked(modelName, detail, totals)
 				s.requestsByDay[dayKey]++
 				s.requestsByHour[hourKey]++
@@ -4549,11 +4547,11 @@ func (s *RequestStatistics) rebuildCostTokenSeriesFromDetailsLocked(rebuildDay, 
 			for _, detail := range modelSt.Details {
 				totals := detailTotalsFromRequest(detail)
 				if rebuildDay {
-					dayKey := detail.Timestamp.Format("2006-01-02")
+					dayKey, _ := dashboardLocalDayHour(detail.Timestamp)
 					s.costTokensByDay[dayKey] = incrementTimeSeriesTokenStats(s.costTokensByDay[dayKey], detailModel(modelName, detail), detail.Provider, totals)
 				}
 				if rebuildHour {
-					hourKey := detail.Timestamp.Hour()
+					_, hourKey := dashboardLocalDayHour(detail.Timestamp)
 					s.costTokensByHour[hourKey] = incrementTimeSeriesTokenStats(s.costTokensByHour[hourKey], detailModel(modelName, detail), detail.Provider, totals)
 				}
 			}
@@ -4610,6 +4608,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 
 func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
 	result := StatisticsSnapshot{}
+	result.TimeZone = dashboardTimeZone
 	result.TotalRequests = s.totalRequests
 	result.SuccessCount = s.successCount
 	result.FailureCount = s.failureCount
@@ -5195,6 +5194,74 @@ func healthBucketKey(t time.Time) (int64, bool) {
 	return t.UTC().Truncate(dashboardHealthStep).Unix(), true
 }
 
+const dashboardTimeZone = "Asia/Shanghai"
+
+// Dashboard time series are presented in China Standard Time regardless of
+// the host or container's system timezone. Event timestamps remain UTC at
+// storage and API boundaries so ordering and range queries stay unambiguous.
+var dashboardLocation = time.FixedZone(dashboardTimeZone, 8*60*60)
+
+func dashboardLocalDayHour(t time.Time) (string, int) {
+	local := t.In(dashboardLocation)
+	return local.Format("2006-01-02"), local.Hour()
+}
+
+// migrateLegacyDashboardHourlySeries converts snapshots written before the
+// dashboard timezone was explicit. Those snapshots used UTC hour keys, while
+// current summaries use Asia/Shanghai hour keys.
+func migrateLegacyDashboardHourlySeries(snapshot *StatisticsSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	zone := strings.TrimSpace(snapshot.TimeZone)
+	if zone != "" && !strings.EqualFold(zone, "UTC") {
+		return false
+	}
+	snapshot.RequestsByHour = shiftLegacyHourlyInt64Map(snapshot.RequestsByHour)
+	snapshot.TokensByHour = shiftLegacyHourlyInt64Map(snapshot.TokensByHour)
+	snapshot.CostByHour = shiftLegacyHourlyFloat64Map(snapshot.CostByHour)
+	snapshot.CostTokensByHour = shiftLegacyHourlyTokenStats(snapshot.CostTokensByHour)
+	snapshot.TimeZone = dashboardTimeZone
+	return true
+}
+
+func shiftLegacyHourlyInt64Map(values map[string]int64) map[string]int64 {
+	shifted := make(map[string]int64, len(values))
+	for key, value := range values {
+		hour, err := strconv.Atoi(strings.TrimSpace(key))
+		if err != nil || hour < 0 || hour >= 24 {
+			continue
+		}
+		shifted[hourKeys[(hour+8)%24]] += value
+	}
+	return shifted
+}
+
+func shiftLegacyHourlyFloat64Map(values map[string]float64) map[string]float64 {
+	shifted := make(map[string]float64, len(values))
+	for key, value := range values {
+		hour, err := strconv.Atoi(strings.TrimSpace(key))
+		if err != nil || hour < 0 || hour >= 24 {
+			continue
+		}
+		shifted[hourKeys[(hour+8)%24]] += value
+	}
+	return shifted
+}
+
+func shiftLegacyHourlyTokenStats(values map[string][]TimeSeriesTokenStat) map[string][]TimeSeriesTokenStat {
+	shifted := make(map[string][]TimeSeriesTokenStat, len(values))
+	for key, stats := range values {
+		hour, err := strconv.Atoi(strings.TrimSpace(key))
+		if err != nil || hour < 0 || hour >= 24 || len(stats) == 0 {
+			continue
+		}
+		bucket := hourKeys[(hour+8)%24]
+		shifted[bucket] = append(shifted[bucket], stats...)
+	}
+	return shifted
+}
+
 func normalizedCacheTokens(tokens TokenStats) int64 {
 	cachedTokens := nonNegativeInt64(tokens.CachedTokens)
 	cacheWriteTokens := nonNegativeInt64(tokens.CacheWriteTokens)
@@ -5720,7 +5787,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 	summary.Meta.RetentionDays = int(s.retention.Hours() / 24)
 	summary.Meta.MaxDetailsPerModel = s.maxDetailsPerModel
 	summary.Meta.CurrentDetailCount = s.currentDetailCountLocked()
-	summary.Meta.CurrentHour = now.Hour()
+	_, summary.Meta.CurrentHour = dashboardLocalDayHour(now)
 	summary.Meta.EvictedTotal = s.evictedTotal
 	summary.Meta.SummaryVersion = s.summaryVersion
 	summary.Meta.Storage = s.storageStatusLocked()
@@ -5787,8 +5854,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 		}
 
 		// Day/hour time series
-		dayKey := detail.Timestamp.Format("2006-01-02")
-		hourKey := detail.Timestamp.Hour()
+		dayKey, hourKey := dashboardLocalDayHour(detail.Timestamp)
 		cost := s.detailCostLocked(modelName, detail, totals)
 		requestsByDay[dayKey]++
 		requestsByHour[hourKey]++
@@ -6082,7 +6148,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	summary.Meta.RetentionDays = int(s.retention.Hours() / 24)
 	summary.Meta.MaxDetailsPerModel = s.maxDetailsPerModel
 	summary.Meta.CurrentDetailCount = s.currentDetailCountLocked()
-	summary.Meta.CurrentHour = now.Hour()
+	_, summary.Meta.CurrentHour = dashboardLocalDayHour(now)
 	summary.Meta.EvictedTotal = s.evictedTotal
 	summary.Meta.SummaryVersion = s.summaryVersion
 	summary.Meta.Storage = s.storageStatusLocked()

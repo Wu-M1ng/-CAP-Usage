@@ -729,6 +729,7 @@ type StatisticsSnapshot struct {
 	CacheWriteTokens int64   `json:"cache_write_tokens,omitempty"`
 	ReasoningTokens  int64   `json:"reasoning_tokens,omitempty"`
 	AvgLatencyMs     float64 `json:"avg_latency_ms,omitempty"`
+	TimeZone         string  `json:"time_zone,omitempty"`
 
 	APIs map[string]APISnapshot `json:"apis"`
 

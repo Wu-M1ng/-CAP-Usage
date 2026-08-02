@@ -959,6 +959,7 @@ func (s *eventStore) loadAggregate(ctx context.Context) (StatisticsSnapshot, boo
 	if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
 		return StatisticsSnapshot{}, false, fmt.Errorf("decode aggregate state: %w", err)
 	}
+	migrateLegacyDashboardHourlySeries(&snapshot)
 	for apiName, apiSnapshot := range snapshot.APIs {
 		for modelName, modelSnapshot := range apiSnapshot.Models {
 			modelSnapshot.Details = nil

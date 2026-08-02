@@ -859,6 +859,67 @@ func TestDashboardSummaryHasMetadata(t *testing.T) {
 	}
 }
 
+func TestDashboardHourlyAggregatesUseChinaTime(t *testing.T) {
+	previousLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = previousLocal })
+
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     false,
+	})
+	stats.Record(UsageRecord{
+		Provider:    "openai",
+		Model:       "gpt-4.1",
+		RequestedAt: time.Date(2026, 7, 3, 15, 44, 0, 0, time.UTC),
+		Detail:      UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+
+	snapshot := stats.Snapshot()
+	if got := snapshot.RequestsByHour[hourKeys[23]]; got != 1 {
+		t.Fatalf("requests_by_hour[23] = %d, want 1: %#v", got, snapshot.RequestsByHour)
+	}
+	if got := snapshot.TokensByHour[hourKeys[23]]; got != 15 {
+		t.Fatalf("tokens_by_hour[23] = %d, want 15: %#v", got, snapshot.TokensByHour)
+	}
+
+	summary := stats.SummaryWithoutDetailsAt(time.Date(2026, 7, 3, 15, 44, 0, 0, time.UTC))
+	if summary.Meta.CurrentHour != 23 {
+		t.Fatalf("current_hour = %d, want 23: %#v", summary.Meta.CurrentHour, summary.Meta)
+	}
+}
+
+func TestLegacyDashboardHourlySeriesMigratesToChinaTime(t *testing.T) {
+	snapshot := StatisticsSnapshot{
+		RequestsByHour: map[string]int64{"15": 2},
+		TokensByHour:   map[string]int64{"15": 20},
+		CostByHour:     map[string]float64{"15": 0.5},
+		CostTokensByHour: map[string][]TimeSeriesTokenStat{
+			"15": {{Model: "gpt-4.1", Provider: "openai", InputTokens: 20}},
+		},
+	}
+
+	if !migrateLegacyDashboardHourlySeries(&snapshot) {
+		t.Fatal("legacy dashboard snapshot should be migrated")
+	}
+	if snapshot.TimeZone != dashboardTimeZone {
+		t.Fatalf("migrated time zone = %q, want %q", snapshot.TimeZone, dashboardTimeZone)
+	}
+	if snapshot.RequestsByHour["23"] != 2 || snapshot.TokensByHour["23"] != 20 || snapshot.CostByHour["23"] != 0.5 {
+		t.Fatalf("migrated hourly aggregates = %#v, want 23-hour values", snapshot)
+	}
+	if len(snapshot.CostTokensByHour["23"]) != 1 || snapshot.CostTokensByHour["15"] != nil {
+		t.Fatalf("migrated cost token series = %#v, want only hour 23", snapshot.CostTokensByHour)
+	}
+
+	if migrateLegacyDashboardHourlySeries(&snapshot) {
+		t.Fatal("current dashboard snapshot should not be migrated twice")
+	}
+}
+
 func TestSummaryCacheHitPreservesGeneratedMetadata(t *testing.T) {
 	stats := NewRequestStatistics()
 	now := time.Now()
@@ -1773,15 +1834,16 @@ func TestCacheWriteCostSeparatesReadWriteAndProviderAccounting(t *testing.T) {
 	})
 
 	snapshot := recorded.Snapshot()
-	assertFloatNear(t, "recorded daily cache cost", snapshot.CostByDay["2026-07-11"], 0.895)
-	assertFloatNear(t, "recorded hourly cache cost", snapshot.CostByHour["10"], 0.895)
+	expectedDay, expectedHour := dashboardLocalDayHour(when)
+	assertFloatNear(t, "recorded daily cache cost", snapshot.CostByDay[expectedDay], 0.895)
+	assertFloatNear(t, "recorded hourly cache cost", snapshot.CostByHour[hourKeys[expectedHour]], 0.895)
 
 	recorded.mu.RLock()
 	rebuiltDay := recorded.costByDayFromTokenSeriesLocked()
 	rebuiltHour := recorded.costByHourFromTokenSeriesLocked()
 	recorded.mu.RUnlock()
-	assertFloatNear(t, "rebuilt daily cache cost", rebuiltDay["2026-07-11"], 0.895)
-	assertFloatNear(t, "rebuilt hourly cache cost", rebuiltHour[10], 0.895)
+	assertFloatNear(t, "rebuilt daily cache cost", rebuiltDay[expectedDay], 0.895)
+	assertFloatNear(t, "rebuilt hourly cache cost", rebuiltHour[expectedHour], 0.895)
 }
 
 func TestMissingTotalTokensIncludesExclusiveClaudeCache(t *testing.T) {
@@ -2490,6 +2552,7 @@ func TestLegacySnapshotWithCostMapsPruneRebuildsMissingCostTokens(t *testing.T) 
 
 	oldTime := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	oldDay, oldHour := dashboardLocalDayHour(oldTime)
 	snapshot := StatisticsSnapshot{
 		TotalRequests: 1,
 		SuccessCount:  1,
@@ -2520,23 +2583,23 @@ func TestLegacySnapshotWithCostMapsPruneRebuildsMissingCostTokens(t *testing.T) 
 				},
 			},
 		},
-		RequestsByDay:  map[string]int64{"2026-07-01": 1},
-		RequestsByHour: map[string]int64{"10": 1},
-		TokensByDay:    map[string]int64{"2026-07-01": 100},
-		TokensByHour:   map[string]int64{"10": 100},
-		CostByDay:      map[string]float64{"2026-07-01": 0.0001},
-		CostByHour:     map[string]float64{"10": 0.0001},
+		RequestsByDay:  map[string]int64{oldDay: 1},
+		RequestsByHour: map[string]int64{hourKeys[oldHour]: 1},
+		TokensByDay:    map[string]int64{oldDay: 100},
+		TokensByHour:   map[string]int64{hourKeys[oldHour]: 100},
+		CostByDay:      map[string]float64{oldDay: 0.0001},
+		CostByHour:     map[string]float64{hourKeys[oldHour]: 0.0001},
 	}
 
 	stats.mu.Lock()
 	stats.restoreStorageSnapshotLocked(snapshot, now)
-	if len(stats.costTokensByDay["2026-07-01"]) != 1 || len(stats.costTokensByHour[10]) != 1 {
+	if len(stats.costTokensByDay[oldDay]) != 1 || len(stats.costTokensByHour[oldHour]) != 1 {
 		stats.mu.Unlock()
 		t.Fatalf("legacy restore did not rebuild missing cost token series: day %#v hour %#v", stats.costTokensByDay, stats.costTokensByHour)
 	}
 	stats.pruneLocked(now, true)
-	costByDay := stats.costByDay["2026-07-01"]
-	costByHour := stats.costByHour[10]
+	costByDay := stats.costByDay[oldDay]
+	costByHour := stats.costByHour[oldHour]
 	stats.mu.Unlock()
 
 	assertFloatNear(t, "pruned legacy cost-map daily cost", costByDay, 0)
