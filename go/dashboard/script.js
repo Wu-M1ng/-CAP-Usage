@@ -27,6 +27,7 @@ const apiDetailRecentLimit = apiDetailRecentPageSize;
 const priceReferenceResultLimit = 100;
 const visiblePollDelayMs = 30000;
 const hiddenPollDelayMs = 300000;
+const dashboardTimeZoneOffsetMs = 8 * 60 * 60 * 1000;
 let apiDetailSeq = 0;
 const apiDetailCache = new Map();
 const conditionalPayloadCache = new Map();
@@ -1686,10 +1687,13 @@ function detailSeriesBucket(d) {
   const raw = String(d && d.timestamp || '');
   const ms = timestampMs(raw);
   if (!ms) return null;
-  const match = raw.match(/^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3])/);
-  if (match) return { day: match[1], hour: match[2] };
-  const dt = new Date(ms);
-  return { day: dt.toISOString().slice(0, 10), hour: String(dt.getUTCHours()).padStart(2, '0') };
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  if (!hasZone) {
+    const match = raw.match(/^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3])/);
+    if (match) return { day: match[1], hour: match[2] };
+  }
+  const china = new Date(ms + dashboardTimeZoneOffsetMs);
+  return { day: china.toISOString().slice(0, 10), hour: String(china.getUTCHours()).padStart(2, '0') };
 }
 function addDetailToUsageTotals(usage, d, latency) {
   const tokens = d.tokens || {};

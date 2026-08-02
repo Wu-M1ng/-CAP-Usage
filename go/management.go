@@ -233,10 +233,11 @@ func handleManagementRegister() ([]byte, error) {
 func handleDashboardData() ([]byte, error) {
 	snapshot := stats.Snapshot()
 	sanitizeSnapshotAPIKeysForOutput(&snapshot)
+	localizeStatisticsSnapshotForResource(&snapshot)
 	responseData := map[string]interface{}{
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
-		"generated_at":    time.Now().UTC().Format(time.RFC3339),
+		"generated_at":    dashboardResourceTime(time.Now()),
 	}
 	responseJSON, err := json.Marshal(responseData)
 	if err != nil {
@@ -270,6 +271,7 @@ func handleDashboardPage() ([]byte, error) {
 func handleGetUsage() ([]byte, error) {
 	snapshot := stats.Snapshot()
 	sanitizeSnapshotAPIKeysForOutput(&snapshot)
+	localizeStatisticsSnapshotForResource(&snapshot)
 
 	responseData := map[string]interface{}{
 		"usage":           snapshot,
@@ -324,6 +326,7 @@ func handleDeleteModelPrice(query map[string][]string) ([]byte, error) {
 }
 
 func modelPricesManagementResponse(data ModelPricesResponse) ([]byte, error) {
+	localizeModelPricesResponseForResource(&data)
 	responseJSON, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
@@ -342,10 +345,11 @@ func modelPricesManagementResponse(data ModelPricesResponse) ([]byte, error) {
 func handleExportUsage() ([]byte, error) {
 	snapshot := stats.Snapshot()
 	sanitizeSnapshotAPIKeysForOutput(&snapshot)
+	localizeStatisticsSnapshotForResource(&snapshot)
 
 	exportPayload := ExportPayload{
 		Version:     1,
-		ExportedAt:  time.Now().UTC().Format(time.RFC3339),
+		ExportedAt:  dashboardResourceTime(time.Now()),
 		Plugin:      pluginVersion,
 		DetailCount: stats.DetailCount(),
 		Config:      stats.ConfigSnapshot(),

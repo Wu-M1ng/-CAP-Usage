@@ -295,6 +295,7 @@ func encodeDashboardEventsExportFile(params EventsQuery, opts dashboardEventsExp
 func encodeDashboardEventsExportPaged(writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time) (dashboardExportFileResult, error) {
 	contentType := dashboardExportContentType(opts.Format)
 	firstPage := stats.QueryExportEventsPage(params, 0, dashboardExportJobPageSize, opts.Limit, snapshotAt)
+	localizeEventsResultForResource(&firstPage)
 	result := dashboardExportFileResult{
 		Total:       firstPage.Total,
 		Truncated:   firstPage.Truncated,
@@ -394,6 +395,7 @@ func encodeDashboardEventsPaged(params EventsQuery, opts dashboardEventsExportOp
 			return exported, nil
 		}
 		page = stats.QueryExportEventsPage(params, exported, dashboardExportJobPageSize, opts.Limit, snapshotAt)
+		localizeEventsResultForResource(&page)
 	}
 }
 
@@ -583,10 +585,7 @@ func dashboardExportJobID(query map[string][]string) string {
 }
 
 func formatExportJobTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339)
+	return dashboardResourceTime(t)
 }
 
 func newDashboardExportJobID() string {

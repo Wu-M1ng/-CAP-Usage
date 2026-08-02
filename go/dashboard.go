@@ -75,6 +75,7 @@ func handleDashboardSummary(query map[string][]string, headers map[string][]stri
 	summary := stats.SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey, clientAPI, now)
 	etag = dashboardSummaryETagForClientAPIVersion(now, rangeKey, clientAPI, summary.Meta.SummaryVersion)
 	sanitizeDashboardSummaryAPIKeysForOutput(&summary)
+	localizeDashboardSummaryForResource(&summary)
 	responseJSON, err := json.Marshal(summary)
 	if err != nil {
 		return nil, err
@@ -162,6 +163,7 @@ func handleDashboardEvents(query map[string][]string, headers map[string][]strin
 	result := stats.QueryEventsAt(params, now)
 	etag = dashboardEventsETagForVersion(params, now, result.dashboardVersion)
 	sanitizeEventsAPIKeysForOutput(&result)
+	localizeEventsResultForResource(&result)
 	responseJSON, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
@@ -269,6 +271,7 @@ func handleDashboardEventsExport(query map[string][]string, headers map[string][
 	startedAt := time.Now()
 	result := stats.QueryExportEventsAt(params, opts.Limit, now)
 	etag = dashboardEventsExportETagForVersion(params, opts, now, result.dashboardVersion)
+	localizeEventsResultForResource(&result)
 	body, contentType, err := encodeDashboardEventsExport(result, opts)
 	if err != nil {
 		return nil, err
@@ -323,6 +326,7 @@ func dashboardEventsExportETagForVersion(params EventsQuery, opts dashboardEvent
 }
 
 func encodeDashboardEventsExport(result EventsResult, opts dashboardEventsExportOptions) ([]byte, string, error) {
+	localizeEventsResultForResource(&result)
 	sanitizeEventsAPIKeysForOutput(&result)
 	switch opts.Format {
 	case dashboardExportJSONL:
@@ -425,7 +429,7 @@ func dashboardEventCSVRecord(event RequestDetail) []string {
 		status = "失败"
 	}
 	return []string{
-		event.Timestamp.UTC().Format(time.RFC3339),
+		dashboardResourceTime(event.Timestamp),
 		event.Model,
 		dashboardExportSource(event),
 		event.AuthIndex,
@@ -502,6 +506,7 @@ func handleDashboardAPIDetail(query map[string][]string, headers map[string][]st
 	result := stats.QueryAPIDetailPageAt(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now)
 	etag = dashboardAPIDetailETagForClientAPIVersionPage(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now, result.dashboardVersion)
 	sanitizeAPIDetailAPIKeysForOutput(&result)
+	localizeAPIDetailForResource(&result)
 	responseJSON, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
@@ -652,6 +657,8 @@ func handleHealthCheck() ([]byte, error) {
 	summary := stats.SummaryWithoutDetails()
 	storage := stats.StorageStatus()
 	runtime := stats.RuntimeStatus()
+	localizeStorageStatusForResource(&storage)
+	localizeRuntimeStatusForResource(&runtime)
 	alerts := healthAlerts(storage, runtime)
 
 	health := HealthResponse{
@@ -663,7 +670,7 @@ func handleHealthCheck() ([]byte, error) {
 		Config:        stats.ConfigSnapshot(),
 		Storage:       storage,
 		Runtime:       runtime,
-		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt:   dashboardResourceTime(time.Now()),
 	}
 	responseJSON, err := json.Marshal(health)
 	if err != nil {

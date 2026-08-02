@@ -1616,6 +1616,23 @@ test('dashboard fallback buckets offset timestamps by their source hour', async 
   assert.doesNotMatch(document.getElementById('trendChart').innerHTML, /15:00/);
 });
 
+test('dashboard fallback converts UTC timestamps to China time before bucketing', async () => {
+  const generatedAt = '2026-01-02T16:00:00Z';
+  const { document, fetchCalls } = createDashboardHarness({
+    failDashboardSummary: true,
+    range: '7h',
+    dashboardDataNowMs: Date.parse(generatedAt),
+    dashboardDataGeneratedAt: generatedAt,
+    dashboardDataRecentTimestamp: '2026-01-02T15:30:00Z',
+    dashboardDataOldDetailHours: 8,
+  });
+
+  await waitFor(() => fetchCalls.some((url) => url.includes('dashboard-data')) && document.getElementById('trendChart').innerHTML.includes('23:00'));
+
+  assert.match(document.getElementById('trendChart').innerHTML, /23:00/);
+  assert.doesNotMatch(document.getElementById('trendChart').innerHTML, /15:00/);
+});
+
 test('dashboard keeps summary path when model prices fail', async () => {
   const { document, fetchCalls } = createDashboardHarness({
     failModelPrices: true,
