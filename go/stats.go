@@ -522,6 +522,36 @@ func decrementEndpointStat(acc *endpointStatAccumulator, modelName string, detai
 	}
 }
 
+// moveEndpointStatLocked keeps the derived endpoint dimension aligned with a
+// request detail whose endpoint is learned after the initial native record.
+// Caller must hold s.mu.
+func (s *RequestStatistics) moveEndpointStatLocked(modelName string, before, after RequestDetail) {
+	if s == nil {
+		return
+	}
+	oldEndpoint := summaryEndpointKey(before)
+	newEndpoint := summaryEndpointKey(after)
+	if oldEndpoint == newEndpoint {
+		return
+	}
+	totals := detailTotalsFromRequest(after)
+	if oldStats := s.endpointStats[oldEndpoint]; oldStats != nil {
+		decrementEndpointStat(oldStats, modelName, before, totals)
+		if oldStats.stat.TotalRequests <= 0 {
+			delete(s.endpointStats, oldEndpoint)
+		}
+	}
+	if s.endpointStats == nil {
+		s.endpointStats = make(map[string]*endpointStatAccumulator)
+	}
+	newStats := s.endpointStats[newEndpoint]
+	if newStats == nil {
+		newStats = newEndpointStatAccumulator(newEndpoint)
+		s.endpointStats[newEndpoint] = newStats
+	}
+	incrementEndpointStat(newStats, modelName, after, totals)
+}
+
 func endpointStatsFromAccumulators(accumulators map[string]*endpointStatAccumulator) []EndpointStat {
 	if len(accumulators) == 0 {
 		return nil
@@ -1301,9 +1331,11 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 			if dedupKey(apiName, modelName, modelSt.Details[i]) != target {
 				continue
 			}
+			before := modelSt.Details[i]
 			if !enrichRequestDetailMetadata(&modelSt.Details[i], update) {
 				return false
 			}
+			s.moveEndpointStatLocked(modelName, before, modelSt.Details[i])
 			s.invalidateSummaryLocked()
 			return true
 		}
@@ -1316,6 +1348,9 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 	}
 	if changed {
 		s.mu.Lock()
+		enriched := base
+		enrichRequestDetailMetadata(&enriched, update)
+		s.moveEndpointStatLocked(modelName, base, enriched)
 		s.invalidateSummaryLocked()
 		s.mu.Unlock()
 	}
@@ -3385,9 +3420,11 @@ func (s *RequestStatistics) enrichPersistedDetailMetadataLocked(apiName, modelNa
 		if dedupKey(apiName, modelName, details[i]) != target {
 			continue
 		}
+		before := details[i]
 		if !enrichRequestDetailMetadata(&details[i], update) {
 			return false
 		}
+		s.moveEndpointStatLocked(modelName, before, details[i])
 		apiSt.Models[modelName].Details = details
 		s.invalidateSummaryLocked()
 		return true

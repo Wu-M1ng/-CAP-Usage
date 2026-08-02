@@ -244,6 +244,48 @@ func TestDashboardSummaryHasEndpointStatsAndTokenParts(t *testing.T) {
 	}
 }
 
+func TestDashboardEndpointStatsFollowMetadataEnrichment(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     false,
+	})
+	native := UsageRecord{
+		Provider:    "openai",
+		Model:       "gpt-4.1",
+		APIKey:      "sk-client-alpha-0000xx",
+		RequestedAt: time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC),
+		Detail:      UsageDetail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120},
+	}
+	stats.Record(native)
+
+	enriched := native
+	enriched.Endpoint = "/v1/responses"
+	if !stats.EnrichRecordedUsage(native, enriched) {
+		t.Fatal("EnrichRecordedUsage() = false, want metadata update")
+	}
+
+	summary := stats.SummaryWithoutDetails()
+	var response, unknown *EndpointStat
+	for i := range summary.EndpointStats {
+		stat := &summary.EndpointStats[i]
+		switch stat.Endpoint {
+		case "/v1/responses":
+			response = stat
+		case "unknown":
+			unknown = stat
+		}
+	}
+	if response == nil || response.TotalRequests != 1 || response.TotalTokens != 120 {
+		t.Fatalf("response endpoint stats = %#v, want one request and 120 tokens", summary.EndpointStats)
+	}
+	if unknown != nil && unknown.TotalRequests > 0 {
+		t.Fatalf("unknown endpoint stats = %#v, want no positive residual", *unknown)
+	}
+}
+
 func TestDashboardSummaryHasModelStats(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0})

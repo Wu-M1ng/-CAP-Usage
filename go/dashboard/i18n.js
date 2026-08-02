@@ -258,6 +258,7 @@ var I18N_MAP = {
     distribution_requests_share: '按 Token',
     distribution_name: '名称',
     distribution_cost: '费用',
+    distribution_share: '占比',
     distribution_other: '其他',
     distribution_empty: '暂无分布数据',
     unknown_model: '未知模型',
@@ -269,6 +270,7 @@ var I18N_MAP = {
     token_cache_creation: '缓存创建',
     token_cache_read: '缓存读取',
     token_cache_rate: '缓存命中率',
+    token_total: '总 token',
 
     // ---- model stats extra ----
     col_cache_rate: '缓存命中率',
@@ -511,6 +513,7 @@ var I18N_MAP = {
     distribution_requests_share: '按 Token',
     distribution_name: '名稱',
     distribution_cost: '費用',
+    distribution_share: '占比',
     distribution_other: '其他',
     distribution_empty: '暫無分布資料',
     unknown_model: '未知模型',
@@ -522,6 +525,7 @@ var I18N_MAP = {
     token_cache_creation: '快取建立',
     token_cache_read: '快取讀取',
     token_cache_rate: '快取命中率',
+    token_total: '總 token',
 
     col_cache_rate: '快取命中率',
     col_cost_per_m: '實際單價',
@@ -763,6 +767,7 @@ var I18N_MAP = {
     distribution_requests_share: 'By Token',
     distribution_name: 'Name',
     distribution_cost: 'Cost',
+    distribution_share: 'Share',
     distribution_other: 'Other',
     distribution_empty: 'No distribution data',
     unknown_model: 'Unknown model',
@@ -774,6 +779,7 @@ var I18N_MAP = {
     token_cache_creation: 'Cache Creation',
     token_cache_read: 'Cache Read',
     token_cache_rate: 'Cache Hit Rate',
+    token_total: 'Total Tokens',
 
     col_cache_rate: 'Cache Hit Rate',
     col_cost_per_m: 'Unit Cost',
@@ -1015,6 +1021,7 @@ var I18N_MAP = {
     distribution_requests_share: 'По токенам',
     distribution_name: 'Название',
     distribution_cost: 'Стоимость',
+    distribution_share: 'Доля',
     distribution_other: 'Другое',
     distribution_empty: 'Нет данных распределения',
     unknown_model: 'Неизвестная модель',
@@ -1026,6 +1033,7 @@ var I18N_MAP = {
     token_cache_creation: 'Создание кэша',
     token_cache_read: 'Чтение кэша',
     token_cache_rate: 'Попадание в кэш',
+    token_total: 'Всего токенов',
 
     col_cache_rate: 'Попадание в кэш',
     col_cost_per_m: 'Цена за ед.',

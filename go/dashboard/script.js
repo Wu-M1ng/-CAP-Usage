@@ -1154,6 +1154,81 @@ function renderModelStats() {
   }).join('') + '</tbody></table>' : '<div class="empty">' + t('no_model_data') + '</div>';
 }
 
+function dashboardTooltipTarget(event) {
+  const target = event && event.target;
+  if (!target) return null;
+  return typeof target.closest === 'function' ? target.closest('[data-tooltip]') : null;
+}
+
+function dashboardTooltipMove(target, event) {
+  const tip = $('tooltip');
+  if (!tip || !target || typeof target.getAttribute !== 'function') return;
+  const content = target.getAttribute('data-tooltip');
+  if (!content) return;
+  tip.innerHTML = content;
+  tip.classList.remove('hidden');
+  const rect = typeof target.getBoundingClientRect === 'function' ? target.getBoundingClientRect() : { left: 0, right: 0, top: 0, bottom: 0 };
+  const hasPointer = event && Number.isFinite(Number(event.clientX)) && Number.isFinite(Number(event.clientY));
+  const viewportWidth = typeof window !== 'undefined' && Number(window.innerWidth) > 0 ? Number(window.innerWidth) : 1280;
+  const viewportHeight = typeof window !== 'undefined' && Number(window.innerHeight) > 0 ? Number(window.innerHeight) : 720;
+  const width = tip.offsetWidth || 300;
+  const height = tip.offsetHeight || 110;
+  const pointerX = hasPointer ? Number(event.clientX) : Number(rect.right || rect.left || 0);
+  const pointerY = hasPointer ? Number(event.clientY) : Number(rect.top || 0);
+  let left = pointerX + 14;
+  let top = pointerY + 14;
+  if (left + width + 8 > viewportWidth) left = pointerX - width - 14;
+  if (top + height + 8 > viewportHeight) top = pointerY - height - 14;
+  left = Math.max(8, Math.min(left, Math.max(8, viewportWidth - width - 8)));
+  top = Math.max(8, Math.min(top, Math.max(8, viewportHeight - height - 8)));
+  tip.style.left = Math.round(left) + 'px';
+  tip.style.top = Math.round(top) + 'px';
+}
+
+function hideDashboardTooltip() {
+  const tip = $('tooltip');
+  if (tip) tip.classList.add('hidden');
+}
+
+function bindDashboardTooltip(svg, hoverHandler) {
+  if (!svg) return;
+  const handleTarget = function (event, move) {
+    const target = dashboardTooltipTarget(event);
+    if (!target) {
+      if (hoverHandler) hoverHandler(null, false);
+      hideDashboardTooltip();
+      return;
+    }
+    if (hoverHandler) hoverHandler(target, true);
+    if (move) dashboardTooltipMove(target, event);
+  };
+  svg.onmouseover = function (event) { handleTarget(event, true); };
+  svg.onmousemove = function (event) { handleTarget(event, true); };
+  svg.onmouseleave = function () {
+    if (hoverHandler) hoverHandler(null, false);
+    hideDashboardTooltip();
+  };
+  svg.onfocusin = function (event) { handleTarget(event, true); };
+  svg.onfocusout = function (event) {
+    const next = dashboardTooltipTarget({ target: event && event.relatedTarget });
+    if (next) return;
+    if (hoverHandler) hoverHandler(null, false);
+    hideDashboardTooltip();
+  };
+}
+
+function distributionTooltip(row, totalTokens) {
+  const tokens = Math.max(num(row && row.tokens), 0);
+  const share = totalTokens > 0 ? tokens / totalTokens * 100 : 0;
+  return '<div class="tooltipTitle">' + esc(row && row.name) + '</div>' +
+    '<div class="tooltipGrid">' +
+    '<div class="tooltipRow"><span>' + esc(t('col_requests')) + '</span><strong>' + esc(formatInteger(row && row.requests)) + '</strong></div>' +
+    '<div class="tooltipRow"><span>' + esc(t('col_tokens')) + '</span><strong>' + esc(formatInteger(tokens)) + '</strong></div>' +
+    '<div class="tooltipRow"><span>' + esc(t('distribution_cost')) + '</span><strong>' + esc(formatUsd(num(row && row.cost))) + '</strong></div>' +
+    '<div class="tooltipRow"><span>' + esc(t('distribution_share')) + '</span><strong>' + esc(pct(share)) + '</strong></div>' +
+    '</div>';
+}
+
 const distributionColors = ['#2563eb', '#14b8a6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#94a3b8'];
 
 function distributionCost(row) {
@@ -1196,6 +1271,7 @@ function renderDistributionDonut(svgId, totalId, rows) {
   if (!sorted.length || totalTokens <= 0) {
     svg.setAttribute('viewBox', '0 0 120 120');
     svg.innerHTML = '<circle cx="60" cy="60" r="43" fill="none" stroke="var(--cpa-border-light)" stroke-width="18"/>';
+    bindDashboardTooltip(svg);
     return;
   }
   const visible = sorted.slice(0, 6);
@@ -1210,13 +1286,15 @@ function renderDistributionDonut(svgId, totalId, rows) {
   const rings = visible.map((row, index) => {
     const share = row.tokens / totalTokens * 100;
     const color = distributionColors[index % distributionColors.length];
-    const title = esc(row.name + ': ' + compact(row.tokens));
-    const ring = '<circle cx="60" cy="60" r="43" fill="none" stroke="' + color + '" stroke-width="18" pathLength="100" stroke-dasharray="' + share.toFixed(3) + ' ' + (100 - share).toFixed(3) + '" stroke-dashoffset="-' + offset.toFixed(3) + '" transform="rotate(-90 60 60)"><title>' + title + '</title></circle>';
+    const tooltip = distributionTooltip(row, totalTokens);
+    const title = esc(row.name + ': ' + formatInteger(row.tokens) + ' (' + pct(share) + ')');
+    const ring = '<circle class="distributionDonutSegment" cx="60" cy="60" r="43" fill="none" stroke="' + color + '" stroke-width="18" pathLength="100" stroke-dasharray="' + share.toFixed(3) + ' ' + (100 - share).toFixed(3) + '" stroke-dashoffset="-' + offset.toFixed(3) + '" transform="rotate(-90 60 60)" tabindex="0" focusable="true" role="img" aria-label="' + esc(row.name + ' ' + formatInteger(row.tokens)) + '" data-tooltip="' + esc(tooltip) + '"><title>' + title + '</title></circle>';
     offset += share;
     return ring;
   }).join('');
   svg.setAttribute('viewBox', '0 0 120 120');
   svg.innerHTML = '<circle cx="60" cy="60" r="43" fill="none" stroke="var(--cpa-border-light)" stroke-width="18"/>' + rings;
+  bindDashboardTooltip(svg);
 }
 
 function renderDistributionTable(elementId, rows) {
@@ -1241,32 +1319,97 @@ function renderDistributionTable(elementId, rows) {
   }).join('') + '</tbody></table>';
 }
 
+function tokenTrendBucketValue(values, hour) {
+  if (!values || typeof values !== 'object') return {};
+  const n = Number(hour);
+  if (!Number.isFinite(n)) return {};
+  const padded = String(n).padStart(2, '0');
+  const plain = String(n);
+  if (Object.prototype.hasOwnProperty.call(values, padded)) return values[padded] || {};
+  if (Object.prototype.hasOwnProperty.call(values, plain)) return values[plain] || {};
+  return {};
+}
+
+function tokenTrendPoint(key, hourly, source, totals) {
+  const row = hourly ? tokenTrendBucketValue(source, key) : (source[key] || {});
+  const input = num(row.input_tokens);
+  const output = num(row.output_tokens);
+  const cacheCreation = num(row.cache_write_tokens);
+  const cacheRead = num(row.cache_read_tokens);
+  const aggregateTotal = hourly ? hourBucketValue(totals, key) : num(totals[key]);
+  const label = hourly ? String(key).padStart(2, '0') + ':00' : (String(key).length > 7 ? String(key).slice(5) : String(key));
+  return {
+    key: String(key),
+    label,
+    tooltipLabel: hourly ? label : String(key),
+    input,
+    output,
+    cacheCreation,
+    cacheRead,
+    total: aggregateTotal > 0 ? aggregateTotal : input + output + cacheCreation + cacheRead,
+    cacheRate: input > 0 ? cacheRead / input * 100 : 0,
+  };
+}
+
 function tokenTrendPoints(panelData) {
   const usage = panelData && panelData.usage || {};
   const hourly = $('range').value === '7h' || $('range').value === '24h';
-  const source = hourly ? usage.token_parts_by_hour : usage.token_parts_by_day;
-  let keys = Object.keys(source || {});
+  const source = hourly ? usage.token_parts_by_hour || {} : usage.token_parts_by_day || {};
+  const totals = hourly ? usage.tokens_by_hour || {} : usage.tokens_by_day || {};
+  let keys = Object.keys(source);
   if (hourly) keys = orderedRecentHours(keys, dashboardCurrentHour(panelData));
   else {
     keys.sort();
     if ($('range').value === 'all' && keys.length > 30) keys = keys.slice(-30);
   }
   if (!keys.length) {
-    const totals = hourly ? usage.tokens_by_hour || {} : usage.tokens_by_day || {};
     keys = Object.keys(totals);
     if (hourly) keys = orderedRecentHours(keys, dashboardCurrentHour(panelData));
     else {
       keys.sort();
       if ($('range').value === 'all' && keys.length > 30) keys = keys.slice(-30);
     }
-    return keys.map((key) => ({ label: hourly ? String(key).padStart(2, '0') + ':00' : (key.length > 7 ? key.slice(5) : key), input: num(totals[key]), output: 0, cacheCreation: 0, cacheRead: 0, cacheRate: 0 }));
+    return keys.map((key) => {
+      const total = hourly ? hourBucketValue(totals, key) : num(totals[key]);
+      const label = hourly ? String(key).padStart(2, '0') + ':00' : (String(key).length > 7 ? String(key).slice(5) : String(key));
+      return { key: String(key), label, tooltipLabel: hourly ? label : String(key), input: total, output: 0, cacheCreation: 0, cacheRead: 0, total, cacheRate: 0 };
+    });
   }
-  return keys.map((key) => {
-    const row = source[key] || {};
-    const input = num(row.input_tokens);
-    const cacheRead = num(row.cache_read_tokens);
-    return { label: hourly ? String(key).padStart(2, '0') + ':00' : (key.length > 7 ? key.slice(5) : key), input, output: num(row.output_tokens), cacheCreation: num(row.cache_write_tokens), cacheRead, cacheRate: input > 0 ? cacheRead / input * 100 : 0 };
-  });
+  return keys.map((key) => tokenTrendPoint(key, hourly, source, totals));
+}
+
+function tokenTrendTooltip(point) {
+  const metric = function (label, value, color) {
+    return '<div class="tooltipRow"><span><i class="tooltipSwatch" style="background:' + color + '"></i>' + esc(label) + '</span><strong>' + esc(formatInteger(value)) + '</strong></div>';
+  };
+  return '<div class="tooltipTitle">' + esc(point.tooltipLabel || point.label) + '</div>' +
+    '<div class="tooltipGrid">' +
+    metric(t('token_input'), point.input, '#2563eb') +
+    metric(t('token_output'), point.output, '#14b8a6') +
+    metric(t('token_cache_creation'), point.cacheCreation, '#f59e0b') +
+    metric(t('token_cache_read'), point.cacheRead, '#8b5cf6') +
+    '<div class="tooltipRow"><span>' + esc(t('token_cache_rate')) + '</span><strong>' + esc(pct(point.cacheRate)) + '</strong></div>' +
+    '<div class="tooltipRow tooltipTotal"><span>' + esc(t('token_total')) + '</span><strong>' + esc(formatInteger(point.total)) + '</strong></div>' +
+    '</div>';
+}
+
+function tokenTrendHover(target, active) {
+  const svg = target && (target.ownerSVGElement || target.parentNode);
+  if (!svg || typeof svg.querySelector !== 'function') return;
+  const line = svg.querySelector('.tokenTrendHoverLine');
+  if (!line) return;
+  if (!active || !target || typeof target.getAttribute !== 'function') {
+    line.setAttribute('visibility', 'hidden');
+    return;
+  }
+  const x = target.getAttribute('data-trend-x');
+  if (!x) {
+    line.setAttribute('visibility', 'hidden');
+    return;
+  }
+  line.setAttribute('x1', x);
+  line.setAttribute('x2', x);
+  line.setAttribute('visibility', 'visible');
 }
 
 function renderTokenUsageChart(panelData) {
@@ -1284,6 +1427,7 @@ function renderTokenUsageChart(panelData) {
   if (!points.length) {
     svg.setAttribute('viewBox', '0 0 720 190');
     svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" class="distributionAxisText">' + esc(t('distribution_empty')) + '</text>';
+    bindDashboardTooltip(svg);
     return;
   }
   const W = 720, H = 190, PL = 42, PR = 42, PT = 16, PB = 28;
@@ -1299,17 +1443,26 @@ function renderTokenUsageChart(panelData) {
   }
   series.forEach((item) => {
     const path = points.map((point, index) => (index ? 'L' : 'M') + x(index) + ' ' + yToken(point[item.key])).join(' ');
-    html += '<path d="' + path + '" class="distributionLine" stroke="' + item.color + '"></path>';
+    html += '<path d="' + path + '" class="distributionLine tokenTrendSeries" stroke="' + item.color + '"></path>';
   });
   const ratePath = points.map((point, index) => (index ? 'L' : 'M') + x(index) + ' ' + (PT + chartH - point.cacheRate / 100 * chartH)).join(' ');
-  html += '<path d="' + ratePath + '" class="distributionLine" stroke="#64748b" stroke-dasharray="4 3"></path>';
+  html += '<path d="' + ratePath + '" class="distributionLine tokenTrendRate" stroke="#64748b" stroke-dasharray="4 3"></path>';
+  html += '<line x1="' + x(0) + '" x2="' + x(0) + '" y1="' + PT + '" y2="' + (PT + chartH) + '" class="tokenTrendHoverLine" visibility="hidden"/>';
+  const hitWidth = chartW / count;
   points.forEach((point, index) => {
-    series.forEach((item) => { html += '<circle cx="' + x(index) + '" cy="' + yToken(point[item.key]) + '" r="2.5" class="distributionPoint" fill="' + item.color + '"><title>' + esc(point.label + ' ' + item.label + ': ' + compact(point[item.key])) + '</title></circle>'; });
-    html += '<circle cx="' + x(index) + '" cy="' + (PT + chartH - point.cacheRate / 100 * chartH) + '" r="2.5" class="distributionPoint" fill="#64748b"><title>' + esc(point.label + ' ' + t('token_cache_rate') + ': ' + pct(point.cacheRate)) + '</title></circle>';
+    const tooltip = esc(tokenTrendTooltip(point));
+    const hitX = Math.max(PL, x(index) - hitWidth / 2);
+    html += '<rect class="tokenTrendHit" x="' + hitX + '" y="' + PT + '" width="' + hitWidth + '" height="' + chartH + '" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" aria-label="' + esc(point.tooltipLabel || point.label) + ' ' + esc(t('token_total')) + ' ' + esc(formatInteger(point.total)) + '"/>';
+  });
+  points.forEach((point, index) => {
+    const tooltip = esc(tokenTrendTooltip(point));
+    series.forEach((item) => { html += '<circle cx="' + x(index) + '" cy="' + yToken(point[item.key]) + '" r="3" class="distributionPoint tokenTrendPoint" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" fill="' + item.color + '"><title>' + esc(point.label + ' ' + item.label + ': ' + compact(point[item.key])) + '</title></circle>'; });
+    html += '<circle cx="' + x(index) + '" cy="' + (PT + chartH - point.cacheRate / 100 * chartH) + '" r="3" class="distributionPoint tokenTrendPoint" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" fill="#64748b"><title>' + esc(point.label + ' ' + t('token_cache_rate') + ': ' + pct(point.cacheRate)) + '</title></circle>';
     if (index % Math.max(1, Math.ceil(points.length / 10)) === 0 || index === points.length - 1) html += '<text x="' + x(index) + '" y="' + (H - 6) + '" text-anchor="middle" class="distributionAxisText">' + esc(point.label) + '</text>';
   });
   svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
   svg.innerHTML = html;
+  bindDashboardTooltip(svg, tokenTrendHover);
 }
 
 function renderDistributionDashboard() {

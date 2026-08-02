@@ -1389,6 +1389,12 @@ test('dashboard distribution section renders token-only charts with one cost col
   assert.match(document.getElementById('upstreamDistributionDonut').innerHTML, /circle/);
   assert.match(document.getElementById('endpointDistributionDonut').innerHTML, /circle/);
   assert.match(document.getElementById('tokenUsageTrend').innerHTML, /distributionLine/);
+  assert.match(document.getElementById('modelDistributionDonut').innerHTML, /data-tooltip=/);
+  assert.match(document.getElementById('upstreamDistributionDonut').innerHTML, /data-tooltip=/);
+  assert.match(document.getElementById('endpointDistributionDonut').innerHTML, /data-tooltip=/);
+  assert.match(document.getElementById('tokenUsageTrend').innerHTML, /tokenTrendHit/);
+  assert.match(document.getElementById('tokenUsageTrend').innerHTML, /data-tooltip=/);
+  assert.match(document.getElementById('tokenUsageTrend').innerHTML, /总 token/);
   assert.doesNotMatch(html, /actual|standard|实际消费|标准消费/i);
 });
 
@@ -1397,10 +1403,10 @@ test('dashboard distribution translations exist in every supported language', ()
   const keys = [
     'distribution_title', 'distribution_subtle', 'distribution_token_mode',
     'model_distribution_title', 'upstream_distribution_title', 'endpoint_distribution_title',
-    'distribution_requests_share', 'distribution_name', 'distribution_cost',
+    'distribution_requests_share', 'distribution_name', 'distribution_cost', 'distribution_share',
     'distribution_other', 'distribution_empty', 'unknown_model', 'unknown_endpoint',
     'token_distribution_title', 'token_distribution_subtle', 'token_input', 'token_output',
-    'token_cache_creation', 'token_cache_read', 'token_cache_rate',
+    'token_cache_creation', 'token_cache_read', 'token_cache_rate', 'token_total',
   ];
   for (const language of ['zh-CN', 'zh-TW', 'en', 'ru']) {
     for (const key of keys) assert.ok(context.I18N_MAP[language][key], language + ' missing ' + key);
