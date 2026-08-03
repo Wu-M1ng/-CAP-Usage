@@ -298,7 +298,7 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		AuthID:          authID,
 		AuthIndex:       fallbackAuthIndex(req.Metadata, authID),
 		AuthType:        fallbackAuthType(req.Metadata, authID),
-		Endpoint:        fallbackUsageEndpoint(req),
+		Endpoint:        metadataString(req.Metadata, "request_path", "endpoint", "request_endpoint", "path", "uri", "url", "route"),
 		ReasoningEffort: metadataString(req.Metadata, "reasoning_effort"),
 		ServiceTier:     firstNonEmpty(metadataString(req.Metadata, "service_tier"), jsonStringPath(requestRoot, "service_tier")),
 		Stream:          req.Stream,
@@ -308,23 +308,6 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		Source:          metadataString(req.Metadata, "upstream_source", "provider_source", "selected_source"),
 		ResponseHeaders: req.ResponseHeaders,
 	}, true
-}
-
-func fallbackUsageEndpoint(req ResponseInterceptRequest) string {
-	if endpoint := metadataString(req.Metadata, "request_path", "endpoint", "request_endpoint", "path", "uri", "url", "route"); endpoint != "" {
-		return endpoint
-	}
-	source := strings.ToLower(strings.TrimSpace(req.SourceFormat))
-	switch {
-	case source == "openai-responses" || source == "openai-response":
-		return "/v1/responses"
-	case source == "openai":
-		return "/v1/chat/completions"
-	case strings.Contains(source, "gemini"):
-		return "/v1beta/models"
-	default:
-		return ""
-	}
 }
 
 func responseUsesAnthropicUsageAccounting(req ResponseInterceptRequest) bool {
