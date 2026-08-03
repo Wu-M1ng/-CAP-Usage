@@ -232,6 +232,9 @@ func (s *eventStore) insertEvent(ctx context.Context, row eventRow, fingerprint 
 }
 
 func (s *eventStore) insertEventTx(ctx context.Context, tx *sql.Tx, row eventRow, fingerprint string, exact bool, cutoff time.Time) (int64, bool, error) {
+	if strings.TrimSpace(fingerprint) == "" {
+		fingerprint = eventFingerprint(row.API, eventRowModel(row), row.Detail)
+	}
 	if exact {
 		var existingID int64
 		query := "SELECT id FROM request_events WHERE fingerprint = ?"
@@ -303,17 +306,19 @@ func (s *eventStore) enrichEvent(ctx context.Context, fingerprint string, timest
 	defer tx.Rollback()
 
 	var (
-		id       int64
-		endpoint string
-		thinking string
-		stream   int64
+		id         int64
+		endpoint   string
+		apiKey     string
+		apiKeyHash string
+		thinking   string
+		stream     int64
 	)
 	err = tx.QueryRowContext(ctx, `
-SELECT id, endpoint, thinking_json, stream
+SELECT id, endpoint, api_key, api_key_hash, thinking_json, stream
 FROM request_events
 WHERE fingerprint = ? AND timestamp_ns = ? AND timestamp_zero = ?
 ORDER BY id DESC
-LIMIT 1`, fingerprint, timestampNS, timestampZero).Scan(&id, &endpoint, &thinking, &stream)
+	LIMIT 1`, fingerprint, timestampNS, timestampZero).Scan(&id, &endpoint, &apiKey, &apiKeyHash, &thinking, &stream)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := upsertPendingEnrichment(ctx, tx, fingerprint, timestampNS, timestampZero, update); err != nil {
 			return false, err
@@ -327,7 +332,12 @@ LIMIT 1`, fingerprint, timestampNS, timestampZero).Scan(&id, &endpoint, &thinkin
 		return false, fmt.Errorf("find event to enrich: %w", err)
 	}
 
-	detail := RequestDetail{Endpoint: endpoint, Stream: stream != 0}
+	detail := RequestDetail{
+		Endpoint:   normalizeRequestEndpoint(endpoint),
+		APIKey:     apiKey,
+		APIKeyHash: apiKeyHash,
+		Stream:     stream != 0,
+	}
 	if err := decodeEventThinking(thinking, &detail.Thinking); err != nil {
 		return false, err
 	}
@@ -343,8 +353,8 @@ LIMIT 1`, fingerprint, timestampNS, timestampZero).Scan(&id, &endpoint, &thinkin
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE request_events
-SET endpoint = ?, thinking_json = ?, stream = ?
-WHERE id = ?`, detail.Endpoint, thinkingJSON, boolToInt64(detail.Stream), id); err != nil {
+SET endpoint = ?, api_key = ?, api_key_hash = ?, api_key_label_hash = ?, thinking_json = ?, stream = ?
+WHERE id = ?`, detail.Endpoint, detail.APIKey, detail.APIKeyHash, hashAPIKey(detail.APIKey), thinkingJSON, boolToInt64(detail.Stream), id); err != nil {
 		return false, fmt.Errorf("update event enrichment: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1330,7 +1340,7 @@ func decodeEventHeaders(encoded string) (map[string][]string, error) {
 }
 
 func hasEventEnrichment(update RequestDetail) bool {
-	return strings.TrimSpace(update.Endpoint) != "" || update.Thinking != (UsageThinking{}) || update.Stream
+	return strings.TrimSpace(update.Endpoint) != "" || strings.TrimSpace(update.APIKey) != "" || strings.TrimSpace(update.APIKeyHash) != "" || update.Thinking != (UsageThinking{}) || update.Stream
 }
 
 func pendingEnrichment(ctx context.Context, tx *sql.Tx, fingerprint string, timestampNS, timestampZero int64) (RequestDetail, bool, error) {
@@ -1493,7 +1503,7 @@ func scanEvent(scanner eventScanner) (RequestDetail, error) {
 		AuthID:      authID,
 		AuthIndex:   authIndex,
 		AuthType:    authType,
-		Endpoint:    endpoint,
+		Endpoint:    normalizeRequestEndpoint(endpoint),
 		BaseURL:     baseURL,
 		Stream:      stream != 0,
 		Tokens: TokenStats{

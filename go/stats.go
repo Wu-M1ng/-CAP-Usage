@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -550,6 +551,26 @@ func (s *RequestStatistics) moveEndpointStatLocked(modelName string, before, aft
 		s.endpointStats[newEndpoint] = newStats
 	}
 	incrementEndpointStat(newStats, modelName, after, totals)
+}
+
+// moveClientAPIStatLocked keeps the client-key dimension aligned with a detail
+// whose caller identity is learned after the native usage record arrives.
+// Caller must hold s.mu.
+func (s *RequestStatistics) moveClientAPIStatLocked(modelName string, before, after RequestDetail) {
+	if s == nil || clientAPIGroupKey(before) == clientAPIGroupKey(after) {
+		return
+	}
+	totals := detailTotalsFromRequest(after)
+	oldKey := clientAPIGroupKey(before)
+	if oldStats := s.clientAPIStats[oldKey]; oldStats != nil {
+		decrementClientAPIStatByKey(oldStats, modelName, before, totals)
+		if oldStats.stat.TotalRequests <= 0 {
+			delete(s.clientAPIStats, oldKey)
+		}
+	}
+	if hasClientAPIIdentity(after) {
+		incrementClientAPIStat(s.clientAPIStats, modelName, after, totals)
+	}
 }
 
 func endpointStatsFromAccumulators(accumulators map[string]*endpointStatAccumulator) []EndpointStat {
@@ -1279,7 +1300,7 @@ func requestDetailFromUsageRecord(record UsageRecord, timestamp time.Time, white
 		AuthID:     strings.TrimSpace(record.AuthID),
 		AuthIndex:  strings.TrimSpace(record.AuthIndex),
 		AuthType:   strings.TrimSpace(record.AuthType),
-		Endpoint:   strings.TrimSpace(record.Endpoint),
+		Endpoint:   normalizeRequestEndpoint(record.Endpoint),
 		BaseURL:    strings.TrimSpace(record.BaseURL),
 		Stream:     record.Stream,
 		Thinking:   usageThinking(record),
@@ -1336,6 +1357,7 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 				return false
 			}
 			s.moveEndpointStatLocked(modelName, before, modelSt.Details[i])
+			s.moveClientAPIStatLocked(modelName, before, modelSt.Details[i])
 			s.invalidateSummaryLocked()
 			return true
 		}
@@ -1351,6 +1373,7 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 		enriched := base
 		enrichRequestDetailMetadata(&enriched, update)
 		s.moveEndpointStatLocked(modelName, base, enriched)
+		s.moveClientAPIStatLocked(modelName, base, enriched)
 		s.invalidateSummaryLocked()
 		s.mu.Unlock()
 	}
@@ -1374,8 +1397,16 @@ func enrichRequestDetailMetadata(detail *RequestDetail, update RequestDetail) bo
 		return false
 	}
 	changed := false
-	if detail.Endpoint == "" && strings.TrimSpace(update.Endpoint) != "" {
-		detail.Endpoint = strings.TrimSpace(update.Endpoint)
+	if detail.Endpoint == "" && normalizeRequestEndpoint(update.Endpoint) != "" {
+		detail.Endpoint = normalizeRequestEndpoint(update.Endpoint)
+		changed = true
+	}
+	if isUnknownClientAPIValue(detail.APIKey) && !isUnknownClientAPIValue(update.APIKey) {
+		detail.APIKey = strings.TrimSpace(update.APIKey)
+		changed = true
+	}
+	if strings.TrimSpace(detail.APIKeyHash) == "" && strings.TrimSpace(update.APIKeyHash) != "" {
+		detail.APIKeyHash = strings.TrimSpace(update.APIKeyHash)
 		changed = true
 	}
 	if detail.Thinking == (UsageThinking{}) && update.Thinking != (UsageThinking{}) {
@@ -2704,6 +2735,7 @@ func (s *RequestStatistics) addStorageSnapshotResidualModelLocked(apiName, model
 
 func normalizeStorageSnapshotDetail(modelName string, detail RequestDetail, now time.Time) RequestDetail {
 	detail.Model = normalizeDetailModelName(modelName, detail.Model)
+	detail.Endpoint = normalizeRequestEndpoint(detail.Endpoint)
 	if detail.Timestamp.IsZero() {
 		detail.Timestamp = now
 	}
@@ -4255,49 +4287,7 @@ func (s *RequestStatistics) incrementSummaryDimensionStatsLocked(modelName strin
 	}
 	credentialStat.TotalTokens += totals.totalTokens
 
-	clientKey := clientAPIGroupKey(detail)
-	clientAgg, ok := s.clientAPIStats[clientKey]
-	if !ok {
-		clientAgg = &clientAPIStatAccumulator{
-			stat: ClientAPIStat{
-				APIKey:     clientAPIGroupLabel(detail),
-				APIKeyHash: detail.APIKeyHash,
-			},
-			models: make(map[string]*ClientAPIModelStat),
-		}
-		s.clientAPIStats[clientKey] = clientAgg
-	}
-	clientAgg.stat.TotalRequests++
-	if detail.Failed {
-		clientAgg.stat.FailureCount++
-	} else {
-		clientAgg.stat.SuccessCount++
-	}
-	clientAgg.stat.TotalTokens += totals.totalTokens
-	clientAgg.stat.InputTokens += totals.inputTokens
-	clientAgg.stat.OutputTokens += totals.outputTokens
-	clientAgg.stat.CachedTokens += totals.cachedTokens
-	clientAgg.stat.CacheWriteTokens += totals.cacheWriteTokens
-	clientAgg.stat.ReasoningTokens += totals.reasoningTokens
-
-	clientModel, ok := clientAgg.models[modelName]
-	if !ok {
-		clientModel = &ClientAPIModelStat{Model: modelName}
-		clientAgg.models[modelName] = clientModel
-	}
-	clientModel.TotalRequests++
-	if detail.Failed {
-		clientModel.FailureCount++
-	} else {
-		clientModel.SuccessCount++
-	}
-	clientModel.TotalTokens += totals.totalTokens
-	clientModel.InputTokens += totals.inputTokens
-	clientModel.OutputTokens += totals.outputTokens
-	clientModel.CachedTokens += totals.cachedTokens
-	clientModel.CacheWriteTokens += totals.cacheWriteTokens
-	clientModel.ReasoningTokens += totals.reasoningTokens
-	clientModel.providerStats = incrementModelProviderStats(clientModel.providerStats, detail.Provider, detail.Failed, totals)
+	incrementClientAPIStat(s.clientAPIStats, modelName, detail, totals)
 }
 
 func (s *RequestStatistics) decrementSummaryDimensionStatsLocked(modelName string, detail RequestDetail, totals detailTotals) {
@@ -4348,43 +4338,7 @@ func (s *RequestStatistics) decrementSummaryDimensionStatsLocked(modelName strin
 		}
 	}
 
-	clientKey := clientAPIGroupKey(detail)
-	if clientAgg, ok := s.clientAPIStats[clientKey]; ok {
-		clientAgg.stat.TotalRequests--
-		if detail.Failed {
-			clientAgg.stat.FailureCount--
-		} else {
-			clientAgg.stat.SuccessCount--
-		}
-		clientAgg.stat.TotalTokens -= totals.totalTokens
-		clientAgg.stat.InputTokens -= totals.inputTokens
-		clientAgg.stat.OutputTokens -= totals.outputTokens
-		clientAgg.stat.CachedTokens -= totals.cachedTokens
-		clientAgg.stat.CacheWriteTokens -= totals.cacheWriteTokens
-		clientAgg.stat.ReasoningTokens -= totals.reasoningTokens
-
-		if clientModel, ok := clientAgg.models[modelName]; ok {
-			clientModel.TotalRequests--
-			if detail.Failed {
-				clientModel.FailureCount--
-			} else {
-				clientModel.SuccessCount--
-			}
-			clientModel.TotalTokens -= totals.totalTokens
-			clientModel.InputTokens -= totals.inputTokens
-			clientModel.OutputTokens -= totals.outputTokens
-			clientModel.CachedTokens -= totals.cachedTokens
-			clientModel.CacheWriteTokens -= totals.cacheWriteTokens
-			clientModel.ReasoningTokens -= totals.reasoningTokens
-			decrementModelProviderStats(clientModel.providerStats, detail.Provider, detail.Failed, totals)
-			if clientModel.TotalRequests <= 0 {
-				delete(clientAgg.models, modelName)
-			}
-		}
-		if clientAgg.stat.TotalRequests <= 0 {
-			delete(s.clientAPIStats, clientKey)
-		}
-	}
+	decrementClientAPIStat(s.clientAPIStats, modelName, detail, totals)
 }
 
 func (s *RequestStatistics) incrementHealthBucketLocked(detail RequestDetail) {
@@ -5396,11 +5350,54 @@ func summarySourceKey(detail RequestDetail) string {
 }
 
 func summaryEndpointKey(detail RequestDetail) string {
-	endpoint := strings.TrimSpace(detail.Endpoint)
+	endpoint := normalizeRequestEndpoint(detail.Endpoint)
 	if endpoint == "" {
 		return "unknown"
 	}
 	return endpoint
+}
+
+// normalizeRequestEndpoint gives all endpoint dimensions one stable shape. CPA
+// metadata can expose a route, a path without a leading slash, or a complete
+// URL with a query string; the dashboard only needs the request path.
+func normalizeRequestEndpoint(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if fields := strings.Fields(value); len(fields) > 1 && isHTTPMethod(fields[0]) {
+		value = fields[1]
+	}
+	if parsed, err := url.Parse(value); err == nil && parsed.Path != "" && (parsed.IsAbs() || strings.HasPrefix(value, "//")) {
+		value = parsed.Path
+	} else if index := strings.IndexAny(value, "?#"); index >= 0 {
+		value = value[:index]
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	value = strings.TrimRight(value, "/")
+	switch value {
+	case "", "/":
+		return ""
+	case "/responses":
+		return "/v1/responses"
+	default:
+		return value
+	}
+}
+
+func isHTTPMethod(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS":
+		return true
+	default:
+		return false
+	}
 }
 
 func summaryCredentialKey(detail RequestDetail) string {
@@ -6255,32 +6252,9 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 		}
 		cred.TotalTokens += totals.totalTokens
 
-		// Client API stats
-		clientKey := clientAPIGroupKey(detail)
-		client, ok := clientAPIAgg[clientKey]
-		if !ok {
-			client = &clientAPIStatAccumulator{
-				stat: ClientAPIStat{
-					APIKey:     clientAPIGroupLabel(detail),
-					APIKeyHash: detail.APIKeyHash,
-				},
-				models: make(map[string]*ClientAPIModelStat),
-			}
-			clientAPIAgg[clientKey] = client
-		}
-		client.stat.TotalRequests++
-		if detail.Failed {
-			client.stat.FailureCount++
-		} else {
-			client.stat.SuccessCount++
-		}
-		client.stat.TotalTokens += totals.totalTokens
-		client.stat.InputTokens += totals.inputTokens
-		client.stat.OutputTokens += totals.outputTokens
-		client.stat.CachedTokens += totals.cachedTokens
-		client.stat.CacheWriteTokens += totals.cacheWriteTokens
-		client.stat.ReasoningTokens += totals.reasoningTokens
-		rangeIncrementClientModel(client, dModel, detail, totals)
+		// Client API stats. Requests without a caller API key remain in the
+		// global dimensions but do not create a misleading selector group.
+		incrementClientAPIStat(clientAPIAgg, dModel, detail, totals)
 	}
 
 	if s.eventStore != nil {
@@ -6596,6 +6570,111 @@ func clientAPIGroupKey(detail RequestDetail) string {
 	return "(unknown)"
 }
 
+func hasClientAPIIdentity(detail RequestDetail) bool {
+	return !isUnknownClientAPIValue(detail.APIKey) || strings.TrimSpace(detail.APIKeyHash) != ""
+}
+
+func incrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if accumulators == nil || !hasClientAPIIdentity(detail) {
+		return
+	}
+	clientKey := clientAPIGroupKey(detail)
+	clientAgg := accumulators[clientKey]
+	if clientAgg == nil {
+		clientAgg = &clientAPIStatAccumulator{
+			stat: ClientAPIStat{
+				APIKey:     clientAPIGroupLabel(detail),
+				APIKeyHash: strings.TrimSpace(detail.APIKeyHash),
+			},
+			models: make(map[string]*ClientAPIModelStat),
+		}
+		accumulators[clientKey] = clientAgg
+	}
+	clientAgg.stat.TotalRequests++
+	if detail.Failed {
+		clientAgg.stat.FailureCount++
+	} else {
+		clientAgg.stat.SuccessCount++
+	}
+	clientAgg.stat.TotalTokens += totals.totalTokens
+	clientAgg.stat.InputTokens += totals.inputTokens
+	clientAgg.stat.OutputTokens += totals.outputTokens
+	clientAgg.stat.CachedTokens += totals.cachedTokens
+	clientAgg.stat.CacheWriteTokens += totals.cacheWriteTokens
+	clientAgg.stat.ReasoningTokens += totals.reasoningTokens
+
+	modelName = normalizeModelName(modelName)
+	clientModel := clientAgg.models[modelName]
+	if clientModel == nil {
+		clientModel = &ClientAPIModelStat{Model: modelName}
+		clientAgg.models[modelName] = clientModel
+	}
+	clientModel.TotalRequests++
+	if detail.Failed {
+		clientModel.FailureCount++
+	} else {
+		clientModel.SuccessCount++
+	}
+	clientModel.TotalTokens += totals.totalTokens
+	clientModel.InputTokens += totals.inputTokens
+	clientModel.OutputTokens += totals.outputTokens
+	clientModel.CachedTokens += totals.cachedTokens
+	clientModel.CacheWriteTokens += totals.cacheWriteTokens
+	clientModel.ReasoningTokens += totals.reasoningTokens
+	clientModel.providerStats = incrementModelProviderStats(clientModel.providerStats, detail.Provider, detail.Failed, totals)
+}
+
+func decrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if len(accumulators) == 0 {
+		return
+	}
+	key := clientAPIGroupKey(detail)
+	if agg := accumulators[key]; agg != nil {
+		decrementClientAPIStatByKey(agg, modelName, detail, totals)
+		if agg.stat.TotalRequests <= 0 {
+			delete(accumulators, key)
+		}
+	}
+}
+
+func decrementClientAPIStatByKey(agg *clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if agg == nil {
+		return
+	}
+	agg.stat.TotalRequests--
+	if detail.Failed {
+		agg.stat.FailureCount--
+	} else {
+		agg.stat.SuccessCount--
+	}
+	agg.stat.TotalTokens -= totals.totalTokens
+	agg.stat.InputTokens -= totals.inputTokens
+	agg.stat.OutputTokens -= totals.outputTokens
+	agg.stat.CachedTokens -= totals.cachedTokens
+	agg.stat.CacheWriteTokens -= totals.cacheWriteTokens
+	agg.stat.ReasoningTokens -= totals.reasoningTokens
+
+	modelName = normalizeModelName(modelName)
+	if model := agg.models[modelName]; model != nil {
+		model.TotalRequests--
+		if detail.Failed {
+			model.FailureCount--
+		} else {
+			model.SuccessCount--
+		}
+		model.TotalTokens -= totals.totalTokens
+		model.InputTokens -= totals.inputTokens
+		model.OutputTokens -= totals.outputTokens
+		model.CachedTokens -= totals.cachedTokens
+		model.CacheWriteTokens -= totals.cacheWriteTokens
+		model.ReasoningTokens -= totals.reasoningTokens
+		decrementModelProviderStats(model.providerStats, detail.Provider, detail.Failed, totals)
+		if model.TotalRequests <= 0 {
+			delete(agg.models, modelName)
+		}
+	}
+}
+
 func clientAPIStatsFromAccumulators(accumulators map[string]*clientAPIStatAccumulator) []ClientAPIStat {
 	stats := make([]ClientAPIStat, 0, len(accumulators))
 	for _, agg := range accumulators {
@@ -6603,6 +6682,9 @@ func clientAPIStatsFromAccumulators(accumulators map[string]*clientAPIStatAccumu
 			continue
 		}
 		stat := agg.stat
+		if stat.TotalRequests <= 0 || (isUnknownClientAPIValue(stat.APIKey) && strings.TrimSpace(stat.APIKeyHash) == "") {
+			continue
+		}
 		stat.Models = make([]ClientAPIModelStat, 0, len(agg.models))
 		for _, model := range agg.models {
 			if model == nil {
@@ -6897,6 +6979,11 @@ func mergeFinalizedProviderStats(dst []ModelProviderStat, src []ModelProviderSta
 func normalizeImportedClientAPIIdentity(detail RequestDetail) RequestDetail {
 	label := canonicalClientAPIKey(detail.APIKey)
 	hash := strings.TrimSpace(detail.APIKeyHash)
+	if isUnknownClientAPIValue(label) {
+		detail.APIKey = ""
+		detail.APIKeyHash = ""
+		return detail
+	}
 	alreadyMasked := label != "" && strings.Contains(label, redactedMarker)
 	if label != "" && !alreadyMasked {
 		hash = hashAPIKey(label)
@@ -6917,6 +7004,11 @@ func normalizeImportedClientAPIIdentity(detail RequestDetail) RequestDetail {
 
 func normalizeStoredClientAPIIdentity(detail RequestDetail) RequestDetail {
 	label := canonicalClientAPIKey(detail.APIKey)
+	if isUnknownClientAPIValue(label) {
+		detail.APIKey = ""
+		detail.APIKeyHash = ""
+		return detail
+	}
 	if label == "" {
 		detail.APIKey = ""
 		detail.APIKeyHash = strings.TrimSpace(detail.APIKeyHash)

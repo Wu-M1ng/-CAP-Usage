@@ -1398,6 +1398,63 @@ test('dashboard distribution section renders token-only charts with one cost col
   assert.doesNotMatch(html, /actual|standard|实际消费|标准消费/i);
 });
 
+test('token trend legend exposes independent visibility controls and detailed hover data', async () => {
+  const { context, document } = createDashboardHarness({
+    range: '24h',
+    summaryUsage: {
+      token_parts_by_hour: {
+        '10': { input_tokens: 100, output_tokens: 70, cache_read_tokens: 20, cache_write_tokens: 8 },
+        '11': { input_tokens: 140, output_tokens: 90, cache_read_tokens: 30, cache_write_tokens: 12 },
+      },
+      tokens_by_hour: { '10': 198, '11': 272 },
+    },
+  });
+  await waitFor(() => document.getElementById('tokenUsageTrend').innerHTML.includes('tokenTrendHit'));
+  const legend = document.getElementById('tokenTrendLegend').innerHTML;
+  const chart = document.getElementById('tokenUsageTrend').innerHTML;
+  assert.match(legend, /data-token-series="cacheRate"/);
+  assert.match(legend, /aria-pressed="true"/);
+  assert.match(chart, /data-tooltip=/);
+  assert.match(chart, /tokenTrendHoverLine/);
+  assert.match(chart, /stroke-dasharray="4 3"/);
+  assert.match(chart, /fill-opacity="0\.1"/);
+  assert.ok(typeof context.setTokenTrendSeriesVisible === 'function');
+});
+
+test('dashboard normalizes endpoint variants in distribution data', async () => {
+  const { context, document } = createDashboardHarness({
+    endpointStats: [{
+      endpoint: 'POST https://api.example.test/responses?stream=true',
+      total_requests: 2,
+      total_tokens: 20,
+      models: [{ model: 'gpt-4.1', total_requests: 2, total_tokens: 20 }],
+    }],
+  });
+  await waitFor(() => document.getElementById('endpointDistribution').innerHTML.includes('/v1/responses'));
+  assert.strictEqual(context.normalizeDashboardEndpoint('/responses/'), '/v1/responses');
+  assert.strictEqual(context.normalizeDashboardEndpoint('https://api.example.test/v1/responses?x=1'), '/v1/responses');
+  assert.match(document.getElementById('endpointDistribution').innerHTML, /\/v1\/responses/);
+  assert.doesNotMatch(document.getElementById('endpointDistribution').innerHTML, /unknown/);
+});
+
+test('token trend visibility controls persist and filter chart tooltips', async () => {
+  const { context, document } = createDashboardHarness({
+    range: '24h',
+    summaryUsage: {
+      token_parts_by_hour: {
+        '10': { input_tokens: 100, output_tokens: 70, cache_read_tokens: 20, cache_write_tokens: 8 },
+      },
+      tokens_by_hour: { '10': 198 },
+    },
+  });
+  await waitFor(() => document.getElementById('tokenUsageTrend').innerHTML.includes('data-token-series="input"'));
+  context.setTokenTrendSeriesVisible('input', false);
+  assert.match(document.getElementById('tokenTrendLegend').innerHTML, /data-token-series="input"[^>]*aria-pressed="false"/);
+  assert.doesNotMatch(document.getElementById('tokenUsageTrend').innerHTML, /data-token-series="input"/);
+  assert.strictEqual(JSON.parse(context.localStorage.getItem('cpa-usage-token-trend-series-v1')).input, false);
+  context.setTokenTrendSeriesVisible('input', true);
+});
+
 test('dashboard distribution translations exist in every supported language', () => {
   const { context } = createDashboardHarness();
   const keys = [

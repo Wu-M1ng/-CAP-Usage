@@ -59,12 +59,103 @@ func TestDashboardSummaryReturnsNoDetails(t *testing.T) {
 	}
 }
 
+func TestNormalizeDashboardEndpointCanonicalizesResponsesPaths(t *testing.T) {
+	tests := map[string]string{
+		"/v1/responses": "/v1/responses",
+		"v1/responses":  "/v1/responses",
+		"/responses":    "/v1/responses",
+		"responses":     "/v1/responses",
+		"POST https://api.example.test/v1/responses?stream=true": "/v1/responses",
+		"/v1/chat/completions/":                                  "/v1/chat/completions",
+		"":                                                       "",
+	}
+	for input, want := range tests {
+		if got := normalizeRequestEndpoint(input); got != want {
+			t.Fatalf("normalizeRequestEndpoint(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestEnrichRecordedUsageMovesUnknownClientAPIToRealKey(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, RetentionDays: 0, StorageEnabled: false})
+	when := time.Now().Add(-time.Minute)
+	native := UsageRecord{
+		Provider:    "openai-compatible",
+		Model:       "gpt-4.1",
+		RequestedAt: when,
+		Detail:      UsageDetail{InputTokens: 100, OutputTokens: 40, TotalTokens: 140},
+	}
+	stats.Record(native)
+	before := stats.SummaryWithoutDetails()
+	if before.Usage.TotalRequests != 1 || len(before.ClientAPIStats) != 0 {
+		t.Fatalf("before enrichment = usage %#v client api %#v, want global totals and no unknown client group", before.Usage, before.ClientAPIStats)
+	}
+
+	enriched := native
+	enriched.APIKey = "sk-client-dashboard-test-0000xx"
+	enriched.Endpoint = "POST https://api.example.test/v1/responses?stream=true"
+	if !stats.EnrichRecordedUsage(native, enriched) {
+		t.Fatal("EnrichRecordedUsage() = false, want metadata update")
+	}
+
+	after := stats.SummaryWithoutDetails()
+	if after.Usage.TotalRequests != 1 || after.Usage.TotalTokens != 140 {
+		t.Fatalf("global usage after enrichment = %#v, want unchanged 1/140", after.Usage)
+	}
+	if len(after.ClientAPIStats) != 1 || after.ClientAPIStats[0].APIKey != "s******" || after.ClientAPIStats[0].TotalRequests != 1 {
+		t.Fatalf("client api stats after enrichment = %#v, want one real key group", after.ClientAPIStats)
+	}
+	for _, stat := range after.EndpointStats {
+		if stat.Endpoint == "unknown" && stat.TotalRequests > 0 {
+			t.Fatalf("endpoint stats retained unknown request: %#v", after.EndpointStats)
+		}
+	}
+	if len(after.EndpointStats) != 1 || after.EndpointStats[0].Endpoint != "/v1/responses" {
+		t.Fatalf("endpoint stats after enrichment = %#v, want canonical responses endpoint", after.EndpointStats)
+	}
+}
+
+func TestEnrichRecordedUsageMovesUnknownClientAPIToRealKeyInSQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage-statistics.db")
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, RetentionDays: 0, StorageEnabled: true, StoragePath: path})
+	defer stats.Close()
+	when := time.Now().Add(-time.Minute)
+	native := UsageRecord{
+		Provider:    "openai-compatible",
+		Model:       "gpt-4.1",
+		RequestedAt: when,
+		Detail:      UsageDetail{InputTokens: 50, OutputTokens: 25, TotalTokens: 75},
+	}
+	stats.Record(native)
+	enriched := native
+	enriched.APIKey = "sk-client-sqlite-test-0000xx"
+	enriched.Endpoint = "https://api.example.test/v1/responses?foo=bar"
+	if !stats.EnrichRecordedUsage(native, enriched) {
+		t.Fatal("EnrichRecordedUsage() = false, want SQLite metadata update")
+	}
+
+	summary := stats.SummaryWithoutDetails()
+	if len(summary.ClientAPIStats) != 1 || summary.ClientAPIStats[0].APIKey != "s******" {
+		t.Fatalf("SQLite client api stats = %#v, want one real key group", summary.ClientAPIStats)
+	}
+	if len(summary.EndpointStats) != 1 || summary.EndpointStats[0].Endpoint != "/v1/responses" {
+		t.Fatalf("SQLite endpoint stats = %#v, want canonical responses endpoint", summary.EndpointStats)
+	}
+	events := stats.QueryEvents(EventsQuery{Limit: 10})
+	if len(events.Events) != 1 || events.Events[0].APIKey != "s******" || events.Events[0].Endpoint != "/v1/responses" {
+		t.Fatalf("SQLite event after enrichment = %#v, want persisted key and endpoint", events.Events)
+	}
+}
+
 func TestDashboardModelStatsIncludeProviderBreakdown(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0})
 	stats.Record(UsageRecord{
 		Provider: "openai",
 		Model:    "openai/gpt-5.5",
+		APIKey:   "sk-dashboard-provider-test",
 		Detail: UsageDetail{
 			InputTokens:  100,
 			OutputTokens: 50,
@@ -74,6 +165,7 @@ func TestDashboardModelStatsIncludeProviderBreakdown(t *testing.T) {
 	stats.Record(UsageRecord{
 		Provider: "openrouter",
 		Model:    "openai/gpt-5.5",
+		APIKey:   "sk-dashboard-provider-test",
 		Detail: UsageDetail{
 			InputTokens:  200,
 			OutputTokens: 80,

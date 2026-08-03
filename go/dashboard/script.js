@@ -28,6 +28,15 @@ const priceReferenceResultLimit = 100;
 const visiblePollDelayMs = 30000;
 const hiddenPollDelayMs = 300000;
 const dashboardTimeZoneOffsetMs = 8 * 60 * 60 * 1000;
+const tokenTrendVisibilityStorageKey = 'cpa-usage-token-trend-series-v1';
+const tokenTrendSeriesCatalog = [
+  { key: 'input', color: '#2563eb', labelKey: 'token_input' },
+  { key: 'output', color: '#14b8a6', labelKey: 'token_output' },
+  { key: 'cacheCreation', color: '#f59e0b', labelKey: 'token_cache_creation' },
+  { key: 'cacheRead', color: '#8b5cf6', labelKey: 'token_cache_read' },
+  { key: 'cacheRate', color: '#a855f7', labelKey: 'token_cache_rate', rate: true },
+];
+let tokenTrendVisibility = null;
 let apiDetailSeq = 0;
 const apiDetailCache = new Map();
 const conditionalPayloadCache = new Map();
@@ -1238,6 +1247,26 @@ function distributionCost(row) {
   return aggregateCost(row, modelPrices, manualModelPrices);
 }
 
+function normalizeDashboardEndpoint(raw) {
+  let value = String(raw || '').trim();
+  if (!value || /^(unknown|未知|未知端点)$/i.test(value)) return '';
+  const method = value.match(/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)/i);
+  if (method) value = method[1];
+  try {
+    const parsed = new URL(value, 'http://dashboard.local');
+    if (parsed.pathname) value = parsed.pathname;
+  } catch (e) {
+    const queryIndex = value.search(/[?#]/);
+    if (queryIndex >= 0) value = value.slice(0, queryIndex);
+  }
+  value = value.trim();
+  if (!value) return '';
+  if (!value.startsWith('/')) value = '/' + value;
+  value = value.replace(/\/{2,}/g, '/').replace(/\/$/, '');
+  if (value === '/responses') value = '/v1/responses';
+  return value === '/' ? '' : value;
+}
+
 function distributionRowsForPanel(panelData) {
   const usage = panelData && panelData.usage || {};
   const modelRows = (panelData && panelData.model_stats || []).map((row) => ({
@@ -1253,7 +1282,7 @@ function distributionRowsForPanel(panelData) {
     cost: distributionCost({ models: Object.entries(row.models || {}).map(([model, stat]) => Object.assign({ model }, stat)) }),
   }));
   const endpointRows = (panelData && panelData.endpoint_stats || []).map((row) => ({
-    name: row.endpoint === 'unknown' ? t('unknown_endpoint') : (row.endpoint || t('unknown_endpoint')),
+    name: normalizeDashboardEndpoint(row.endpoint) || t('unknown_endpoint'),
     requests: num(row.total_requests),
     tokens: num(row.total_tokens),
     cost: distributionCost(row),
@@ -1378,17 +1407,54 @@ function tokenTrendPoints(panelData) {
   return keys.map((key) => tokenTrendPoint(key, hourly, source, totals));
 }
 
-function tokenTrendTooltip(point) {
+function tokenTrendSeriesDefinitions() {
+  return tokenTrendSeriesCatalog.map((item) => Object.assign({}, item, { label: t(item.labelKey) }));
+}
+
+function tokenTrendVisibilityState() {
+  if (tokenTrendVisibility) return tokenTrendVisibility;
+  tokenTrendVisibility = {};
+  tokenTrendSeriesCatalog.forEach((item) => { tokenTrendVisibility[item.key] = true; });
+  try {
+    const saved = JSON.parse(localStorage.getItem(tokenTrendVisibilityStorageKey) || 'null');
+    if (saved && typeof saved === 'object') {
+      tokenTrendSeriesCatalog.forEach((item) => {
+        if (typeof saved[item.key] === 'boolean') tokenTrendVisibility[item.key] = saved[item.key];
+      });
+    }
+  } catch (e) { /* ignore unavailable or malformed local storage */ }
+  return tokenTrendVisibility;
+}
+
+function saveTokenTrendVisibility() {
+  try {
+    localStorage.setItem(tokenTrendVisibilityStorageKey, JSON.stringify(tokenTrendVisibilityState()));
+  } catch (e) { /* ignore unavailable local storage */ }
+}
+
+function tokenTrendSeriesEnabled(key) {
+  return tokenTrendVisibilityState()[key] !== false;
+}
+
+function setTokenTrendSeriesVisible(key, visible) {
+  const item = tokenTrendSeriesCatalog.find((series) => series.key === key);
+  if (!item) return;
+  const state = tokenTrendVisibilityState();
+  state[key] = typeof visible === 'boolean' ? visible : !state[key];
+  saveTokenTrendVisibility();
+  renderTokenUsageChart(dashboardPanelData());
+}
+
+function tokenTrendTooltip(point, activeSeries) {
   const metric = function (label, value, color) {
     return '<div class="tooltipRow"><span><i class="tooltipSwatch" style="background:' + color + '"></i>' + esc(label) + '</span><strong>' + esc(formatInteger(value)) + '</strong></div>';
   };
+  const series = activeSeries || tokenTrendSeriesDefinitions().filter((item) => tokenTrendSeriesEnabled(item.key));
+  const rows = series.map((item) => item.rate
+    ? '<div class="tooltipRow"><span><i class="tooltipSwatch" style="background:' + item.color + '"></i>' + esc(item.label) + '</span><strong>' + esc(pct(point.cacheRate)) + '</strong></div>'
+    : metric(item.label, point[item.key], item.color)).join('');
   return '<div class="tooltipTitle">' + esc(point.tooltipLabel || point.label) + '</div>' +
-    '<div class="tooltipGrid">' +
-    metric(t('token_input'), point.input, '#2563eb') +
-    metric(t('token_output'), point.output, '#14b8a6') +
-    metric(t('token_cache_creation'), point.cacheCreation, '#f59e0b') +
-    metric(t('token_cache_read'), point.cacheRead, '#8b5cf6') +
-    '<div class="tooltipRow"><span>' + esc(t('token_cache_rate')) + '</span><strong>' + esc(pct(point.cacheRate)) + '</strong></div>' +
+    '<div class="tooltipGrid">' + rows +
     '<div class="tooltipRow tooltipTotal"><span>' + esc(t('token_total')) + '</span><strong>' + esc(formatInteger(point.total)) + '</strong></div>' +
     '</div>';
 }
@@ -1412,18 +1478,91 @@ function tokenTrendHover(target, active) {
   line.setAttribute('visibility', 'visible');
 }
 
+function tokenTrendMonotonePath(points, valueFn, x, y) {
+  if (!points.length) return '';
+  const coords = points.map((point, index) => ({
+    x: x(index),
+    y: y(valueFn(point)),
+  }));
+  if (coords.length === 1) return 'M' + coords[0].x.toFixed(2) + ' ' + coords[0].y.toFixed(2);
+
+  const count = coords.length;
+  const h = [];
+  const delta = [];
+  for (let i = 0; i < count - 1; i++) {
+    h[i] = coords[i + 1].x - coords[i].x;
+    delta[i] = h[i] ? (coords[i + 1].y - coords[i].y) / h[i] : 0;
+  }
+  const tangent = Array(count).fill(0);
+  if (count === 2) {
+    tangent[0] = delta[0];
+    tangent[1] = delta[0];
+  } else {
+    const endpointSlope = function (h0, h1, d0, d1) {
+      let slope = ((2 * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+      if (Math.sign(slope) !== Math.sign(d0)) slope = 0;
+      else if (Math.sign(d0) !== Math.sign(d1) && Math.abs(slope) > Math.abs(3 * d0)) slope = 3 * d0;
+      return slope;
+    };
+    tangent[0] = endpointSlope(h[0], h[1], delta[0], delta[1]);
+    tangent[count - 1] = endpointSlope(h[count - 2], h[count - 3], delta[count - 2], delta[count - 3]);
+    for (let i = 1; i < count - 1; i++) {
+      if (delta[i - 1] * delta[i] <= 0) tangent[i] = 0;
+      else tangent[i] = (h[i - 1] + h[i]) / ((h[i - 1] + 2 * h[i]) / delta[i - 1] + (2 * h[i - 1] + h[i]) / delta[i]);
+    }
+  }
+  for (let i = 0; i < count - 1; i++) {
+    if (delta[i] === 0) {
+      tangent[i] = 0;
+      tangent[i + 1] = 0;
+      continue;
+    }
+    const a = tangent[i] / delta[i];
+    const b = tangent[i + 1] / delta[i];
+    const norm = a * a + b * b;
+    if (norm > 9) {
+      const scale = 3 / Math.sqrt(norm);
+      tangent[i] = scale * a * delta[i];
+      tangent[i + 1] = scale * b * delta[i];
+    }
+  }
+
+  let path = 'M' + coords[0].x.toFixed(2) + ' ' + coords[0].y.toFixed(2);
+  for (let i = 0; i < count - 1; i++) {
+    const third = h[i] / 3;
+    path += ' C' + (coords[i].x + third).toFixed(2) + ' ' + (coords[i].y + tangent[i] * third).toFixed(2)
+      + ' ' + (coords[i + 1].x - third).toFixed(2) + ' ' + (coords[i + 1].y - tangent[i + 1] * third).toFixed(2)
+      + ' ' + coords[i + 1].x.toFixed(2) + ' ' + coords[i + 1].y.toFixed(2);
+  }
+  return path;
+}
+
+function tokenTrendAreaPath(points, valueFn, x, y, baseline) {
+  if (!points.length) return '';
+  const line = tokenTrendMonotonePath(points, valueFn, x, y);
+  return line + ' L' + x(points.length - 1).toFixed(2) + ' ' + baseline.toFixed(2)
+    + ' L' + x(0).toFixed(2) + ' ' + baseline.toFixed(2) + ' Z';
+}
+
 function renderTokenUsageChart(panelData) {
   const svg = $('tokenUsageTrend');
   const legend = $('tokenTrendLegend');
   if (!svg || !legend) return;
   const points = tokenTrendPoints(panelData);
-  const series = [
-    { key: 'input', label: t('token_input'), color: '#2563eb' },
-    { key: 'output', label: t('token_output'), color: '#14b8a6' },
-    { key: 'cacheCreation', label: t('token_cache_creation'), color: '#f59e0b' },
-    { key: 'cacheRead', label: t('token_cache_read'), color: '#8b5cf6' },
-  ];
-  legend.innerHTML = series.map((item) => '<span class="tokenTrendLegendItem"><span class="distributionLegendDot" style="background:' + item.color + '"></span>' + esc(item.label) + '</span>').join('') + '<span class="tokenTrendLegendItem"><span class="distributionLegendDot" style="background:#64748b"></span>' + esc(t('token_cache_rate')) + '</span>';
+  const series = tokenTrendSeriesDefinitions();
+  const activeSeries = series.filter((item) => tokenTrendSeriesEnabled(item.key));
+  const tokenSeries = activeSeries.filter((item) => !item.rate);
+  const rateEnabled = activeSeries.some((item) => item.rate);
+  legend.innerHTML = series.map((item) => {
+    const enabled = tokenTrendSeriesEnabled(item.key);
+    return '<button type="button" class="tokenTrendLegendItem' + (enabled ? '' : ' is-muted') + '" data-token-series="' + item.key + '" aria-pressed="' + String(enabled) + '" aria-label="' + esc(item.label) + '" title="' + esc(item.label) + '"><span class="distributionLegendDot" style="background:' + item.color + '"></span><span>' + esc(item.label) + '</span></button>';
+  }).join('');
+  legend.onclick = function (event) {
+    const target = event && event.target;
+    const button = target && typeof target.closest === 'function' ? target.closest('[data-token-series]') : target;
+    if (!button || typeof button.getAttribute !== 'function') return;
+    setTokenTrendSeriesVisible(button.getAttribute('data-token-series'));
+  };
   if (!points.length) {
     svg.setAttribute('viewBox', '0 0 720 190');
     svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" class="distributionAxisText">' + esc(t('distribution_empty')) + '</text>';
@@ -1432,32 +1571,39 @@ function renderTokenUsageChart(panelData) {
   }
   const W = 720, H = 190, PL = 42, PR = 42, PT = 16, PB = 28;
   const chartW = W - PL - PR, chartH = H - PT - PB;
-  const maxTokens = Math.max(1, ...points.flatMap((point) => series.map((item) => point[item.key])));
+  const axisSeries = tokenSeries.length ? tokenSeries : series.filter((item) => !item.rate);
+  const maxTokens = Math.max(1, ...points.flatMap((point) => axisSeries.map((item) => point[item.key])));
   const count = Math.max(points.length, 2);
   const x = (index) => PL + (index + 0.5) * chartW / count;
   const yToken = (value) => PT + chartH - value / maxTokens * chartH;
+  const yRate = (value) => PT + chartH - value / 100 * chartH;
   let html = '';
   for (let i = 0; i <= 3; i++) {
     const y = PT + chartH - i / 3 * chartH;
-    html += '<line x1="' + PL + '" x2="' + (W - PR) + '" y1="' + y + '" y2="' + y + '" class="distributionAxisLine"/><text x="' + (PL - 6) + '" y="' + (y + 3) + '" text-anchor="end" class="distributionAxisText">' + esc(compact(maxTokens * i / 3)) + '</text><text x="' + (W - PR + 6) + '" y="' + (y + 3) + '" class="distributionAxisText">' + (i * 100 / 3).toFixed(0) + '%</text>';
+    html += '<line x1="' + PL + '" x2="' + (W - PR) + '" y1="' + y + '" y2="' + y + '" class="distributionAxisLine"/><text x="' + (PL - 6) + '" y="' + (y + 3) + '" text-anchor="end" class="distributionAxisText">' + esc(compact(maxTokens * i / 3)) + '</text>' + (rateEnabled ? '<text x="' + (W - PR + 6) + '" y="' + (y + 3) + '" class="distributionAxisText">' + (i * 100 / 3).toFixed(0) + '%</text>' : '');
   }
-  series.forEach((item) => {
-    const path = points.map((point, index) => (index ? 'L' : 'M') + x(index) + ' ' + yToken(point[item.key])).join(' ');
-    html += '<path d="' + path + '" class="distributionLine tokenTrendSeries" stroke="' + item.color + '"></path>';
+  tokenSeries.forEach((item) => {
+    const valueFn = (point) => point[item.key];
+    const path = tokenTrendMonotonePath(points, valueFn, x, yToken);
+    const area = tokenTrendAreaPath(points, valueFn, x, yToken, PT + chartH);
+    html += '<path d="' + area + '" class="tokenTrendArea" data-token-series="' + item.key + '" fill="' + item.color + '" fill-opacity="0.1" stroke="none"></path>';
+    html += '<path d="' + path + '" class="distributionLine tokenTrendSeries" data-token-series="' + item.key + '" stroke="' + item.color + '"></path>';
   });
-  const ratePath = points.map((point, index) => (index ? 'L' : 'M') + x(index) + ' ' + (PT + chartH - point.cacheRate / 100 * chartH)).join(' ');
-  html += '<path d="' + ratePath + '" class="distributionLine tokenTrendRate" stroke="#64748b" stroke-dasharray="4 3"></path>';
+  if (rateEnabled) {
+    const ratePath = tokenTrendMonotonePath(points, (point) => point.cacheRate, x, yRate);
+    html += '<path d="' + ratePath + '" class="distributionLine tokenTrendRate" data-token-series="cacheRate" stroke="#a855f7" stroke-dasharray="4 3"></path>';
+  }
   html += '<line x1="' + x(0) + '" x2="' + x(0) + '" y1="' + PT + '" y2="' + (PT + chartH) + '" class="tokenTrendHoverLine" visibility="hidden"/>';
   const hitWidth = chartW / count;
   points.forEach((point, index) => {
-    const tooltip = esc(tokenTrendTooltip(point));
+    const tooltip = esc(tokenTrendTooltip(point, activeSeries));
     const hitX = Math.max(PL, x(index) - hitWidth / 2);
     html += '<rect class="tokenTrendHit" x="' + hitX + '" y="' + PT + '" width="' + hitWidth + '" height="' + chartH + '" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" aria-label="' + esc(point.tooltipLabel || point.label) + ' ' + esc(t('token_total')) + ' ' + esc(formatInteger(point.total)) + '"/>';
   });
   points.forEach((point, index) => {
-    const tooltip = esc(tokenTrendTooltip(point));
-    series.forEach((item) => { html += '<circle cx="' + x(index) + '" cy="' + yToken(point[item.key]) + '" r="3" class="distributionPoint tokenTrendPoint" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" fill="' + item.color + '"><title>' + esc(point.label + ' ' + item.label + ': ' + compact(point[item.key])) + '</title></circle>'; });
-    html += '<circle cx="' + x(index) + '" cy="' + (PT + chartH - point.cacheRate / 100 * chartH) + '" r="3" class="distributionPoint tokenTrendPoint" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" fill="#64748b"><title>' + esc(point.label + ' ' + t('token_cache_rate') + ': ' + pct(point.cacheRate)) + '</title></circle>';
+    const tooltip = esc(tokenTrendTooltip(point, activeSeries));
+    tokenSeries.forEach((item) => { html += '<circle cx="' + x(index) + '" cy="' + yToken(point[item.key]) + '" r="3" class="distributionPoint tokenTrendPoint" data-token-series="' + item.key + '" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" fill="' + item.color + '"><title>' + esc(point.label + ' ' + item.label + ': ' + compact(point[item.key])) + '</title></circle>'; });
+    if (rateEnabled) html += '<circle cx="' + x(index) + '" cy="' + yRate(point.cacheRate) + '" r="3" class="distributionPoint tokenTrendPoint" data-token-series="cacheRate" data-trend-x="' + x(index) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" fill="#a855f7"><title>' + esc(point.label + ' ' + t('token_cache_rate') + ': ' + pct(point.cacheRate)) + '</title></circle>';
     if (index % Math.max(1, Math.ceil(points.length / 10)) === 0 || index === points.length - 1) html += '<text x="' + x(index) + '" y="' + (H - 6) + '" text-anchor="middle" class="distributionAxisText">' + esc(point.label) + '</text>';
   });
   svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
@@ -1470,6 +1616,8 @@ function renderDistributionDashboard() {
   const containers = ['modelDistributionDonut', 'upstreamDistributionDonut', 'endpointDistributionDonut', 'tokenUsageTrend'];
   if (!panelData) {
     containers.forEach((id) => { const element = $(id); if (element) element.innerHTML = ''; });
+    const legend = $('tokenTrendLegend');
+    if (legend) legend.innerHTML = '';
     return;
   }
   const rows = distributionRowsForPanel(panelData);
@@ -2063,7 +2211,7 @@ function addDetailToTokenParts(usage, d, bucket) {
   addTokenParts(usage.token_parts_by_hour, bucket.hour);
 }
 function addDetailToEndpointAgg(endpointAgg, d) {
-  const endpoint = String(d && d.endpoint || '').trim() || 'unknown';
+  const endpoint = normalizeDashboardEndpoint(d && d.endpoint) || 'unknown';
   const row = endpointAgg.get(endpoint) || {
     endpoint,
     total_requests: 0,

@@ -33,10 +33,23 @@ func looksLikeSecretKey(raw string) bool {
 
 func maskAPIKey(raw string) string {
 	s := strings.TrimSpace(raw)
+	if isUnknownClientAPIValue(s) {
+		return ""
+	}
 	for _, ch := range s {
 		return string(ch) + redactedMarker
 	}
 	return ""
+}
+
+func isUnknownClientAPIValue(raw string) bool {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "", "unknown", "(unknown)", "unknown api", "\u672a\u77e5", "\u672a\u77e5 api":
+		return true
+	default:
+		return strings.HasPrefix(value, "\u672a") && strings.HasSuffix(value, redactedMarker)
+	}
 }
 
 func isFirstCharacterAPIKeyMask(raw string) bool {

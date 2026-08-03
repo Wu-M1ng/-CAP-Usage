@@ -625,6 +625,9 @@ func (c *usageFallbackCoordinator) HandleNative(record UsageRecord) (UsageRecord
 }
 
 func enrichUsageRecord(record UsageRecord, enrichment UsageRecord) UsageRecord {
+	if strings.TrimSpace(record.APIKey) == "" {
+		record.APIKey = strings.TrimSpace(enrichment.APIKey)
+	}
 	if strings.TrimSpace(record.Endpoint) == "" {
 		record.Endpoint = strings.TrimSpace(enrichment.Endpoint)
 	}

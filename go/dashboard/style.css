@@ -286,13 +286,17 @@ section.panel{margin-bottom:14px}
 .tokenTrendWrap{height:170px;min-width:0}
 .tokenTrendSvg{width:100%;height:170px;display:block}
 .tokenTrendLegend{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:8px;color:var(--cpa-text-dim);font-size:11px}
-.tokenTrendLegendItem{display:inline-flex;align-items:center;white-space:nowrap}
+.tokenTrendLegendItem{display:inline-flex;align-items:center;gap:0;white-space:nowrap;padding:2px 0;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer;transition:opacity .15s,color .15s}
+.tokenTrendLegendItem:hover,.tokenTrendLegendItem:focus-visible{color:var(--cpa-text-secondary)}
+.tokenTrendLegendItem:focus-visible{outline:2px solid var(--cpa-accent-soft);outline-offset:3px;border-radius:4px}
+.tokenTrendLegendItem.is-muted{opacity:.38}
 .distributionAxisLine{stroke:var(--cpa-border-light);stroke-width:1}
 .distributionAxisText{fill:var(--cpa-text-tertiary);font-size:10px}
 .distributionLine{fill:none;stroke-width:2.25;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.tokenTrendArea{pointer-events:none;transition:opacity .15s ease}
 .distributionPoint{stroke:var(--cpa-bg-surface);stroke-width:1.5;vector-effect:non-scaling-stroke}
-.tokenTrendSeries{filter:drop-shadow(0 1px 1px rgba(15,23,42,.12))}
-.tokenTrendRate{opacity:.9}
+.tokenTrendSeries{filter:drop-shadow(0 1px 1px rgba(15,23,42,.12));transition:opacity .15s ease}
+.tokenTrendRate{opacity:.95;transition:opacity .15s ease}
 .tokenTrendHit{fill:transparent;cursor:crosshair;outline:none;transition:fill .12s ease}
 .tokenTrendHit:hover,.tokenTrendHit:focus{fill:var(--cpa-accent-soft);fill-opacity:.45}
 .tokenTrendHoverLine{stroke:var(--cpa-text-tertiary);stroke-width:1;stroke-dasharray:3 4;pointer-events:none;vector-effect:non-scaling-stroke}
