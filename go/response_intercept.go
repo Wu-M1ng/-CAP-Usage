@@ -249,13 +249,15 @@ func usageRecordFromResponseValues(req ResponseInterceptRequest, responseValues 
 
 // usageRecordFromStreamValues mirrors usageRecordFromResponseValues but skips
 // the message_start-style "message.usage" path: in Claude streams that node
-// only carries the pre-generation input snapshot and would schedule a phantom
-// fallback that never matches the final usage of the request.
 func usageRecordFromStreamValues(req ResponseInterceptRequest, responseValues []any) (UsageRecord, bool) {
 	return usageRecordFromValues(req, responseValues, usageDetailStreamPaths)
 }
 
 func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, detailPaths []string) (UsageRecord, bool) {
+	sourceFormat := strings.ToLower(strings.TrimSpace(req.SourceFormat))
+	if sourceFormat == "openai-responses" || sourceFormat == "openai-response" {
+		return UsageRecord{}, false
+	}
 	detail, ok := usageDetailFromResponseValues(responseValues, detailPaths)
 	if !ok {
 		return UsageRecord{}, false

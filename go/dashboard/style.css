@@ -272,7 +272,8 @@ section.panel{margin-bottom:14px}
 .subtle{color:var(--cpa-text-tertiary);font-size:12px;line-height:1.5}
 .distributionDashboard{margin-bottom:14px}
 .distributionGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:24px}
-.distributionBlock{min-width:0;margin-bottom:12px}
+.distributionBlock{min-width:0;margin-bottom:12px;transition:transform .25s cubic-bezier(.4,0,.2,1),box-shadow .25s cubic-bezier(.4,0,.2,1)}
+.distributionBlock:hover{transform:translateY(-2px);box-shadow:var(--cpa-shadow-hover)}
 .distributionBlockHead{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:8px}
 .distributionBlockHead h3{margin:0;font-size:13px;font-weight:700}
 .distributionBody{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:center;min-width:0}
@@ -325,7 +326,8 @@ tbody td{transition:background-color .12s}
 
 /* ---- 指标网格 ---- */
 .detailGrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:14px}
-.metric{border:1px solid var(--cpa-border-light);border-radius:10px;padding:12px;background:var(--cpa-bg-raised);min-height:74px}
+.metric{border:1px solid var(--cpa-border-light);border-radius:10px;padding:12px;background:var(--cpa-bg-raised);min-height:74px;transition:transform .25s cubic-bezier(.4,0,.2,1),box-shadow .25s cubic-bezier(.4,0,.2,1),background .25s}
+.metric:hover{transform:translateY(-2px);box-shadow:var(--cpa-shadow-hover);background:var(--cpa-bg-surface)}
 .metricLabel{font-size:11px;color:var(--cpa-text-tertiary);font-weight:600;margin-bottom:8px;letter-spacing:.05em;text-transform:uppercase}
 .metricValue{font-size:20px;line-height:1.3;font-weight:750;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
 .metricMeta{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;font-size:11px;line-height:1.4}
@@ -485,3 +487,4 @@ html[data-cpa-theme="light"] .anomalyBar.muted{background:#f8f9fb;border-color:#
 
 /* ---- 动画偏好 ---- */
 @media(prefers-reduced-motion:reduce){*{transition-duration:0s!important;animation-duration:0s!important}}
+.distributionLegendDot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}

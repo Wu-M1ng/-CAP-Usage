@@ -1800,6 +1800,7 @@ function renderTrendSvg(points, range, color, barColor, mode) {
   if (!svg) return;
 
   var values = points.map(valueFn);
+  var realMax = values.length ? Math.max.apply(null, values) : 0;
   var maxVal = Math.max.apply(null, values.concat([1]));
   var minVal = Math.min.apply(null, values.concat([0]));
   var sumVal = values.reduce(function(a, b) { return a + b; }, 0);
@@ -1808,13 +1809,8 @@ function renderTrendSvg(points, range, color, barColor, mode) {
   var badgesEl = $('trendBadges');
   if (badgesEl) {
     badgesEl.innerHTML =
-      '<div class="trendBadge">峰值 Peak: <strong>' + esc(formatVal(maxVal)) + '</strong></div>' +
+      '<div class="trendBadge">峰值 Peak: <strong>' + esc(formatVal(realMax)) + '</strong></div>' +
       '<div class="trendBadge">均值 Avg: <strong>' + esc(formatVal(avgVal)) + '</strong></div>';
-  }
-
-  var subtleEl = $('trendSubtle');
-  if (subtleEl) {
-    subtleEl.textContent = (mode === 'hour' ? '按小时' : '按日') + '聚合的用量趋势图，可切换查看不同指标。';
   }
 
   var n = points.length;
