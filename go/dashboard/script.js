@@ -427,6 +427,36 @@ function renderStats() {
   drawSpark('tokenSpark', tokByHour, '#8b5cf6');
   drawSpark('rpmSpark', reqByHour.length ? reqByHour.map(v => v / 60) : [0], '#22c55e');
   drawSpark('costSpark', reqByHour.length ? reqByHour.map(v => (cost > 0 ? v / Math.max(u.total_requests || 1, 1) * cost : 0)) : [0], '#f59e0b');
+
+  // Trend tag badge helper
+  const updateCardTag = (cardId, firstHalfSum, secondHalfSum) => {
+    const el = $(cardId);
+    if (!el || !el.parentElement) return;
+    let labelEl = el.parentElement.querySelector('.label');
+    if (!labelEl) return;
+    let tag = labelEl.querySelector('.trendTag');
+    if (firstHalfSum > 0 && secondHalfSum !== undefined) {
+      const pctVal = ((secondHalfSum - firstHalfSum) / firstHalfSum) * 100;
+      const isUp = pctVal >= 0;
+      const text = (isUp ? '+' : '') + pctVal.toFixed(1) + '% ' + (isUp ? '↑' : '↓');
+      if (!tag) {
+        tag = document.createElement('span');
+        labelEl.appendChild(tag);
+      }
+      tag.className = 'trendTag ' + (isUp ? 'up' : 'down');
+      tag.textContent = text;
+    } else if (tag) {
+      tag.remove();
+    }
+  };
+
+  const reqH1 = reqByHour.slice(0, 12).reduce((a, b) => a + b, 0);
+  const reqH2 = reqByHour.slice(12).reduce((a, b) => a + b, 0);
+  const tokH1 = tokByHour.slice(0, 12).reduce((a, b) => a + b, 0);
+  const tokH2 = tokByHour.slice(12).reduce((a, b) => a + b, 0);
+
+  updateCardTag('totalRequests', reqH1, reqH2);
+  updateCardTag('totalTokens', tokH1, tokH2);
 }
 
 function storageTitle() {
@@ -495,6 +525,20 @@ function renderHealth() {
     cells.push('<div class="healthCell ' + (total ? 'active' : '') + '" data-health-idx="' + i + '" style="' + healthCellStyle(i, count, total, rate) + '"></div>');
   });
   $('healthGrid').innerHTML = cells.join('');
+  const dateLabelsEl = $('healthDateLabels');
+  if (dateLabelsEl) {
+    const dateItems = [];
+    for (let r = 0; r < 5; r++) {
+      const slot = grid[r * 96];
+      if (slot && slot.start) {
+        const dStr = formatDateTime(slot.start).slice(5, 10);
+        dateItems.push('<div class="healthDateLabel">' + esc(dStr) + '</div>');
+      } else {
+        dateItems.push('<div class="healthDateLabel">-</div>');
+      }
+    }
+    dateLabelsEl.innerHTML = dateItems.join('');
+  }
   const tip = $('tooltip');
   const showTip = function (cell) {
     if (!cell) return;
@@ -1334,6 +1378,7 @@ function renderDistributionTable(elementId, rows) {
     el.innerHTML = '<div class="distributionEmpty">' + esc(t('distribution_empty')) + '</div>';
     return;
   }
+  const totalTokens = sorted.reduce((sum, item) => sum + num(item.tokens), 0);
   const visible = sorted.slice(0, 6);
   const other = sorted.slice(6).reduce((row, item) => ({
     name: t('distribution_other'),
@@ -1344,7 +1389,8 @@ function renderDistributionTable(elementId, rows) {
   if (other.tokens > 0) visible.push(other);
   el.innerHTML = '<table><thead><tr><th>' + t('distribution_name') + '</th><th>' + t('col_requests') + '</th><th>' + t('col_tokens') + '</th><th>' + t('distribution_cost') + '</th></tr></thead><tbody>' + visible.map((row, index) => {
     const color = distributionColors[index % distributionColors.length];
-    return '<tr><td class="nameCell" title="' + esc(row.name) + '"><span class="distributionLegendDot" style="background:' + color + '"></span>' + esc(row.name) + '</td><td>' + formatInteger(row.requests) + '</td><td>' + compact(row.tokens) + '</td><td>' + formatUsd(row.cost) + '</td></tr>';
+    const pctVal = totalTokens > 0 ? Math.min(100, Math.max(0, (row.tokens / totalTokens) * 100)) : 0;
+    return '<tr><td class="nameCell" title="' + esc(row.name) + '"><span class="distributionLegendDot" style="background:' + color + '"></span>' + esc(row.name) + '<div class="progressPillBg"><div class="progressPillFill" style="width:' + pctVal.toFixed(1) + '%;background:' + color + '"></div></div></td><td>' + formatInteger(row.requests) + '</td><td>' + compact(row.tokens) + '</td><td>' + formatUsd(row.cost) + '</td></tr>';
   }).join('') + '</tbody></table>';
 }
 
@@ -1709,6 +1755,35 @@ function clearAnomalyBar() {
   bar.innerHTML = '';
 }
 
+function trendHover(target, active) {
+  var svg = target && (target.ownerSVGElement || target.parentNode);
+  if (!svg || typeof svg.querySelector !== 'function') return;
+  var line = svg.querySelector('.trendHoverLine');
+  if (!line) return;
+  if (!active || !target || typeof target.getAttribute !== 'function') {
+    line.setAttribute('visibility', 'hidden');
+    return;
+  }
+  var x = target.getAttribute('data-trend-x');
+  if (!x) {
+    line.setAttribute('visibility', 'hidden');
+    return;
+  }
+  line.setAttribute('x1', x);
+  line.setAttribute('x2', x);
+  line.setAttribute('visibility', 'visible');
+}
+
+function trendMetricLabel(metric) {
+  switch (metric) {
+    case 'requests': return t('trend_daily_requests') || t('col_requests');
+    case 'tokens': return t('trend_daily_tokens') || t('col_tokens');
+    case 'rpm': return t('trend_daily_rpm') || t('rpm');
+    case 'cost': return t('trend_daily_cost') || t('distribution_cost');
+    default: return t('col_tokens');
+  }
+}
+
 function renderTrendSvg(points, range, color, barColor, mode) {
   var valueFn, formatVal;
   if (trendMetric === 'requests') {
@@ -1721,17 +1796,44 @@ function renderTrendSvg(points, range, color, barColor, mode) {
     valueFn = function(p) { return p.cost; }; formatVal = function(v) { return formatUsd(v); };
   }
 
+  var svg = $('trendChart');
+  if (!svg) return;
+
   var values = points.map(valueFn);
   var maxVal = Math.max.apply(null, values.concat([1]));
   var minVal = Math.min.apply(null, values.concat([0]));
+  var sumVal = values.reduce(function(a, b) { return a + b; }, 0);
+  var avgVal = points.length ? sumVal / points.length : 0;
+
+  var badgesEl = $('trendBadges');
+  if (badgesEl) {
+    badgesEl.innerHTML =
+      '<div class="trendBadge">峰值 Peak: <strong>' + esc(formatVal(maxVal)) + '</strong></div>' +
+      '<div class="trendBadge">均值 Avg: <strong>' + esc(formatVal(avgVal)) + '</strong></div>';
+  }
+
+  var subtleEl = $('trendSubtle');
+  if (subtleEl) {
+    subtleEl.textContent = (mode === 'hour' ? '按小时' : '按日') + '聚合的用量趋势图，可切换查看不同指标。';
+  }
+
   var n = points.length;
   if (n < 2) n = 2;
 
   var W = 1200, H = 240, PL = 70, PR = 20, PT = 24, PB = 36;
   var chartW = W - PL - PR, chartH = H - PT - PB;
-  var barW = Math.max(3, Math.min(60, chartW / n - (mode === 'hour' ? 4 : 6)));
 
-  var html = '';
+  var x = function(index) { return PL + (index + 0.5) * (chartW / n); };
+  var yFn = function(value) { return PT + chartH - (maxVal > 0 ? (value / maxVal) * chartH : 0); };
+
+  var gradId = 'trendGradientDynamic';
+  var html = '<defs>' +
+    '<linearGradient id="' + gradId + '" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%" stop-color="' + color + '" stop-opacity="0.35"/>' +
+      '<stop offset="100%" stop-color="' + color + '" stop-opacity="0.0"/>' +
+    '</linearGradient>' +
+  '</defs>';
+
   // Y axis grid lines
   var ySteps = 4;
   for (var i = 0; i <= ySteps; i++) {
@@ -1741,45 +1843,53 @@ function renderTrendSvg(points, range, color, barColor, mode) {
     html += '<text x="' + (PL - 8) + '" y="' + (y + 4) + '" text-anchor="end" class="trendAxisText">' + esc(formatVal(yVal)) + '</text>';
   }
 
-  // Bars with color
+  // Hermite Spline smooth curve & area path
+  var pathD = tokenTrendMonotonePath(points, valueFn, x, yFn);
+  var areaD = tokenTrendAreaPath(points, valueFn, x, yFn, PT + chartH);
+
+  html += '<path d="' + areaD + '" class="trendArea" fill="url(#' + gradId + ')" stroke="none"/>';
+  html += '<path d="' + pathD + '" class="trendLine" fill="none" stroke="' + color + '" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>';
+
+  // Crosshair hover line
+  html += '<line x1="' + x(0) + '" x2="' + x(0) + '" y1="' + PT + '" y2="' + (PT + chartH) + '" class="trendHoverLine" visibility="hidden"/>';
+
+  // Invisible hover rects
+  var hitWidth = chartW / n;
+  var metricName = trendMetricLabel(trendMetric);
   points.forEach(function(p, i) {
     var v = valueFn(p);
-    var title = esc(p.label + ': ' + formatVal(v));
-    var barH = maxVal > 0 ? Math.max(2, (v / maxVal) * chartH) : 2;
-    var barX = PL + (i + 0.5) * (chartW / n) - barW / 2;
-    var barY = PT + chartH - barH;
-    html += '<rect x="' + barX + '" y="' + barY + '" width="' + barW + '" height="' + barH + '" fill="' + barColor + '" rx="2"><title>' + title + '</title></rect>';
+    var valStr = formatVal(v);
+    var tooltipHtml = '<div class="tooltipTitle">' + esc(p.label) + '</div>' +
+      '<div class="tooltipGrid">' +
+      '<div class="tooltipRow"><span><i class="tooltipSwatch" style="background:' + color + '"></i>' + esc(metricName) + '</span><strong>' + esc(valStr) + '</strong></div>' +
+      '</div>';
+    var tooltip = esc(tooltipHtml);
+    var hitX = Math.max(PL, x(i) - hitWidth / 2);
+    html += '<rect class="trendHit" x="' + hitX + '" y="' + PT + '" width="' + hitWidth + '" height="' + chartH + '" data-trend-x="' + x(i) + '" data-tooltip="' + tooltip + '" tabindex="0" focusable="true" role="img" aria-label="' + esc(p.label + ': ' + valStr) + '"/>';
   });
 
-  // Line
-  var lineD = '';
-  points.forEach(function(p, i) {
-    var v = valueFn(p);
-    var lx = PL + (i + 0.5) * (chartW / n);
-    var ly = PT + chartH - (maxVal > 0 ? (v / maxVal) * chartH : 0);
-    lineD += (i ? 'L' : 'M') + lx + ' ' + ly;
-  });
-  html += '<path d="' + lineD + '" fill="none" stroke="' + color + '" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>';
-
-  // Points
-  points.forEach(function(p, i) {
-    var v = valueFn(p);
-    var title = esc(p.label + ': ' + formatVal(v));
-    var lx = PL + (i + 0.5) * (chartW / n);
-    var ly = PT + chartH - (maxVal > 0 ? (v / maxVal) * chartH : 0);
-    html += '<circle cx="' + lx + '" cy="' + ly + '" r="4" fill="' + color + '"><title>' + title + '</title></circle>';
-  });
-
-  // X axis labels — show every Nth point
+  // Points & X axis labels
   var xStep = mode === 'hour' ? Math.max(1, Math.ceil(n / 12)) : Math.max(1, Math.ceil(n / 14));
   points.forEach(function(p, i) {
-    if (i % xStep !== 0 && i !== n - 1) return;
-    var lx = PL + (i + 0.5) * (chartW / n);
-    html += '<text x="' + lx + '" y="' + (H - 6) + '" text-anchor="middle" class="trendAxisText">' + esc(p.label) + '</text>';
+    var v = valueFn(p);
+    var valStr = formatVal(v);
+    var tooltipHtml = '<div class="tooltipTitle">' + esc(p.label) + '</div>' +
+      '<div class="tooltipGrid">' +
+      '<div class="tooltipRow"><span><i class="tooltipSwatch" style="background:' + color + '"></i>' + esc(metricName) + '</span><strong>' + esc(valStr) + '</strong></div>' +
+      '</div>';
+    var tooltip = esc(tooltipHtml);
+    var cx = x(i);
+    var cy = yFn(v);
+    html += '<circle cx="' + cx + '" cy="' + cy + '" r="4" class="trendPoint" data-trend-x="' + cx + '" data-tooltip="' + tooltip + '" fill="var(--cpa-bg-surface)" stroke="' + color + '" stroke-width="2.5" tabindex="0" focusable="true" role="img" aria-label="' + esc(p.label + ': ' + valStr) + '"><title>' + esc(p.label + ': ' + valStr) + '</title></circle>';
+
+    if (i % xStep === 0 || i === n - 1) {
+      html += '<text x="' + cx + '" y="' + (H - 6) + '" text-anchor="middle" class="trendAxisText">' + esc(p.label) + '</text>';
+    }
   });
 
-  $('trendChart').setAttribute('viewBox', '0 0 ' + W + ' ' + H);
-  $('trendChart').innerHTML = html;
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.innerHTML = html;
+  bindDashboardTooltip(svg, trendHover);
 
   clearAnomalyBar();
 }

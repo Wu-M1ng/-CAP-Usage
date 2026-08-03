@@ -1120,6 +1120,118 @@ func TestResponseInterceptFallbackDoesNotDoubleCountNativeMissingOptionalUsage(t
 	}
 }
 
+func TestResponseInterceptDeduplicatesOpenAIResponsesAndGeminiVariants(t *testing.T) {
+	previousStats := stats
+	previousFallbacks := usageFallbacks
+	previousDelay := usageFallbackRecordDelay
+	stats = NewRequestStatistics()
+	usageFallbacks = newUsageFallbackCoordinator()
+	usageFallbackRecordDelay = 25 * time.Millisecond
+	t.Cleanup(func() {
+		usageFallbacks.Flush()
+		usageFallbacks = previousFallbacks
+		usageFallbackRecordDelay = previousDelay
+		stats = previousStats
+	})
+
+	// Test 1: OpenAI Responses endpoint deduplication
+	respInterceptReq := ResponseInterceptRequest{
+		SourceFormat:   "openai-responses",
+		Model:          "gpt-4o",
+		RequestedModel: "gpt-4o",
+		RequestHeaders: map[string][]string{
+			"Authorization": {"Bearer sk-client-responses-test01"},
+		},
+		RequestBody: []byte(`{"model":"gpt-4o"}`),
+		Body:        []byte(`{"model":"gpt-4o","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}`),
+		StatusCode:  http.StatusOK,
+	}
+	respBody, err := json.Marshal(respInterceptReq)
+	if err != nil {
+		t.Fatalf("marshal responses intercept req: %v", err)
+	}
+	if _, err := handleResponseIntercept(respBody); err != nil {
+		t.Fatalf("handleResponseIntercept() error = %v", err)
+	}
+
+	nativeResponses := UsageRecord{
+		Provider:     "openai-responses",
+		ExecutorType: "OpenAIResponsesExecutor",
+		Model:        "gpt-4o",
+		Alias:        "gpt-4o",
+		APIKey:       "sk-client-responses-test01",
+		Endpoint:     "/v1/responses",
+		RequestedAt:  time.Now(),
+		Detail: UsageDetail{
+			InputTokens:  100,
+			OutputTokens: 50,
+			TotalTokens:  150,
+		},
+	}
+	nativeRespBody, err := json.Marshal(nativeResponses)
+	if err != nil {
+		t.Fatalf("marshal native responses record: %v", err)
+	}
+	if _, err := handleUsage(nativeRespBody); err != nil {
+		t.Fatalf("handleUsage() error = %v", err)
+	}
+
+	// Test 2: Gemini / AIStudio provider deduplication
+	geminiInterceptReq := ResponseInterceptRequest{
+		SourceFormat:   "gemini",
+		Model:          "gemini-2.5-flash",
+		RequestedModel: "gemini-2.5-flash",
+		RequestHeaders: map[string][]string{
+			"Authorization": {"Bearer sk-client-gemini-test02"},
+		},
+		RequestBody: []byte(`{"model":"gemini-2.5-flash"}`),
+		Body:        []byte(`{"model":"gemini-2.5-flash","usageMetadata":{"promptTokenCount":200,"candidatesTokenCount":80}}`),
+		StatusCode:  http.StatusOK,
+	}
+	geminiBody, err := json.Marshal(geminiInterceptReq)
+	if err != nil {
+		t.Fatalf("marshal gemini intercept req: %v", err)
+	}
+	if _, err := handleResponseIntercept(geminiBody); err != nil {
+		t.Fatalf("handleResponseIntercept() error = %v", err)
+	}
+
+	nativeGemini := UsageRecord{
+		Provider:     "aistudio",
+		ExecutorType: "GeminiExecutor",
+		Model:        "gemini-2.5-flash",
+		Alias:        "gemini-2.5-flash",
+		APIKey:       "sk-client-gemini-test02",
+		Endpoint:     "/v1beta/models/gemini-2.5-flash:generateContent",
+		RequestedAt:  time.Now(),
+		Detail: UsageDetail{
+			InputTokens:  200,
+			OutputTokens: 80,
+			TotalTokens:  280,
+		},
+	}
+	nativeGeminiBody, err := json.Marshal(nativeGemini)
+	if err != nil {
+		t.Fatalf("marshal native gemini record: %v", err)
+	}
+	if _, err := handleUsage(nativeGeminiBody); err != nil {
+		t.Fatalf("handleUsage() error = %v", err)
+	}
+
+	time.Sleep(3 * usageFallbackRecordDelay)
+	summary := stats.SummaryWithoutDetailsForRangeAt("24h", time.Now().Add(time.Second))
+	if summary.Usage.TotalRequests != 2 {
+		t.Fatalf("total requests = %d, want 2 (1 responses + 1 gemini) without double-counting", summary.Usage.TotalRequests)
+	}
+
+	events := stats.QueryEventsAt(EventsQuery{Range: "24h", Limit: 10}, time.Now().Add(time.Second))
+	for _, ev := range events.Events {
+		if ev.Endpoint == "" || ev.Endpoint == "-" {
+			t.Fatalf("found event with missing/hyphen endpoint: %#v", ev)
+		}
+	}
+}
+
 func TestResponseStreamChunkDoesNotDoubleCountNativeCodexUsage(t *testing.T) {
 	previousStats := stats
 	previousFallbacks := usageFallbacks

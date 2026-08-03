@@ -296,7 +296,7 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		AuthID:          authID,
 		AuthIndex:       fallbackAuthIndex(req.Metadata, authID),
 		AuthType:        fallbackAuthType(req.Metadata, authID),
-		Endpoint:        metadataString(req.Metadata, "request_path", "endpoint", "request_endpoint"),
+		Endpoint:        fallbackUsageEndpoint(req),
 		ReasoningEffort: metadataString(req.Metadata, "reasoning_effort"),
 		ServiceTier:     firstNonEmpty(metadataString(req.Metadata, "service_tier"), jsonStringPath(requestRoot, "service_tier")),
 		Stream:          req.Stream,
@@ -306,6 +306,23 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		Source:          metadataString(req.Metadata, "upstream_source", "provider_source", "selected_source"),
 		ResponseHeaders: req.ResponseHeaders,
 	}, true
+}
+
+func fallbackUsageEndpoint(req ResponseInterceptRequest) string {
+	if endpoint := metadataString(req.Metadata, "request_path", "endpoint", "request_endpoint", "path", "uri", "url", "route"); endpoint != "" {
+		return endpoint
+	}
+	source := strings.ToLower(strings.TrimSpace(req.SourceFormat))
+	switch {
+	case source == "openai-responses" || source == "openai-response":
+		return "/v1/responses"
+	case source == "openai":
+		return "/v1/chat/completions"
+	case strings.Contains(source, "gemini"):
+		return "/v1beta/models"
+	default:
+		return ""
+	}
 }
 
 func responseUsesAnthropicUsageAccounting(req ResponseInterceptRequest) bool {
@@ -885,12 +902,18 @@ func usageProviderFamily(provider string) string {
 	switch {
 	case value == "":
 		return ""
-	case strings.HasPrefix(value, "openai-compatible") || strings.HasPrefix(value, "openai-compatibility"):
+	case value == "openai" || value == "openai-response" || value == "openai-responses" ||
+		strings.HasPrefix(value, "openai-compatible") || strings.HasPrefix(value, "openai-compatibility"):
 		return "openai-compatible"
-	case value == "anthropic" || strings.HasPrefix(value, "anthropic-"):
+	case value == "anthropic" || strings.HasPrefix(value, "anthropic-") ||
+		value == "claude" || strings.HasPrefix(value, "claude-"):
 		return "claude"
-	case value == "claude" || strings.HasPrefix(value, "claude-"):
-		return "claude"
+	case value == "gemini" || value == "aistudio" || value == "vertex" || value == "google" ||
+		value == "geminicli" || value == "antigravity" || strings.HasPrefix(value, "gemini-") ||
+		strings.HasPrefix(value, "aistudio-") || strings.HasPrefix(value, "vertex-") ||
+		strings.HasPrefix(value, "geminicli-") || strings.HasPrefix(value, "antigravity-") ||
+		strings.HasPrefix(value, "antigravity.") || strings.HasPrefix(value, "antigravity_"):
+		return "gemini"
 	default:
 		return value
 	}
@@ -901,7 +924,7 @@ func fallbackUsageProvider(req ResponseInterceptRequest) string {
 	switch {
 	case source == "openai" || source == "openai-response" || source == "openai-responses":
 		return "openai-compatible"
-	case strings.Contains(source, "gemini"):
+	case strings.Contains(source, "gemini") || strings.Contains(source, "antigravity"):
 		return "gemini"
 	case strings.Contains(source, "claude") || strings.Contains(source, "anthropic"):
 		return "claude"

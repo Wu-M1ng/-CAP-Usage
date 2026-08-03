@@ -62,13 +62,13 @@
       <div><h2 data-i18n="health_title">服务健康监测</h2><div class="subtle" data-i18n="health_subtle">最近5天，15分钟一个网格；绿色代表成功率高，红色代表失败较多。</div></div>
       <div class="healthSummary"><span data-i18n="success_rate">成功率</span><span class="healthRate" id="healthRate">-</span><span class="ok" id="healthSuccess">成功 -</span><span class="bad" id="healthFailure">失败 -</span></div>
     </div>
-    <div class="healthScroller"><div class="healthGrid" id="healthGrid"></div></div>
+    <div class="healthScroller"><div class="healthGridWrap"><div class="healthDateLabels" id="healthDateLabels"></div><div class="healthGrid" id="healthGrid"></div></div></div>
     <div class="legend"><span data-i18n="legend_less">少</span><span class="legendDot" style="background:#ef4444"></span><span class="legendDot" style="background:#facc15"></span><span class="legendDot" style="background:#22c55e"></span><span data-i18n="legend_more">多</span><span data-i18n="legend_empty">灰色为无请求</span></div>
   </section>
   <section class="panel full">
     <div class="panelHead">
-      <div><h2 data-i18n="trend_title">用量趋势</h2><div class="subtle" data-i18n="trend_subtle">按日聚合的趋势图，可切换查看不同指标。</div></div>
-      <div class="toolbar"><label for="trendMetric" data-i18n="trend_metric_label">指标</label><select id="trendMetric" class="select"></select></div>
+      <div><h2 data-i18n="trend_title">用量趋势</h2><div class="subtle" id="trendSubtle" data-i18n="trend_subtle">按时间聚合的趋势图，可切换查看不同指标。</div></div>
+      <div class="toolbar"><div id="trendBadges" class="trendBadges"></div><label for="trendMetric" data-i18n="trend_metric_label">指标</label><select id="trendMetric" class="select"></select></div>
     </div>
     <div id="anomalyBar"></div>
     <div class="trendChartWrap"><svg id="trendChart" class="trendSvg"></svg></div>
