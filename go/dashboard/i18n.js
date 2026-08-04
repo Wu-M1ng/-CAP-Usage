@@ -29,6 +29,7 @@ var I18N_MAP = {
     rpm_meta: '最近30分钟请求',
     total_cost: '总花费',
     cost_meta: '按本页模型价格估算',
+    trend_previous_day: '较前一日 {0}',
 
     // ---- health panel ----
     health_title: '服务健康监测',
@@ -303,6 +304,7 @@ var I18N_MAP = {
     rpm_meta: '最近30分鐘請求',
     total_cost: '總花費',
     cost_meta: '依本頁模型價格估算',
+    trend_previous_day: '較前一日 {0}',
 
     health_title: '服務健康監測',
     health_subtle: '最近5天，15分鐘一個網格；綠色代表成功率高，紅色代表失敗較多。',
@@ -557,6 +559,7 @@ var I18N_MAP = {
     rpm_meta: 'Recent 30 min requests',
     total_cost: 'Total Cost',
     cost_meta: 'Estimated with model prices on this page',
+    trend_previous_day: '{0} vs previous day',
 
     health_title: 'Service Health',
     health_subtle: 'Last 5 days, 15-min slots. Green = high success rate, red = failures.',
@@ -811,6 +814,7 @@ var I18N_MAP = {
     rpm_meta: 'За последние 30 мин',
     total_cost: 'Общая стоимость',
     cost_meta: 'Оценка по ценам моделей',
+    trend_previous_day: '{0} к предыдущему дню',
 
     health_title: 'Здоровье сервиса',
     health_subtle: 'Последние 5 дней, интервалы по 15 мин. Зелёный = высокий успех, красный = много ошибок.',

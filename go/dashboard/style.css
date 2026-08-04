@@ -252,6 +252,7 @@ html[data-cpa-theme="light"] .btn.danger:hover{background:#fef2f2;border-color:#
 .stat.amber:before{background:#f59e0b}
 .label{color:var(--cpa-text-tertiary);font-size:11px;font-weight:600;margin-bottom:12px;letter-spacing:.06em;text-transform:uppercase;display:flex;justify-content:space-between;align-items:center}
 .trendTag{font-size:10px;font-weight:700;padding:1px 6px;border-radius:6px;background:var(--cpa-bg-pill);color:var(--cpa-text-dim)}
+.trendTag[hidden]{display:none}
 .trendTag.up{background:var(--cpa-storage-ok-bg);color:var(--cpa-storage-ok-text)}
 .trendTag.down{background:var(--cpa-storage-bad-bg);color:var(--cpa-storage-bad-text)}
 .value{font-size:28px;line-height:1.2;font-weight:750;letter-spacing:-.01em;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}

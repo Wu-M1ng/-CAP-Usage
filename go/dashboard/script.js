@@ -81,6 +81,11 @@ function localizedColon() { return String(typeof I18N_LANG === 'string' ? I18N_L
 function withLabel(key, value) { return t(key) + localizedColon() + value; }
 function formatInteger(value) { return fmt.format(num(value)); }
 function formatDateTime(value) { return new Date(value).toLocaleString(currentLocale()); }
+function formatHealthDateLabel(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '-';
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric' }).format(date);
+}
 function formatTime(value) { return new Date(value).toLocaleTimeString(currentLocale()); }
 function statusText(failed) { return failed ? t('failure_label') : t('success_label'); }
 function renderUpdated() {
@@ -394,6 +399,39 @@ function drawSpark(id, values, color) {
     + '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>';
 }
 
+function latestDailyComparison(values) {
+  const entries = Object.entries(values || {})
+    .filter(([day, value]) => /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Number(value)))
+    .map(([day, value]) => [day, num(value)])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  if (entries.length < 2) return null;
+  const previous = entries[entries.length - 2];
+  const current = entries[entries.length - 1];
+  return { current: current[1], previous: previous[1], currentDay: current[0], previousDay: previous[0] };
+}
+
+function updateCardTrend(tagId, comparison) {
+  const tag = $(tagId);
+  if (!tag) return;
+  if (!comparison || comparison.previous <= 0) {
+    tag.hidden = true;
+    tag.textContent = '';
+    if (typeof tag.removeAttribute === 'function') tag.removeAttribute('title');
+    else tag.title = '';
+    tag.setAttribute('aria-hidden', 'true');
+    return;
+  }
+  const pctVal = ((comparison.current - comparison.previous) / comparison.previous) * 100;
+  const isUp = pctVal >= 0;
+  const text = (isUp ? '+' : '') + pctVal.toFixed(1) + '%';
+  tag.hidden = false;
+  tag.textContent = text;
+  tag.className = 'trendTag ' + (isUp ? 'up' : 'down');
+  tag.title = t('trend_previous_day', text);
+  tag.setAttribute('aria-label', t('trend_previous_day', text));
+  tag.setAttribute('aria-hidden', 'false');
+}
+
 function renderStats() {
   if (!summaryData) return;
   const u = summaryData.usage;
@@ -428,35 +466,16 @@ function renderStats() {
   drawSpark('rpmSpark', reqByHour.length ? reqByHour.map(v => v / 60) : [0], '#22c55e');
   drawSpark('costSpark', reqByHour.length ? reqByHour.map(v => (cost > 0 ? v / Math.max(u.total_requests || 1, 1) * cost : 0)) : [0], '#f59e0b');
 
-  // Trend tag badge helper
-  const updateCardTag = (cardId, firstHalfSum, secondHalfSum) => {
-    const el = $(cardId);
-    if (!el || !el.parentElement) return;
-    let labelEl = el.parentElement.querySelector('.label');
-    if (!labelEl) return;
-    let tag = labelEl.querySelector('.trendTag');
-    if (firstHalfSum > 0 && secondHalfSum !== undefined) {
-      const pctVal = ((secondHalfSum - firstHalfSum) / firstHalfSum) * 100;
-      const isUp = pctVal >= 0;
-      const text = (isUp ? '+' : '') + pctVal.toFixed(1) + '% ' + (isUp ? '↑' : '↓');
-      if (!tag) {
-        tag = document.createElement('span');
-        labelEl.appendChild(tag);
-      }
-      tag.className = 'trendTag ' + (isUp ? 'up' : 'down');
-      tag.textContent = text;
-    } else if (tag) {
-      tag.remove();
-    }
-  };
-
-  const reqH1 = reqByHour.slice(0, 12).reduce((a, b) => a + b, 0);
-  const reqH2 = reqByHour.slice(12).reduce((a, b) => a + b, 0);
-  const tokH1 = tokByHour.slice(0, 12).reduce((a, b) => a + b, 0);
-  const tokH2 = tokByHour.slice(12).reduce((a, b) => a + b, 0);
-
-  updateCardTag('totalRequests', reqH1, reqH2);
-  updateCardTag('totalTokens', tokH1, tokH2);
+  const requestComparison = latestDailyComparison(u.requests_by_day);
+  const tokenComparison = latestDailyComparison(u.tokens_by_day);
+  const costComparison = latestDailyComparison(u.cost_by_day);
+  updateCardTrend('totalRequestsTrend', requestComparison);
+  updateCardTrend('totalTokensTrend', tokenComparison);
+  // RPM uses the same daily request rate as the request card, normalized to
+  // minutes. The percentage change is therefore identical, but the metric
+  // remains semantically tied to the RPM card.
+  updateCardTrend('rpmTrend', requestComparison);
+  updateCardTrend('totalCostTrend', costComparison);
 }
 
 function storageTitle() {
@@ -531,7 +550,7 @@ function renderHealth() {
     for (let r = 0; r < 5; r++) {
       const slot = grid[r * 96];
       if (slot && slot.start) {
-        const dStr = formatDateTime(slot.start).slice(5, 10);
+        const dStr = formatHealthDateLabel(slot.start);
         dateItems.push('<div class="healthDateLabel">' + esc(dStr) + '</div>');
       } else {
         dateItems.push('<div class="healthDateLabel">-</div>');
@@ -1784,6 +1803,16 @@ function trendMetricLabel(metric) {
   }
 }
 
+function trendMetricTooltipLabel(metric) {
+  switch (metric) {
+    case 'requests': return t('col_requests');
+    case 'tokens': return t('col_tokens');
+    case 'rpm': return t('rpm');
+    case 'cost': return t('distribution_cost');
+    default: return t('col_tokens');
+  }
+}
+
 function renderTrendSvg(points, range, color, barColor, mode) {
   var valueFn, formatVal;
   if (trendMetric === 'requests') {
@@ -1851,7 +1880,7 @@ function renderTrendSvg(points, range, color, barColor, mode) {
 
   // Invisible hover rects
   var hitWidth = chartW / n;
-  var metricName = trendMetricLabel(trendMetric);
+  var metricName = trendMetricTooltipLabel(trendMetric);
   points.forEach(function(p, i) {
     var v = valueFn(p);
     var valStr = formatVal(v);
@@ -2606,6 +2635,9 @@ async function rerender(options) {
     }
   }
 
+  // Translate static labels before renderStats adds dynamic trend badges.
+  // Applying textContent to a parent label after rendering would remove them.
+  if (typeof applyI18N === 'function') applyI18N();
   renderUpdated();
   renderStats();
   renderStorageStatus();
@@ -2621,7 +2653,6 @@ async function rerender(options) {
   else renderEventsContent();
   if (opts.refreshApiDetail || previousApi !== selectedApi) await renderApiDetail();
   else renderApiDetailFromCache();
-  if (typeof applyI18N === 'function') applyI18N();
 }
 
 function pollDelay() { return document.visibilityState === 'hidden' ? hiddenPollDelayMs : visiblePollDelayMs }

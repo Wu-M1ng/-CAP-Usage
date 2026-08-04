@@ -27,10 +27,10 @@
     </div>
   </div>
   <section class="cards">
-    <div class="stat"><div class="label" data-i18n="total_requests">总请求数</div><div class="value" id="totalRequests">-</div><div class="meta"><span class="ok" id="successText">成功请求：-</span><span class="bad" id="failureText">失败请求：-</span><span id="avgLatency">平均用时：-</span></div><svg id="requestSpark" class="spark"></svg></div>
-    <div class="stat purple"><div class="label" data-i18n="total_tokens">总 token 数</div><div class="value" id="totalTokens">-</div><div class="meta"><span id="cachedText">缓存命中 token：-</span><span id="cacheWriteText">缓存创建 token：-</span><span id="reasoningText">思考 token：-</span></div><svg id="tokenSpark" class="spark"></svg></div>
-    <div class="stat green"><div class="label" data-i18n="rpm">每分钟请求</div><div class="value" id="rpm">-</div><div class="meta"><span id="rpmMeta">-</span></div><svg id="rpmSpark" class="spark"></svg></div>
-    <div class="stat amber"><div class="label" data-i18n="total_cost">总花费</div><div class="value" id="totalCost">-</div><div class="meta"><span id="costMeta">-</span></div><svg id="costSpark" class="spark"></svg></div>
+    <div class="stat"><div class="label"><span data-i18n="total_requests">总请求数</span><span id="totalRequestsTrend" class="trendTag" hidden></span></div><div class="value" id="totalRequests">-</div><div class="meta"><span class="ok" id="successText">成功请求：-</span><span class="bad" id="failureText">失败请求：-</span><span id="avgLatency">平均用时：-</span></div><svg id="requestSpark" class="spark"></svg></div>
+    <div class="stat purple"><div class="label"><span data-i18n="total_tokens">总 token 数</span><span id="totalTokensTrend" class="trendTag" hidden></span></div><div class="value" id="totalTokens">-</div><div class="meta"><span id="cachedText">缓存命中 token：-</span><span id="cacheWriteText">缓存创建 token：-</span><span id="reasoningText">思考 token：-</span></div><svg id="tokenSpark" class="spark"></svg></div>
+    <div class="stat green"><div class="label"><span data-i18n="rpm">每分钟请求</span><span id="rpmTrend" class="trendTag" hidden></span></div><div class="value" id="rpm">-</div><div class="meta"><span id="rpmMeta">-</span></div><svg id="rpmSpark" class="spark"></svg></div>
+    <div class="stat amber"><div class="label"><span data-i18n="total_cost">总花费</span><span id="totalCostTrend" class="trendTag" hidden></span></div><div class="value" id="totalCost">-</div><div class="meta"><span id="costMeta">-</span></div><svg id="costSpark" class="spark"></svg></div>
   </section>
   <section class="distributionGrid" id="distributionDashboard">
       <article class="panel distributionBlock">

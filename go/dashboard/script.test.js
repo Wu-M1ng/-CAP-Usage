@@ -745,6 +745,55 @@ test('dashboard loads summary and export button uses backend event export', asyn
   assert.strictEqual(exported.length, 1200);
 });
 
+test('dashboard card trend tags persist across localization rerenders', async () => {
+  const { context, document } = createDashboardHarness({
+    summaryUsage: {
+      requests_by_day: { '2026-08-03': 100, '2026-08-04': 125 },
+      tokens_by_day: { '2026-08-03': 24000, '2026-08-04': 30000 },
+      cost_by_day: { '2026-08-03': 0.01, '2026-08-04': 0.02 },
+    },
+  });
+
+  await waitFor(() => document.getElementById('totalRequests').textContent === '1,200');
+  assert.strictEqual(document.getElementById('totalRequestsTrend').textContent, '+25.0%');
+  assert.strictEqual(document.getElementById('totalTokensTrend').textContent, '+25.0%');
+  assert.strictEqual(document.getElementById('rpmTrend').textContent, '+25.0%');
+  assert.strictEqual(document.getElementById('totalCostTrend').textContent, '+100.0%');
+
+  context.applyI18N();
+  assert.strictEqual(document.getElementById('totalRequestsTrend').textContent, '+25.0%');
+  assert.strictEqual(document.getElementById('totalTokensTrend').textContent, '+25.0%');
+  assert.strictEqual(document.getElementById('rpmTrend').textContent, '+25.0%');
+  assert.strictEqual(document.getElementById('totalCostTrend').textContent, '+100.0%');
+});
+
+test('health date labels do not include a trailing time fragment', () => {
+  const { context } = createDashboardHarness();
+
+  assert.strictEqual(context.formatHealthDateLabel('2026-07-31T00:00:00+08:00'), '7/31');
+  assert.strictEqual(context.formatHealthDateLabel('2026-08-01T00:00:00+08:00'), '8/1');
+});
+
+test('trend chart tooltips use compact metric labels', async () => {
+  const { context, document } = createDashboardHarness({ range: '24h' });
+  await waitFor(() => document.getElementById('trendChart').innerHTML.includes('12:00'));
+
+  const select = document.getElementById('trendMetric');
+  const metrics = [
+    ['cost', 'trend_daily_cost', 'distribution_cost'],
+    ['requests', 'trend_daily_requests', 'col_requests'],
+    ['tokens', 'trend_daily_tokens', 'col_tokens'],
+    ['rpm', 'trend_daily_rpm', 'rpm'],
+  ];
+  for (const [value, dailyKey, compactKey] of metrics) {
+    select.value = value;
+    select.onchange();
+    const html = document.getElementById('trendChart').innerHTML;
+    assert.ok(html.includes(context.t(compactKey)), html);
+    assert.ok(!html.includes(context.t(dailyKey)), html);
+  }
+});
+
 test('dashboard blob downloads keep object URLs alive for Safari', () => {
   const { context, document, downloads, timeoutDelays } = createDashboardHarness();
   context.download('usage.csv', 'a,b\n1,2', 'text/csv;charset=utf-8');
