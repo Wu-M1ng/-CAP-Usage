@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -28,26 +29,14 @@ func TestUsageCallbackProcessorBoundsQueuedTasks(t *testing.T) {
 	}
 	<-started
 
-	ready := make(chan struct{})
-	done := make(chan int, 1)
-	go func() {
-		accepted := 0
-		for i := 0; i < usageCallbackQueueMaxTasks+1; i++ {
-			if processor.enqueue(func() {}, 0) {
-				accepted++
-			}
-			if i == usageCallbackQueueMaxTasks-1 {
-				close(ready)
-			}
+	accepted := 0
+	for i := 0; i < usageCallbackQueueMaxTasks+1; i++ {
+		if processor.enqueue(func() {}, 0) {
+			accepted++
 		}
-		done <- accepted
-	}()
-	<-ready
-
-	select {
-	case accepted := <-done:
-		t.Fatalf("enqueue() accepted %d tasks before the worker drained, want backpressure", accepted)
-	case <-time.After(50 * time.Millisecond):
+	}
+	if accepted != usageCallbackQueueMaxTasks {
+		t.Fatalf("enqueue() accepted %d tasks, want %d", accepted, usageCallbackQueueMaxTasks)
 	}
 
 	processor.mu.Lock()
@@ -62,14 +51,7 @@ func TestUsageCallbackProcessorBoundsQueuedTasks(t *testing.T) {
 	}
 
 	releaseWorker()
-	select {
-	case accepted := <-done:
-		if accepted != usageCallbackQueueMaxTasks+1 {
-			t.Fatalf("accepted tasks after backpressure = %d, want %d", accepted, usageCallbackQueueMaxTasks+1)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("bounded queue did not drain")
-	}
+	processor.drain()
 }
 
 func TestResponseStreamChunkWithoutCurrentUsageIsNotQueued(t *testing.T) {
@@ -178,6 +160,43 @@ func TestPluginCallNeedsRequestCopySkipsNonUsageStreamChunks(t *testing.T) {
 	}
 }
 
+func TestDecodeResponseStreamChunkForUsageBoundsHistoryCopy(t *testing.T) {
+	history := make([][]byte, 128)
+	for i := range history {
+		history[i] = []byte(fmt.Sprintf(`data: {"usage":{"prompt_tokens":%d,"completion_tokens":2,"total_tokens":%d}}`, i+1, i+3))
+	}
+	wire, err := json.Marshal(ResponseStreamChunkRequest{
+		ResponseInterceptRequest: ResponseInterceptRequest{
+			SourceFormat:   "openai",
+			Model:          "gpt-5.5",
+			RequestedModel: "gpt-5.5",
+			Body:           []byte(`data: {"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}}`),
+			StatusCode:     200,
+		},
+		HistoryChunks: history,
+	})
+	if err != nil {
+		t.Fatalf("marshal stream chunk: %v", err)
+	}
+	decoded, hasUsage, err := decodeResponseStreamChunkForUsage(wire)
+	if err != nil {
+		t.Fatalf("decodeResponseStreamChunkForUsage() error = %v", err)
+	}
+	if !hasUsage || decoded.Model != "gpt-5.5" {
+		t.Fatalf("decoded stream chunk = %#v/%t, want usage-bearing gpt-5.5", decoded, hasUsage)
+	}
+	if len(decoded.HistoryChunks) > maxStreamHistoryUsageChunks {
+		t.Fatalf("retained history chunks = %d, want <= %d", len(decoded.HistoryChunks), maxStreamHistoryUsageChunks)
+	}
+	var retainedBytes int
+	for _, chunk := range decoded.HistoryChunks {
+		retainedBytes += len(chunk)
+	}
+	if retainedBytes > maxStreamHistoryUsageBytes {
+		t.Fatalf("retained history bytes = %d, want <= %d", retainedBytes, maxStreamHistoryUsageBytes)
+	}
+}
+
 func TestUsageCallbackProcessorHandlesOversizedPayloadSynchronouslyAfterDrain(t *testing.T) {
 	processor := newUsageCallbackProcessor()
 	started := make(chan struct{})
@@ -204,18 +223,14 @@ func TestUsageCallbackProcessorHandlesOversizedPayloadSynchronouslyAfterDrain(t 
 		accepted <- processor.enqueue(func() {}, usageCallbackQueueMaxBytes)
 	}()
 	select {
-	case <-accepted:
-		t.Fatal("oversized payload bypassed an earlier active callback")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	releaseWorker()
-	select {
 	case queued := <-accepted:
 		if queued {
 			t.Fatal("oversized payload was retained in the bounded queue")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("oversized payload did not fall back to synchronous processing")
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("oversized payload enqueue blocked")
 	}
+
+	releaseWorker()
+	processor.drain()
 }

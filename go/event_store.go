@@ -1579,6 +1579,10 @@ failure, fingerprint, created_at_ns
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *eventStore) saveAggregate(ctx context.Context, snapshot StatisticsSnapshot) error {
+	return s.saveAggregateWithWatermark(ctx, snapshot, 0)
+}
+
+func (s *eventStore) saveAggregateWithWatermark(ctx context.Context, snapshot StatisticsSnapshot, watermark int64) error {
 	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
 	defer cancel()
 	db, err := s.database()
@@ -1590,7 +1594,7 @@ func (s *eventStore) saveAggregate(ctx context.Context, snapshot StatisticsSnaps
 		return fmt.Errorf("begin aggregate state write: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.saveAggregateTx(ctx, tx, snapshot); err != nil {
+	if err := s.saveAggregateTxWithWatermark(ctx, tx, snapshot, watermark); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1600,6 +1604,10 @@ func (s *eventStore) saveAggregate(ctx context.Context, snapshot StatisticsSnaps
 }
 
 func (s *eventStore) saveAggregateTx(ctx context.Context, tx *sql.Tx, snapshot StatisticsSnapshot) error {
+	return s.saveAggregateTxWithWatermark(ctx, tx, snapshot, 0)
+}
+
+func (s *eventStore) saveAggregateTxWithWatermark(ctx context.Context, tx *sql.Tx, snapshot StatisticsSnapshot, watermark int64) error {
 	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
 	defer cancel()
 	if tx == nil {
@@ -1616,18 +1624,19 @@ func (s *eventStore) saveAggregateTx(ctx context.Context, tx *sql.Tx, snapshot S
 	if err != nil {
 		return fmt.Errorf("encode aggregate state: %w", err)
 	}
-	var lastEventID int64
-	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0) FROM request_events").Scan(&lastEventID); err != nil {
-		return fmt.Errorf("read aggregate event watermark: %w", err)
+	if watermark <= 0 {
+		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0) FROM request_events").Scan(&watermark); err != nil {
+			return fmt.Errorf("read aggregate event watermark: %w", err)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO aggregate_state (id, version, state_json, updated_at_ns, last_event_id)
 VALUES (1, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-	version = excluded.version,
-	state_json = excluded.state_json,
-	updated_at_ns = excluded.updated_at_ns,
-	last_event_id = excluded.last_event_id`, eventStoreSchemaVersion, string(encoded), time.Now().UTC().UnixNano(), maxInt64(lastEventID, 0)); err != nil {
+		version = excluded.version,
+		state_json = excluded.state_json,
+		updated_at_ns = excluded.updated_at_ns,
+		last_event_id = excluded.last_event_id`, eventStoreSchemaVersion, string(encoded), time.Now().UTC().UnixNano(), maxInt64(watermark, 0)); err != nil {
 		return fmt.Errorf("write aggregate state: %w", err)
 	}
 	return nil

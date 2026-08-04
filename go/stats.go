@@ -32,6 +32,7 @@ type RequestStatistics struct {
 	configurationApplied bool
 
 	storageControlMu  sync.Mutex
+	eventRecordMu     sync.Mutex
 	storageEnqueueWG  sync.WaitGroup
 	storageQueryWG    sync.WaitGroup
 	storageWriteWG    sync.WaitGroup
@@ -85,6 +86,19 @@ type RequestStatistics struct {
 	eventStoreLastRetentionCutoff int64
 	droppedEvents                 int64
 	eventStoreTemporary           bool
+	eventWriterQueue              chan eventWriteTask
+	eventWriterStop               chan struct{}
+	eventWriterDone               chan struct{}
+	eventWriterStopping           bool
+	eventWriterRunning            bool
+	eventWriterQueueCapacity      int
+	eventWriterQueueLength        int
+	eventWriterSnapshotRecords    int64
+	eventWriterLastSnapshot       time.Time
+	eventWriterSpoolPending       int64
+	eventSpoolMu                  sync.Mutex
+	eventSpoolRetryMu             sync.Mutex
+	eventSpoolRetryRunning        bool
 
 	// Historical file-storage state is kept for source compatibility with the
 	// old implementation. Runtime records and configuration use eventStore;
@@ -774,6 +788,7 @@ func NewRequestStatistics() *RequestStatistics {
 		storageSyncRecordInterval:     defaultStorageSyncRecords,
 		storageWriteQueueCapacity:     defaultStorageWriteQueueSize,
 		storageWriteSlots:             make(chan struct{}, defaultEventStoreWriteQueueSize),
+		eventWriterQueueCapacity:      defaultStorageWriteQueueSize,
 		exportMaxRecords:              defaultExportMaxRecords,
 		priceStoragePath:              defaultRuntimeConfig().PriceStoragePath,
 		modelPrices:                   make(map[string]ModelPrice),
@@ -1040,6 +1055,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 				previousStore = s.eventStore
 				s.eventStore = candidate
 				if candidate != nil {
+					s.startEventWriterLocked()
 					s.eventStorePath = candidate.path
 					s.eventStoreTemporary = candidate.temporary
 					restoreNow := time.Now()
@@ -1328,37 +1344,52 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	s.mu.RUnlock()
 	detail := requestDetailFromUsageRecord(record, timestamp, whitelist)
 
-	store, releaseStore := s.acquireEventStoreWrite()
-	if store == nil {
-		// The in-memory path is also used when persistence is disabled.
+	// Keep the in-memory update and the non-blocking enqueue in one short
+	// critical section. The writer uses the same sequencing lock before taking
+	// an aggregate snapshot, so a snapshot never includes a record whose event
+	// row has not yet been accepted by the writer.
+	s.eventRecordMu.Lock()
+	s.storageControlMu.Lock()
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store != nil && s.eventWriterQueue != nil && !s.eventWriterStopping {
 		now := time.Now()
 		s.mu.Lock()
-		// Live usage records are unique observations. The compatibility
-		// deduplication window applies to imported snapshots only.
-		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, true)
-		if s.configurationApplied {
-			s.pruneLocked(now, false)
-		}
-		s.eventStoreLastError = ""
+		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
+		maxDetails := s.maxDetailsPerModel
+		retention := s.retention
 		s.mu.Unlock()
+		queued := s.enqueueEventWriteLocked(eventWriteTask{
+			store:      store,
+			apiName:    apiName,
+			modelName:  modelName,
+			detail:     detail,
+			enqueuedAt: time.Now(),
+			maxDetails: maxDetails,
+			retention:  retention,
+		})
+		s.storageControlMu.Unlock()
+		s.eventRecordMu.Unlock()
+		if !queued {
+			s.spoolEventWrite(eventWriteTask{store: store, apiName: apiName, modelName: modelName, detail: detail, maxDetails: maxDetails, retention: retention})
+		}
 		return
 	}
+	s.storageControlMu.Unlock()
+	s.eventRecordMu.Unlock()
 
-	s.mu.RLock()
-	maxDetails := s.maxDetailsPerModel
-	retention := s.retention
-	lastRetentionCutoff := s.eventStoreLastRetentionCutoff
-	s.mu.RUnlock()
-	pruneNow := time.Now()
-	retentionCutoff := retentionPruneCutoff(pruneNow, retention)
-	retentionDue := retentionCutoff > 0 && (lastRetentionCutoff == 0 || retentionCutoff > lastRetentionCutoff)
-	// Publish the aggregate immediately. The persistence worker reconciles
-	// retention removals and writes the durable aggregate after this call.
+	// The in-memory path is also used when persistence is disabled. Live usage
+	// records are unique observations; the compatibility deduplication window
+	// applies to imported snapshots only.
 	now := time.Now()
 	s.mu.Lock()
-	s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
+	s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, true)
+	if s.configurationApplied {
+		s.pruneLocked(now, false)
+	}
+	s.eventStoreLastError = ""
 	s.mu.Unlock()
-	go s.persistRecordedEvent(store, releaseStore, apiName, modelName, detail, maxDetails, retention, retentionDue, retentionCutoff, pruneNow)
 }
 
 func (s *RequestStatistics) persistRecordedEvent(store *eventStore, releaseStore func(), apiName, modelName string, detail RequestDetail, maxDetails int, retention time.Duration, retentionDue bool, retentionCutoff int64, pruneNow time.Time) {
@@ -1540,6 +1571,15 @@ func (s *RequestStatistics) recordEventStoreFailure(err error, dropped bool) {
 	if dropped {
 		s.droppedEvents++
 	}
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) recordUsageCallbackDrop() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.droppedEvents++
 	s.mu.Unlock()
 }
 
@@ -8720,6 +8760,7 @@ func (s *RequestStatistics) Close() {
 	}
 	waitForUsageCallbacks()
 	s.stopStorageWorker()
+	s.stopEventWriter()
 	s.stopModelsDevPriceWorker()
 	s.storageControlMu.Lock()
 	s.mu.Lock()
@@ -8782,16 +8823,21 @@ func (s *RequestStatistics) StorageStatus() StorageStatus {
 
 func (s *RequestStatistics) storageStatusLocked() StorageStatus {
 	status := StorageStatus{
-		Backend:       "sqlite",
-		Enabled:       s.storageEnabled,
-		Path:          s.storagePath,
-		LastError:     s.eventStoreLastError,
-		DroppedEvents: s.droppedEvents,
+		Backend:            "sqlite",
+		Enabled:            s.storageEnabled,
+		Path:               s.storagePath,
+		LastError:          s.eventStoreLastError,
+		DroppedEvents:      s.droppedEvents,
+		WriteQueueLength:   s.eventWriterQueueLength,
+		WriteQueueCapacity: s.eventWriterQueueCapacity,
+		WriterRunning:      s.eventWriterRunning,
+		SpoolPending:       s.eventWriterSpoolPending,
 	}
 	if s.eventStore != nil {
 		status.DatabasePath = s.eventStore.path
 		status.EventCount = maxInt64(s.eventStoreEventCount, 0)
 		status.DatabaseSizeBytes = maxInt64(s.eventStoreSizeBytes, 0)
+		status.SpoolPath = eventSpoolPath(s.eventStore.path)
 	}
 	if !s.eventStoreLastWrite.IsZero() {
 		status.LastWriteAt = s.eventStoreLastWrite.UTC().Format(time.RFC3339)

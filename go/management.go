@@ -22,7 +22,8 @@ func handleUsage(requestBody []byte) ([]byte, error) {
 	process := func() {
 		processUsageRecord(statistics, fallbacks, usageRecord)
 	}
-	if deferUsageCallback(statistics, process, len(requestBody)) {
+	switch deferUsageCallback(statistics, process, len(requestBody)) {
+	case usageCallbackQueued, usageCallbackDropped:
 		return okEnvelopeJSON("{}")
 	}
 	process()

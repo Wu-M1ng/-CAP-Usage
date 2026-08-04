@@ -14,6 +14,8 @@ import (
 
 const (
 	defaultUsageFallbackDelay = 2 * time.Second
+	maxUsageFallbackPending   = 4096
+	maxUsageFallbackRecent    = 4096
 	// Native usage and response interception are delivered by independent host
 	// callbacks. Keep the native observation long enough to cover a slow handoff
 	// without making the fallback wait longer before it becomes usable.
@@ -177,9 +179,10 @@ func unmarshalResponseInterceptRequest(data []byte, r *ResponseInterceptRequest)
 func handleResponseIntercept(requestBody []byte) ([]byte, error) {
 	statistics := stats
 	fallbacks := usageFallbacks
-	if deferUsageCallback(statistics, func() {
+	switch deferUsageCallback(statistics, func() {
 		processResponseIntercept(statistics, fallbacks, requestBody)
 	}, len(requestBody)) {
+	case usageCallbackQueued, usageCallbackDropped:
 		return okEnvelopeJSON("{}")
 	}
 
@@ -199,15 +202,30 @@ func handleResponseStreamChunk(requestBody []byte) ([]byte, error) {
 	if !responseStreamChunkMayContainUsage(requestBody) {
 		return okEnvelopeJSON("{}")
 	}
-	if deferUsageCallback(statistics, func() {
+	switch deferUsageCallback(statistics, func() {
 		processResponseStreamChunk(statistics, fallbacks, requestBody)
 	}, len(requestBody)) {
+	case usageCallbackQueued, usageCallbackDropped:
 		return okEnvelopeJSON("{}")
 	}
 
 	var req ResponseStreamChunkRequest
 	if err := json.Unmarshal(requestBody, &req); err != nil {
 		return nil, fmt.Errorf("failed to parse response stream chunk request: %w", err)
+	}
+	return handleResponseStreamChunkRequest(statistics, fallbacks, req)
+}
+
+func handleResponseStreamChunkRequest(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest) ([]byte, error) {
+	payloadBytes := len(req.Body)
+	for _, chunk := range req.HistoryChunks {
+		payloadBytes += len(chunk)
+	}
+	switch deferUsageCallback(statistics, func() {
+		processResponseStreamChunkRequest(statistics, fallbacks, req)
+	}, payloadBytes) {
+	case usageCallbackQueued, usageCallbackDropped:
+		return okEnvelopeJSON("{}")
 	}
 	if record, ok := usageRecordFromResponseStreamChunk(req); ok && fallbacks != nil {
 		fallbacks.Supersede(supersededStreamUsageFingerprints(req))
@@ -275,6 +293,144 @@ var responseUsageMarkers = [...][]byte{
 	[]byte(`"usage_metadata"`),
 }
 
+const (
+	maxStreamHistoryUsageChunks = 32
+	maxStreamHistoryUsageBytes  = 1 << 20
+)
+
+// decodeResponseStreamChunkForUsage parses a host-owned stream callback
+// without first copying the complete JSON payload. HistoryChunks can contain
+// the entire response transcript on every callback; only a bounded tail of
+// chunks that contain usage markers is retained for fallback supersession.
+func decodeResponseStreamChunkForUsage(data []byte) (ResponseStreamChunkRequest, bool, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var req ResponseStreamChunkRequest
+	req.Stream = true
+	if token, err := decoder.Token(); err != nil {
+		return req, false, err
+	} else if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return req, false, fmt.Errorf("response stream chunk is not a JSON object")
+	}
+	bodySet := false
+	currentHasUsage := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return req, false, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return req, false, fmt.Errorf("response stream chunk field name is not a string")
+		}
+		normalized := strings.ToLower(strings.ReplaceAll(key, "_", ""))
+		switch normalized {
+		case "sourceformat":
+			if err := decoder.Decode(&req.SourceFormat); err != nil {
+				return req, false, err
+			}
+		case "model":
+			if err := decoder.Decode(&req.Model); err != nil {
+				return req, false, err
+			}
+		case "requestedmodel":
+			if err := decoder.Decode(&req.RequestedModel); err != nil {
+				return req, false, err
+			}
+		case "stream":
+			var stream bool
+			if err := decoder.Decode(&stream); err != nil {
+				return req, false, err
+			}
+			if stream {
+				req.Stream = true
+			}
+		case "requestheaders":
+			if err := decoder.Decode(&req.RequestHeaders); err != nil {
+				return req, false, err
+			}
+		case "responseheaders":
+			if err := decoder.Decode(&req.ResponseHeaders); err != nil {
+				return req, false, err
+			}
+		case "originalrequest":
+			if err := decoder.Decode(&req.OriginalRequest); err != nil {
+				return req, false, err
+			}
+		case "requestbody":
+			if err := decoder.Decode(&req.RequestBody); err != nil {
+				return req, false, err
+			}
+		case "body":
+			var body []byte
+			if err := decoder.Decode(&body); err != nil {
+				return req, false, err
+			}
+			if !bodySet {
+				req.Body = body
+				bodySet = true
+				currentHasUsage = responseBodyMayContainUsage(body)
+			}
+		case "statuscode":
+			if err := decoder.Decode(&req.StatusCode); err != nil {
+				return req, false, err
+			}
+		case "metadata":
+			if err := decoder.Decode(&req.Metadata); err != nil {
+				return req, false, err
+			}
+		case "historychunks":
+			if err := decodeStreamHistoryUsageChunks(decoder, &req.HistoryChunks); err != nil {
+				return req, false, err
+			}
+		case "chunkindex":
+			if err := decoder.Decode(&req.ChunkIndex); err != nil {
+				return req, false, err
+			}
+		default:
+			if err := skipJSONDecoderValue(decoder); err != nil {
+				return req, false, err
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return req, false, err
+	}
+	return req, currentHasUsage, nil
+}
+
+func decodeStreamHistoryUsageChunks(decoder *json.Decoder, target *[][]byte) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '[' {
+		return fmt.Errorf("HistoryChunks is not an array")
+	}
+	var retainedBytes int
+	for decoder.More() {
+		var chunk []byte
+		if err := decoder.Decode(&chunk); err != nil {
+			return err
+		}
+		if !responseBodyMayContainUsage(chunk) {
+			continue
+		}
+		*target = append(*target, chunk)
+		retainedBytes += len(chunk)
+		for len(*target) > maxStreamHistoryUsageChunks || retainedBytes > maxStreamHistoryUsageBytes {
+			if len(*target) == 0 {
+				break
+			}
+			retainedBytes -= len((*target)[0])
+			*target = (*target)[1:]
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
 func skipJSONDecoderValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
@@ -322,6 +478,10 @@ func processResponseStreamChunk(statistics *RequestStatistics, fallbacks *usageF
 	if err := json.Unmarshal(requestBody, &req); err != nil {
 		return
 	}
+	processResponseStreamChunkRequest(statistics, fallbacks, req)
+}
+
+func processResponseStreamChunkRequest(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest) {
 	if record, ok := usageRecordFromResponseStreamChunk(req); ok && fallbacks != nil {
 		fallbacks.Supersede(supersededStreamUsageFingerprints(req))
 		fallbacks.ScheduleForStats(statistics, record)
@@ -672,16 +832,19 @@ func usageDetailHasTokens(detail UsageDetail) bool {
 }
 
 type usageFallbackCoordinator struct {
-	mu             sync.Mutex
-	pending        map[string][]*pendingUsageFallback
-	nativeRecent   map[string][]usageFallbackOccurrence
-	fallbackRecent map[string][]usageFallbackOccurrence
-	deadlines      usageFallbackDeadlineHeap
-	wake           chan struct{}
-	stop           chan struct{}
-	done           chan struct{}
-	sequence       uint64
-	closed         bool
+	mu                  sync.Mutex
+	pending             map[string][]*pendingUsageFallback
+	nativeRecent        map[string][]usageFallbackOccurrence
+	fallbackRecent      map[string][]usageFallbackOccurrence
+	deadlines           usageFallbackDeadlineHeap
+	wake                chan struct{}
+	stop                chan struct{}
+	done                chan struct{}
+	sequence            uint64
+	pendingCount        int
+	nativeRecentCount   int
+	fallbackRecentCount int
+	closed              bool
 }
 
 type pendingUsageFallback struct {
@@ -884,7 +1047,16 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 		}
 		return
 	}
+	if c.pendingCount >= maxUsageFallbackPending {
+		c.evictOldestPendingLocked()
+		c.mu.Unlock()
+		if pending.stats != nil {
+			pending.stats.recordUsageCallbackDrop()
+		}
+		return
+	}
 	c.pending[key] = append(c.pending[key], pending)
+	c.pendingCount++
 	c.sequence++
 	pending.sequence = c.sequence
 	wasHead := len(c.deadlines) == 0 || pending.deadline.Before(c.deadlines[0].deadline)
@@ -933,12 +1105,16 @@ func (c *usageFallbackCoordinator) HandleNativeForStats(statistics *RequestStati
 		}
 		return record, false
 	}
+	if c.nativeRecentCount >= maxUsageFallbackRecent {
+		c.evictOldestNativeRecentLocked()
+	}
 	c.nativeRecent[key] = append(c.nativeRecent[key], usageFallbackOccurrence{
 		requestAt:  requestAt,
 		observedAt: now,
 		record:     record,
 		stats:      usageFallbackStats(statistics),
 	})
+	c.nativeRecentCount++
 	c.mu.Unlock()
 	return record, true
 }
@@ -1012,6 +1188,7 @@ func (c *usageFallbackCoordinator) Flush() {
 		}
 		delete(c.pending, key)
 	}
+	c.pendingCount = 0
 	c.mu.Unlock()
 	if c.done != nil {
 		<-c.done
@@ -1040,12 +1217,16 @@ func (c *usageFallbackCoordinator) commit(pending *pendingUsageFallback) {
 	pending.cancelled = true
 	c.removePendingLocked(pending)
 	now := time.Now()
+	if c.fallbackRecentCount >= maxUsageFallbackRecent {
+		c.evictOldestFallbackRecentLocked()
+	}
 	c.fallbackRecent[pending.key] = append(c.fallbackRecent[pending.key], usageFallbackOccurrence{
 		requestAt:  pending.requestAt,
 		observedAt: now,
 		record:     pending.record,
 		stats:      pending.stats,
 	})
+	c.fallbackRecentCount++
 	c.cleanupLocked(now)
 	record := pending.record
 	c.mu.Unlock()
@@ -1092,6 +1273,9 @@ func (c *usageFallbackCoordinator) removePendingLocked(pending *pendingUsageFall
 			if len(c.pending[pending.key]) == 0 {
 				delete(c.pending, pending.key)
 			}
+			if c.pendingCount > 0 {
+				c.pendingCount--
+			}
 			return
 		}
 	}
@@ -1122,6 +1306,9 @@ func (c *usageFallbackCoordinator) consumeNativeRecentLocked(key string, record 
 		if len(c.nativeRecent[key]) == 0 {
 			delete(c.nativeRecent, key)
 		}
+		if c.nativeRecentCount > 0 {
+			c.nativeRecentCount--
+		}
 		return item.record, item.stats, true
 	}
 	return UsageRecord{}, nil, false
@@ -1138,6 +1325,9 @@ func (c *usageFallbackCoordinator) matchesFallbackRecentLocked(key string, recor
 			c.fallbackRecent[key] = append(items[:i], items[i+1:]...)
 			if len(c.fallbackRecent[key]) == 0 {
 				delete(c.fallbackRecent, key)
+			}
+			if c.fallbackRecentCount > 0 {
+				c.fallbackRecentCount--
 			}
 			return item.record, item.stats, true
 		}
@@ -1193,6 +1383,73 @@ func usageFallbackRecordsCompatible(left, right UsageRecord) bool {
 	return leftKey == "" || rightKey == "" || leftKey == rightKey
 }
 
+func (c *usageFallbackCoordinator) evictOldestPendingLocked() {
+	if c == nil {
+		return
+	}
+	if len(c.deadlines) > 0 {
+		item := heap.Pop(&c.deadlines).(*pendingUsageFallback)
+		item.cancelled = true
+		c.removePendingLocked(item)
+		return
+	}
+	for key, items := range c.pending {
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			item.cancelled = true
+			c.removePendingLocked(item)
+			return
+		}
+		if len(items) == 0 {
+			delete(c.pending, key)
+		}
+	}
+}
+
+func (c *usageFallbackCoordinator) evictOldestNativeRecentLocked() {
+	if c == nil {
+		return
+	}
+	for key, items := range c.nativeRecent {
+		if len(items) == 0 {
+			delete(c.nativeRecent, key)
+			continue
+		}
+		if len(items) == 1 {
+			delete(c.nativeRecent, key)
+		} else {
+			c.nativeRecent[key] = items[1:]
+		}
+		if c.nativeRecentCount > 0 {
+			c.nativeRecentCount--
+		}
+		return
+	}
+}
+
+func (c *usageFallbackCoordinator) evictOldestFallbackRecentLocked() {
+	if c == nil {
+		return
+	}
+	for key, items := range c.fallbackRecent {
+		if len(items) == 0 {
+			delete(c.fallbackRecent, key)
+			continue
+		}
+		if len(items) == 1 {
+			delete(c.fallbackRecent, key)
+		} else {
+			c.fallbackRecent[key] = items[1:]
+		}
+		if c.fallbackRecentCount > 0 {
+			c.fallbackRecentCount--
+		}
+		return
+	}
+}
+
 func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 	for key, items := range c.nativeRecent {
 		kept := items[:0]
@@ -1206,6 +1463,7 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 		} else {
 			c.nativeRecent[key] = kept
 		}
+		c.nativeRecentCount -= len(items) - len(kept)
 	}
 	for key, items := range c.fallbackRecent {
 		kept := items[:0]
@@ -1219,14 +1477,17 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 		} else {
 			c.fallbackRecent[key] = kept
 		}
+		c.fallbackRecentCount -= len(items) - len(kept)
 	}
 	for key, items := range c.pending {
 		kept := items[:0]
+		removed := 0
 		for _, item := range items {
 			if item != nil && !item.cancelled {
 				kept = append(kept, item)
 			} else if item != nil {
 				c.removePendingHeapLocked(item)
+				removed++
 			}
 		}
 		if len(kept) == 0 {
@@ -1234,6 +1495,16 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 		} else {
 			c.pending[key] = kept
 		}
+		c.pendingCount -= removed
+	}
+	if c.nativeRecentCount < 0 {
+		c.nativeRecentCount = 0
+	}
+	if c.fallbackRecentCount < 0 {
+		c.fallbackRecentCount = 0
+	}
+	if c.pendingCount < 0 {
+		c.pendingCount = 0
 	}
 }
 

@@ -553,15 +553,20 @@ type ExportConfig struct {
 }
 
 type StorageStatus struct {
-	Backend           string `json:"backend"`
-	Enabled           bool   `json:"enabled"`
-	Path              string `json:"path,omitempty"`
-	DatabasePath      string `json:"database_path,omitempty"`
-	EventCount        int64  `json:"event_count"`
-	DatabaseSizeBytes int64  `json:"database_size_bytes"`
-	LastError         string `json:"last_error,omitempty"`
-	LastWriteAt       string `json:"last_write_at,omitempty"`
-	DroppedEvents     int64  `json:"dropped_events,omitempty"`
+	Backend            string `json:"backend"`
+	Enabled            bool   `json:"enabled"`
+	Path               string `json:"path,omitempty"`
+	DatabasePath       string `json:"database_path,omitempty"`
+	EventCount         int64  `json:"event_count"`
+	DatabaseSizeBytes  int64  `json:"database_size_bytes"`
+	LastError          string `json:"last_error,omitempty"`
+	LastWriteAt        string `json:"last_write_at,omitempty"`
+	DroppedEvents      int64  `json:"dropped_events,omitempty"`
+	WriteQueueLength   int    `json:"write_queue_length,omitempty"`
+	WriteQueueCapacity int    `json:"write_queue_capacity,omitempty"`
+	WriterRunning      bool   `json:"writer_running,omitempty"`
+	SpoolPath          string `json:"spool_path,omitempty"`
+	SpoolPending       int64  `json:"spool_pending,omitempty"`
 }
 
 type ModelPrice struct {

@@ -93,6 +93,22 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		// C.GoBytes copies that history into the Go heap when the current chunk has
 		// no usage settlement data.
 		requestView := unsafe.Slice((*byte)(unsafe.Pointer(request)), int(requestLen))
+		if methodName == "response.intercept_stream_chunk" {
+			if compact, hasUsage, compactErr := decodeResponseStreamChunkForUsage(requestView); compactErr == nil {
+				if !hasUsage {
+					raw, _ := okEnvelopeJSON("{}")
+					writeResponse(response, raw)
+					return 0
+				}
+				raw, errHandle := handleResponseStreamChunkRequest(stats, usageFallbacks, compact)
+				if errHandle != nil {
+					writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+					return 1
+				}
+				writeResponse(response, raw)
+				return 0
+			}
+		}
 		if !pluginCallNeedsRequestCopy(methodName, requestView) {
 			raw, _ := okEnvelopeJSON("{}")
 			writeResponse(response, raw)

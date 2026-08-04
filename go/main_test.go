@@ -605,7 +605,7 @@ func TestResponseStreamChunkDoesNotDoubleCountNativeOpenAICompatibleUsage(t *tes
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1056,7 +1056,7 @@ func TestResponseInterceptFallbackDoesNotDoubleCountNativeUsage(t *testing.T) {
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1125,7 +1125,7 @@ func TestResponseInterceptFallbackDoesNotDoubleCountNativeMissingOptionalUsage(t
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1255,7 +1255,7 @@ func TestResponseInterceptDeduplicatesOpenAIResponsesAndGeminiVariants(t *testin
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1367,7 +1367,7 @@ func TestResponseStreamChunkDoesNotDoubleCountNativeCodexUsage(t *testing.T) {
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1518,7 +1518,7 @@ func TestResponseInterceptFallbackDoesNotDoubleCountNativeXAIFileAuth(t *testing
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1590,7 +1590,7 @@ func TestResponseStreamChunkDoesNotMirrorRoutedXAIModelAfterNativeUsage(t *testi
 	previousDelay := usageFallbackRecordDelay
 	stats = NewRequestStatistics()
 	usageFallbacks = newUsageFallbackCoordinator()
-	usageFallbackRecordDelay = 25 * time.Millisecond
+	usageFallbackRecordDelay = 250 * time.Millisecond
 	t.Cleanup(func() {
 		usageFallbacks.Flush()
 		usageFallbacks = previousFallbacks
@@ -1912,6 +1912,47 @@ func TestUsageFallbackKeepsDifferentClientAPIKeysSeparate(t *testing.T) {
 	}
 	if usageRecordFingerprint(left) == usageRecordFingerprint(right) {
 		t.Fatal("exact fingerprints equal, want client API identity preserved")
+	}
+}
+
+func TestUsageFallbackCoordinatorBoundsRecentState(t *testing.T) {
+	previousDelay := usageFallbackRecordDelay
+	usageFallbackRecordDelay = time.Hour
+	t.Cleanup(func() { usageFallbackRecordDelay = previousDelay })
+	statistics := NewRequestStatistics()
+	coordinator := newUsageFallbackCoordinator()
+	defer coordinator.Flush()
+
+	for i := 0; i < maxUsageFallbackPending+128; i++ {
+		coordinator.ScheduleForStats(statistics, UsageRecord{
+			Provider: "openai-compatible",
+			Model:    fmt.Sprintf("pending-%d", i),
+			Detail:   UsageDetail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+	coordinator.mu.Lock()
+	pendingCount := coordinator.pendingCount
+	coordinator.mu.Unlock()
+	if pendingCount > maxUsageFallbackPending {
+		t.Fatalf("pending fallback count = %d, want <= %d", pendingCount, maxUsageFallbackPending)
+	}
+
+	for i := 0; i < maxUsageFallbackRecent+128; i++ {
+		_, accepted := coordinator.HandleNativeForStats(statistics, UsageRecord{
+			Provider:    "openai-compatible",
+			Model:       fmt.Sprintf("native-%d", i),
+			RequestedAt: time.Now(),
+			Detail:      UsageDetail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+		if !accepted {
+			t.Fatalf("native record %d was unexpectedly reconciled", i)
+		}
+	}
+	coordinator.mu.Lock()
+	nativeRecentCount := coordinator.nativeRecentCount
+	coordinator.mu.Unlock()
+	if nativeRecentCount > maxUsageFallbackRecent {
+		t.Fatalf("native recent count = %d, want <= %d", nativeRecentCount, maxUsageFallbackRecent)
 	}
 }
 

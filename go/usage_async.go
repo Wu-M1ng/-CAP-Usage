@@ -52,27 +52,20 @@ func (p *usageCallbackProcessor) enqueue(task func(), payloadBytes int) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for {
-		if p.stopping {
-			return false
-		}
-		fits := len(p.queue) < usageCallbackQueueMaxTasks &&
-			(retainedBytes <= usageCallbackQueueMaxBytes-p.queuedBytes)
-		if fits {
-			p.queue = append(p.queue, usageCallbackTask{fn: task, retained: retainedBytes})
-			p.queuedBytes += retainedBytes
-			p.cond.Signal()
-			return true
-		}
-		// A single oversized payload is handled synchronously, but only after
-		// all earlier callbacks have drained so callback ordering is preserved.
-		if len(p.queue) == 0 && !p.active {
-			return false
-		}
-		// Backpressure is deliberate: dropping usage records or running this
-		// task ahead of queued callbacks would corrupt native/fallback pairing.
-		p.cond.Wait()
+	if p.stopping {
+		return false
 	}
+	fits := len(p.queue) < usageCallbackQueueMaxTasks &&
+		(retainedBytes <= usageCallbackQueueMaxBytes-p.queuedBytes)
+	if !fits {
+		// Host callbacks must never wait for SQLite or an earlier callback. The
+		// caller records an overflow metric and returns the empty success envelope.
+		return false
+	}
+	p.queue = append(p.queue, usageCallbackTask{fn: task, retained: retainedBytes})
+	p.queuedBytes += retainedBytes
+	p.cond.Signal()
+	return true
 }
 
 func (p *usageCallbackProcessor) loop() {
@@ -134,11 +127,23 @@ func (p *usageCallbackProcessor) shutdown() {
 	<-done
 }
 
-func deferUsageCallback(s *RequestStatistics, task func(), payloadBytes int) bool {
+type usageCallbackDisposition uint8
+
+const (
+	usageCallbackSync usageCallbackDisposition = iota
+	usageCallbackQueued
+	usageCallbackDropped
+)
+
+func deferUsageCallback(s *RequestStatistics, task func(), payloadBytes int) usageCallbackDisposition {
 	if s == nil || !s.hasEventStore() {
-		return false
+		return usageCallbackSync
 	}
-	return usageCallbacks.enqueue(task, payloadBytes)
+	if usageCallbacks.enqueue(task, payloadBytes) {
+		return usageCallbackQueued
+	}
+	s.recordUsageCallbackDrop()
+	return usageCallbackDropped
 }
 
 func waitForUsageCallbacks() {
