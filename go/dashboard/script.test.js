@@ -252,6 +252,7 @@ function createDashboardHarness(options = {}) {
   }
 
   function exportJobResponse(job) {
+    const body = typeof job.payload === 'string' ? job.payload : JSON.stringify(job.payload);
     return {
       id: job.id,
       status: job.status,
@@ -263,7 +264,7 @@ function createDashboardHarness(options = {}) {
       total: job.total,
       exported: job.exported,
       truncated: false,
-      body_bytes: typeof job.payload === 'string' ? job.payload.length : JSON.stringify(job.payload).length,
+      body_bytes: Buffer.byteLength(body),
       content_type: job.headers['Content-Type'][0],
       download_path: '/dashboard-events-export-download?id=' + job.id,
     };
@@ -565,6 +566,40 @@ function createDashboardHarness(options = {}) {
         const parsed = new URL(String(url), 'http://test.local/v0/management/plugins/usage-dashboard-zduu/dashboard');
         const job = exportJobs.get(parsed.searchParams.get('id'));
         payload = job ? job.payload : {};
+        if (job && (parsed.searchParams.has('offset') || parsed.searchParams.has('chunk_size'))) {
+          const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
+          const bytes = Buffer.from(body, 'utf8');
+          const offset = Math.max(0, Number(parsed.searchParams.get('offset') || 0));
+          const requested = Math.max(1, Number(parsed.searchParams.get('chunk_size') || (1 << 20)));
+          if (offset > bytes.length) {
+            return {
+              ok: false,
+              status: 416,
+              headers: fetchHeaders({}),
+              text: async () => 'offset outside export',
+            };
+          }
+          let end = Math.min(bytes.length, offset + requested);
+          let chunk = bytes.subarray(offset, end).toString('utf8');
+          while (chunk.includes('\ufffd') && end > offset) {
+            end--;
+            chunk = bytes.subarray(offset, end).toString('utf8');
+          }
+          const chunkHeaders = Object.assign({}, job.headers, {
+            'Content-Length': [String(end - offset)],
+            'Content-Range': [end > offset ? 'bytes ' + offset + '-' + (end - 1) + '/' + bytes.length : 'bytes */' + bytes.length],
+            'Accept-Ranges': ['bytes'],
+            'X-Export-Chunk-Offset': [String(offset)],
+            'X-Export-Chunk-Bytes': [String(end - offset)],
+            'X-Export-Total-Bytes': [String(bytes.length)],
+          });
+          return {
+            ok: true,
+            status: end > offset ? 206 : 200,
+            headers: fetchHeaders(chunkHeaders),
+            text: async () => chunk,
+          };
+        }
         if (typeof payload === 'string') {
           return {
             ok: true,
@@ -737,6 +772,11 @@ test('dashboard loads summary and export button uses backend event export', asyn
   assert.strictEqual(exportJobCreateCount(), beforeExportJobs + 2);
   assert.strictEqual(syncExportEventsCount(), beforeSyncExports);
   assert.strictEqual(exportDownloadCount(), beforeExportDownloads + 2);
+  assert.ok(fetchRequests.some((request) => {
+    if (!request.url.includes('dashboard-events-export-download')) return false;
+    const parsed = new URL(request.url, 'http://test.local');
+    return parsed.searchParams.get('offset') === '0' && parsed.searchParams.get('chunk_size') === String(1 << 20);
+  }), 'expected chunked export download request');
   assert.ok(fetchRequests.some((request) => request.url.includes('dashboard-events-export-jobs') && request.options.method === 'POST' && new URL(request.url, 'http://test.local').searchParams.get('format') === 'csv'));
   const csvExport = downloads.find((d) => d.text && d.text.startsWith('时间,模型'));
   assert.match(csvExport.text, /非缓存输入 token/);
@@ -1581,6 +1621,17 @@ test('dashboard uses a slower polling interval while hidden', async () => {
   await waitFor(() => timeoutDelays.includes(30000));
 });
 
+test('dashboard reuses model prices during the price cache TTL', async () => {
+  const { fetchCalls, setVisibility } = createDashboardHarness();
+  const count = (part) => fetchCalls.filter((url) => url.includes(part)).length;
+  await waitFor(() => count('dashboard-summary') > 0 && count('model-prices') > 0);
+  const initialPrices = count('model-prices');
+  const initialSummaries = count('dashboard-summary');
+  setVisibility('visible');
+  await waitFor(() => count('dashboard-summary') > initialSummaries);
+  assert.strictEqual(count('model-prices'), initialPrices);
+});
+
 test('dashboard polling skips detail requests when no new records arrive', async () => {
   const { document, fetchCalls, setVisibility, setSummaryLastRecordedAt } = createDashboardHarness();
   const countCalls = (part) => fetchCalls.filter((url) => url.includes(part)).length;
@@ -1624,6 +1675,53 @@ test('dashboard keeps previous event rows when event refresh fails', async () =>
   assert.ok(document.getElementById('eventsCount').textContent.includes('1,200'));
   assert.ok(!document.getElementById('eventsCount').textContent.includes('共 0 条'));
   assert.ok(document.getElementById('events').innerHTML.includes('gpt-4.1'));
+});
+
+test('dashboard cache byte accounting uses UTF-8 byte length', async () => {
+  const { context, document } = createDashboardHarness();
+  await waitFor(() => document.getElementById('eventsCount').textContent.includes('1,200'));
+  assert.ok(context.cacheValueSize('上游接口') > context.cacheValueSize('upstream'), 'cache size should count UTF-8 bytes');
+});
+
+test('dashboard ignores stale event responses after a filter changes', async () => {
+  const { context, document } = createDashboardHarness();
+  await waitFor(() => document.getElementById('eventsCount').textContent.includes('1,200'));
+
+  const originalFetch = context.fetch;
+  const pending = [];
+  context.fetch = (url, options = {}) => {
+    if (String(url).includes('dashboard-events?')) {
+      return new Promise((resolve) => pending.push({ url: String(url), options, resolve }));
+    }
+    return originalFetch(url, options);
+  };
+  const eventPayload = (model) => ({
+    events: [{ model, source: 'openai-prod', provider: 'openai', failed: false, tokens: { total_tokens: 1 } }],
+    total: 1,
+    limit: 50,
+    offset: 0,
+  });
+  const responseFor = (payload) => ({
+    ok: true,
+    status: 200,
+    headers: {},
+    text: async () => JSON.stringify(payload),
+  });
+
+  document.getElementById('filterModel').value = 'old-model';
+  const oldRequest = context.renderEvents();
+  await waitFor(() => pending.length === 1);
+  document.getElementById('filterModel').value = 'new-model';
+  const newRequest = context.renderEvents();
+  await waitFor(() => pending.length === 2);
+
+  pending[1].resolve(responseFor(eventPayload('new-model')));
+  await newRequest;
+  pending[0].resolve(responseFor(eventPayload('old-model')));
+  await oldRequest;
+
+  assert.match(document.getElementById('events').innerHTML, /new-model/);
+  assert.doesNotMatch(document.getElementById('events').innerHTML, /old-model/);
 });
 
 test('dashboard does not reuse previous event rows for a failed changed filter', async () => {

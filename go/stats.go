@@ -31,8 +31,11 @@ type RequestStatistics struct {
 
 	configurationApplied bool
 
-	storageControlMu sync.Mutex
-	storageEnqueueWG sync.WaitGroup
+	storageControlMu  sync.Mutex
+	storageEnqueueWG  sync.WaitGroup
+	storageQueryWG    sync.WaitGroup
+	storageWriteWG    sync.WaitGroup
+	storageWriteSlots chan struct{}
 
 	maxDetailsPerModel int
 	retention          time.Duration
@@ -770,6 +773,7 @@ func NewRequestStatistics() *RequestStatistics {
 		storageSyncInterval:           time.Duration(defaultStorageSyncSeconds) * time.Second,
 		storageSyncRecordInterval:     defaultStorageSyncRecords,
 		storageWriteQueueCapacity:     defaultStorageWriteQueueSize,
+		storageWriteSlots:             make(chan struct{}, defaultEventStoreWriteQueueSize),
 		exportMaxRecords:              defaultExportMaxRecords,
 		priceStoragePath:              defaultRuntimeConfig().PriceStoragePath,
 		modelPrices:                   make(map[string]ModelPrice),
@@ -896,6 +900,9 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					}
 				}
 				if storageError == nil {
+					candidate.mu.Lock()
+					candidate.beforeDirectWrite = s.storageWriteWG.Wait
+					candidate.mu.Unlock()
 					candidateState, hasState, loadErr := candidate.loadAggregateState(context.Background())
 					candidateSnapshot = candidateState.Snapshot
 					candidateLastEventID = candidateState.LastEventID
@@ -1059,7 +1066,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, s.eventStoreLastEventID)
 							candidateNeedsAggregateSave = len(candidateTail) > 0
 							if candidateNeedsAggregateSave {
-								candidateRecoveredSnapshot = s.snapshotLocked()
+								candidateRecoveredSnapshot = s.aggregateSnapshotLocked()
 							}
 						}
 					} else if candidateHasSnapshot && candidateLastEventID == 0 && eventCount > 0 {
@@ -1070,7 +1077,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 						{
 							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, 0)
 							candidateNeedsAggregateSave = true
-							candidateRecoveredSnapshot = s.snapshotLocked()
+							candidateRecoveredSnapshot = s.aggregateSnapshotLocked()
 						}
 					} else if eventCount > 0 {
 						s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
@@ -1080,7 +1087,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 						{
 							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, 0)
 							candidateNeedsAggregateSave = true
-							candidateRecoveredSnapshot = s.snapshotLocked()
+							candidateRecoveredSnapshot = s.aggregateSnapshotLocked()
 						}
 					} else if candidateHasSnapshot {
 						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
@@ -1129,6 +1136,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 		}
 	}
 	if previousStore != nil && previousStore != candidate {
+		s.storageQueryWG.Wait()
 		_ = previousStore.close()
 	}
 }
@@ -1232,7 +1240,9 @@ func migrateLegacySnapshotToSQLite(store *eventStore, snapshot StatisticsSnapsho
 	if err != nil {
 		return err
 	}
-	tx, err := db.BeginTx(context.Background(), nil)
+	storageCtx, cancelStorage := eventStoreContext(context.Background(), eventStoreBulkWriteTimeout)
+	defer cancelStorage()
+	tx, err := db.BeginTx(storageCtx, nil)
 	if err != nil {
 		return fmt.Errorf("begin legacy SQLite migration: %w", err)
 	}
@@ -1250,13 +1260,13 @@ func migrateLegacySnapshotToSQLite(store *eventStore, snapshot StatisticsSnapsho
 				apiNameForRow := usageGroupKeyFromDetail(apiName, detail)
 				row := eventRowFromDetail(apiNameForRow, modelNameForRow, detail)
 				fingerprint := eventFingerprint(apiNameForRow, modelNameForRow, detail)
-				if _, _, err := store.insertEventTx(context.Background(), tx, row, fingerprint, true, time.Time{}); err != nil {
+				if _, _, err := store.insertEventTx(storageCtx, tx, row, fingerprint, true, time.Time{}); err != nil {
 					return fmt.Errorf("migrate legacy event: %w", err)
 				}
 			}
 		}
 	}
-	if err := store.saveAggregateTx(context.Background(), tx, snapshot); err != nil {
+	if err := store.saveAggregateTx(storageCtx, tx, snapshot); err != nil {
 		return fmt.Errorf("save migrated aggregate: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1313,23 +1323,14 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	}
 	apiName := usageGroupKey(record)
 	modelName := firstNonEmpty(record.Model, "unknown")
-
-	// Record, Configure and Close share this lock so a store is never closed
-	// between the SQLite transaction and the in-memory aggregate update.
-	s.storageControlMu.Lock()
-	defer s.storageControlMu.Unlock()
 	s.mu.RLock()
-	store := s.eventStore
 	whitelist := s.logResponseHeaders
-	maxDetails := s.maxDetailsPerModel
-	retention := s.retention
-	lastRetentionCutoff := s.eventStoreLastRetentionCutoff
 	s.mu.RUnlock()
-	pruneNow := time.Now()
-	retentionCutoff := retentionPruneCutoff(pruneNow, retention)
-	retentionDue := retentionCutoff > 0 && (lastRetentionCutoff == 0 || retentionCutoff > lastRetentionCutoff)
 	detail := requestDetailFromUsageRecord(record, timestamp, whitelist)
+
+	store, releaseStore := s.acquireEventStoreWrite()
 	if store == nil {
+		// The in-memory path is also used when persistence is disabled.
 		now := time.Now()
 		s.mu.Lock()
 		// Live usage records are unique observations. The compatibility
@@ -1342,77 +1343,100 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 		s.mu.Unlock()
 		return
 	}
+
+	s.mu.RLock()
+	maxDetails := s.maxDetailsPerModel
+	retention := s.retention
+	lastRetentionCutoff := s.eventStoreLastRetentionCutoff
+	s.mu.RUnlock()
+	pruneNow := time.Now()
+	retentionCutoff := retentionPruneCutoff(pruneNow, retention)
+	retentionDue := retentionCutoff > 0 && (lastRetentionCutoff == 0 || retentionCutoff > lastRetentionCutoff)
+	// Publish the aggregate immediately. The persistence worker reconciles
+	// retention removals and writes the durable aggregate after this call.
+	now := time.Now()
+	s.mu.Lock()
+	s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
+	s.mu.Unlock()
+	go s.persistRecordedEvent(store, releaseStore, apiName, modelName, detail, maxDetails, retention, retentionDue, retentionCutoff, pruneNow)
+}
+
+func (s *RequestStatistics) persistRecordedEvent(store *eventStore, releaseStore func(), apiName, modelName string, detail RequestDetail, maxDetails int, retention time.Duration, retentionDue bool, retentionCutoff int64, pruneNow time.Time) {
+	defer releaseStore()
+	if s == nil || store == nil {
+		return
+	}
 	db, err := store.database()
 	if err != nil {
 		s.recordEventStoreFailure(err, true)
 		return
 	}
-	tx, err := db.BeginTx(context.Background(), nil)
+	storageCtx, cancelStorage := eventStoreContext(context.Background(), eventStoreWriteTimeout)
+	defer cancelStorage()
+	tx, err := db.BeginTx(storageCtx, nil)
 	if err != nil {
 		s.recordEventStoreFailure(fmt.Errorf("begin event record: %w", err), true)
 		return
 	}
 	defer tx.Rollback()
-	insertedEventID, _, err := store.insertEventTx(context.Background(), tx, eventRowFromDetail(apiName, modelName, detail), "", false, time.Time{})
+	insertedEventID, _, err := store.insertEventTx(storageCtx, tx, eventRowFromDetail(apiName, modelName, detail), "", false, time.Time{})
 	if err != nil {
 		s.recordEventStoreFailure(err, true)
 		return
 	}
-	var pruneResult eventPruneResult
-	var previousLastRecordedAt time.Time
-	var previousEvictedTotal int64
-	var previousSummaryVersion uint64
-	if pruneResult, err = store.pruneTxScoped(context.Background(), tx, maxDetails, retention, pruneNow, eventPruneScope{
+	pruneResult, err := store.pruneTxScoped(storageCtx, tx, maxDetails, retention, pruneNow, eventPruneScope{
 		API:            apiName,
 		Model:          modelName,
 		ApplyRetention: retentionDue,
-	}); err != nil {
+	})
+	if err != nil {
 		s.recordEventStoreFailure(err, false)
 		return
-	} else {
-		now := time.Now()
+	}
+
+	s.mu.Lock()
+	previousEvictedTotal := s.evictedTotal
+	retentionRemoved := s.applyRetentionRemovalsLocked(pruneResult.RetentionDetails)
+	if pruneResult.Removed > 0 {
+		s.evictedTotal += pruneResult.Removed
+	}
+	// The durable aggregate never needs the bounded detail arrays. Avoid
+	// copying every retained detail on each live record.
+	snapshot := s.aggregateSnapshotLocked()
+	s.mu.Unlock()
+	rollback := func() {
 		s.mu.Lock()
-		previousLastRecordedAt = s.lastRecordedAt
-		previousEvictedTotal = s.evictedTotal
-		previousSummaryVersion = s.summaryVersion
-		s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
-		retentionRemoved := s.applyRetentionRemovalsLocked(pruneResult.RetentionDetails)
-		if pruneResult.Removed > 0 {
-			s.evictedTotal += pruneResult.Removed
+		for _, removed := range retentionRemoved {
+			s.recordDetailLocked(strings.TrimSpace(removed.UpstreamAPI), normalizeModelName(removed.Model), removed, requestDedupKey{}, time.Now(), false, false)
 		}
-		snapshot := s.snapshotLocked()
+		s.evictedTotal = previousEvictedTotal
 		s.mu.Unlock()
-		if err := store.saveAggregateTx(context.Background(), tx, snapshot); err != nil {
-			s.mu.Lock()
-			s.rollbackRecordedDetailLocked(apiName, modelName, detail, retentionRemoved, previousLastRecordedAt, previousEvictedTotal, previousSummaryVersion)
-			s.mu.Unlock()
-			s.recordEventStoreFailure(err, false)
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			s.mu.Lock()
-			s.rollbackRecordedDetailLocked(apiName, modelName, detail, retentionRemoved, previousLastRecordedAt, previousEvictedTotal, previousSummaryVersion)
-			s.mu.Unlock()
-			s.recordEventStoreFailure(fmt.Errorf("commit event record: %w", err), false)
-			return
-		}
-		lockedNow := time.Now()
-		s.mu.Lock()
-		s.eventStoreEventCount += 1 - pruneResult.Removed
-		if s.eventStoreEventCount < 0 {
-			s.eventStoreEventCount = 0
-		}
-		if retentionDue {
-			s.eventStoreLastRetentionCutoff = retentionCutoff
-		}
-		if insertedEventID > s.eventStoreLastEventID {
-			s.eventStoreLastEventID = insertedEventID
-		}
-		s.eventStoreLastError = ""
-		s.eventStoreLastWrite = lockedNow
-		s.mu.Unlock()
+	}
+	if err := store.saveAggregateTx(storageCtx, tx, snapshot); err != nil {
+		rollback()
+		s.recordEventStoreFailure(err, false)
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		rollback()
+		s.recordEventStoreFailure(fmt.Errorf("commit event record: %w", err), false)
+		return
+	}
+	lockedNow := time.Now()
+	s.mu.Lock()
+	s.eventStoreEventCount += 1 - pruneResult.Removed
+	if s.eventStoreEventCount < 0 {
+		s.eventStoreEventCount = 0
+	}
+	if retentionDue {
+		s.eventStoreLastRetentionCutoff = retentionCutoff
+	}
+	if insertedEventID > s.eventStoreLastEventID {
+		s.eventStoreLastEventID = insertedEventID
+	}
+	s.eventStoreLastError = ""
+	s.eventStoreLastWrite = lockedNow
+	s.mu.Unlock()
 }
 
 func requestDetailFromUsageRecord(record UsageRecord, timestamp time.Time, whitelist headerWhitelist) RequestDetail {
@@ -1461,11 +1485,8 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 	base := requestDetailFromUsageRecord(record, record.RequestedAt, headerWhitelist{})
 	update := requestDetailFromUsageRecord(enrichment, record.RequestedAt, headerWhitelist{})
 
-	s.storageControlMu.Lock()
-	defer s.storageControlMu.Unlock()
-	s.mu.RLock()
-	store := s.eventStore
-	s.mu.RUnlock()
+	store, releaseStore := s.acquireEventStore()
+	defer releaseStore()
 	if store == nil {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -1520,6 +1541,60 @@ func (s *RequestStatistics) recordEventStoreFailure(err error, dropped bool) {
 		s.droppedEvents++
 	}
 	s.mu.Unlock()
+}
+
+// acquireEventStore protects a store reference while a read-only operation is
+// in flight. The control mutex is held only long enough to pair the reference
+// with storageQueryWG; database work happens after it is released.
+func (s *RequestStatistics) acquireEventStore() (*eventStore, func()) {
+	if s == nil {
+		return nil, func() {}
+	}
+	s.storageControlMu.Lock()
+	// A dashboard query should observe records accepted by Record before it
+	// opens a SQLite read transaction. The wait is outside s.mu and only
+	// blocks while the control lock prevents a store switch from starting.
+	s.storageWriteWG.Wait()
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store != nil {
+		s.storageQueryWG.Add(1)
+	}
+	s.storageControlMu.Unlock()
+	if store == nil {
+		return nil, func() {}
+	}
+	return store, func() { s.storageQueryWG.Done() }
+}
+
+func (s *RequestStatistics) acquireEventStoreWrite() (*eventStore, func()) {
+	if s == nil {
+		return nil, func() {}
+	}
+	s.storageControlMu.Lock()
+	s.mu.RLock()
+	store := s.eventStore
+	s.mu.RUnlock()
+	if store == nil {
+		s.storageControlMu.Unlock()
+		return nil, func() {}
+	}
+	if s.storageWriteSlots == nil {
+		s.storageWriteSlots = make(chan struct{}, defaultEventStoreWriteQueueSize)
+	}
+	// Backpressure only applies after the in-memory path has a store. Under
+	// normal load this send is immediate; when the bounded queue is full it
+	// prevents unbounded goroutine and pending-record growth.
+	s.storageWriteSlots <- struct{}{}
+	s.storageQueryWG.Add(1)
+	s.storageWriteWG.Add(1)
+	s.storageControlMu.Unlock()
+	return store, func() {
+		<-s.storageWriteSlots
+		s.storageWriteWG.Done()
+		s.storageQueryWG.Done()
+	}
 }
 
 func enrichRequestDetailMetadata(detail *RequestDetail, update RequestDetail) bool {
@@ -4978,14 +5053,14 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		return result
 	}
 
-	s.storageControlMu.Lock()
-	defer s.storageControlMu.Unlock()
+	store, releaseStore := s.acquireEventStore()
+	defer releaseStore()
 	s.mu.RLock()
-	store := s.eventStore
+	maxDetails := s.maxDetailsPerModel
 	result = s.snapshotLocked()
 	s.mu.RUnlock()
 	if store != nil {
-		if err := store.populateSnapshotDetails(context.Background(), &result); err != nil {
+		if err := store.populateSnapshotDetails(context.Background(), &result, maxDetails); err != nil {
 			s.recordEventStoreFailure(err, false)
 		}
 	}
@@ -4993,6 +5068,16 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 }
 
 func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
+	return s.snapshotLockedWithDetails(true)
+}
+
+// aggregateSnapshotLocked builds the durable checkpoint without copying
+// request detail arrays. Callers must hold s.mu.
+func (s *RequestStatistics) aggregateSnapshotLocked() StatisticsSnapshot {
+	return s.snapshotLockedWithDetails(false)
+}
+
+func (s *RequestStatistics) snapshotLockedWithDetails(includeDetails bool) StatisticsSnapshot {
 	result := StatisticsSnapshot{}
 	result.TimeZone = dashboardTimeZone
 	result.TotalRequests = s.totalRequests
@@ -5026,8 +5111,11 @@ func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
 			apiSnapshot.AvgLatencyMs = float64(apiSt.latencySum) / float64(apiSt.latencyN)
 		}
 		for modelName, modelSt := range apiSt.Models {
-			details := make([]RequestDetail, len(modelSt.Details))
-			copy(details, modelSt.Details)
+			var details []RequestDetail
+			if includeDetails {
+				details = make([]RequestDetail, len(modelSt.Details))
+				copy(details, modelSt.Details)
+			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests:    modelSt.TotalRequests,
 				SuccessCount:     modelSt.SuccessCount,
@@ -5125,12 +5213,14 @@ func (s *RequestStatistics) pruneSQLite(store *eventStore, maxDetails int, reten
 	if err != nil {
 		return err
 	}
-	tx, err := db.BeginTx(context.Background(), nil)
+	storageCtx, cancelStorage := eventStoreContext(context.Background(), eventStoreWriteTimeout)
+	defer cancelStorage()
+	tx, err := db.BeginTx(storageCtx, nil)
 	if err != nil {
 		return fmt.Errorf("begin sqlite prune: %w", err)
 	}
 	defer tx.Rollback()
-	pruneResult, err := store.pruneTx(context.Background(), tx, maxDetails, retention, now)
+	pruneResult, err := store.pruneTx(storageCtx, tx, maxDetails, retention, now)
 	if err != nil {
 		return err
 	}
@@ -5146,7 +5236,7 @@ func (s *RequestStatistics) pruneSQLite(store *eventStore, maxDetails int, reten
 	if pruneResult.Removed > 0 {
 		s.evictedTotal += pruneResult.Removed
 	}
-	aggregate := s.snapshotLocked()
+	aggregate := s.aggregateSnapshotLocked()
 	rollback := func() {
 		for _, removed := range retentionRemoved {
 			s.recordDetailLocked(strings.TrimSpace(removed.UpstreamAPI), normalizeModelName(removed.Model), removed, requestDedupKey{}, now, false, false)
@@ -5157,7 +5247,7 @@ func (s *RequestStatistics) pruneSQLite(store *eventStore, maxDetails int, reten
 		s.summaryVersion = previousSummaryVersion
 	}
 	s.mu.Unlock()
-	if err := store.saveAggregateTx(context.Background(), tx, aggregate); err != nil {
+	if err := store.saveAggregateTx(storageCtx, tx, aggregate); err != nil {
 		s.mu.Lock()
 		rollback()
 		s.mu.Unlock()
@@ -5199,7 +5289,9 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 		s.recordEventStoreFailure(err, false)
 		return result
 	}
-	tx, err := db.BeginTx(context.Background(), nil)
+	storageCtx, cancelStorage := eventStoreContext(context.Background(), eventStoreBulkWriteTimeout)
+	defer cancelStorage()
+	tx, err := db.BeginTx(storageCtx, nil)
 	if err != nil {
 		s.recordEventStoreFailure(fmt.Errorf("begin snapshot import: %w", err), false)
 		return result
@@ -5225,7 +5317,7 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 		for i := range queued {
 			requests[i] = queued[i].request
 		}
-		inserted, insertErr := store.insertEventsTx(context.Background(), tx, requests)
+		inserted, insertErr := store.insertEventsTx(storageCtx, tx, requests)
 		if insertErr != nil {
 			return insertErr
 		}
@@ -5289,7 +5381,7 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 		s.recordEventStoreFailure(err, false)
 		return MergeResult{}
 	}
-	pruneResult, err := store.pruneTx(context.Background(), tx, maxDetails, retention, now)
+	pruneResult, err := store.pruneTx(storageCtx, tx, maxDetails, retention, now)
 	if err != nil {
 		s.recordEventStoreFailure(err, false)
 		return MergeResult{}
@@ -5306,7 +5398,7 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 	if pruneResult.Removed > 0 {
 		s.evictedTotal += pruneResult.Removed
 	}
-	aggregate := s.snapshotLocked()
+	aggregate := s.aggregateSnapshotLocked()
 	s.mu.Unlock()
 
 	rollback := func() {
@@ -5325,7 +5417,7 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 		s.mu.Unlock()
 	}
 
-	if err := store.saveAggregateTx(context.Background(), tx, aggregate); err != nil {
+	if err := store.saveAggregateTx(storageCtx, tx, aggregate); err != nil {
 		rollback()
 		s.recordEventStoreFailure(err, false)
 		return MergeResult{}
@@ -5984,9 +6076,6 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 		return s.SummaryWithoutDetailsAt(now)
 	}
 
-	s.storageControlMu.Lock()
-	defer s.storageControlMu.Unlock()
-
 	// Check the range cache before doing the potentially expensive SQL query.
 	s.mu.Lock()
 
@@ -6007,8 +6096,9 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 	}
 
 	s.summaryCacheMisses++
-	store := s.eventStore
 	s.mu.Unlock()
+	store, releaseStore := s.acquireEventStore()
+	defer releaseStore()
 
 	var rangeResult *dashboardRangeQueryResult
 	if store != nil {
@@ -7909,10 +7999,9 @@ func (s *RequestStatistics) QueryEvents(params EventsQuery) EventsResult {
 
 func (s *RequestStatistics) QueryEventsAt(params EventsQuery, now time.Time) EventsResult {
 	if s != nil {
-		s.mu.RLock()
-		store := s.eventStore
-		s.mu.RUnlock()
+		store, releaseStore := s.acquireEventStore()
 		if store != nil {
+			defer releaseStore()
 			startedAt := time.Now()
 			result, err := store.queryEvents(context.Background(), params, now)
 			if err != nil {
@@ -7944,10 +8033,9 @@ func (s *RequestStatistics) QueryExportEvents(params EventsQuery, maxRecords int
 
 func (s *RequestStatistics) QueryExportEventsAt(params EventsQuery, maxRecords int, now time.Time) EventsResult {
 	if s != nil {
-		s.mu.RLock()
-		store := s.eventStore
-		s.mu.RUnlock()
+		store, releaseStore := s.acquireEventStore()
 		if store != nil {
+			defer releaseStore()
 			startedAt := time.Now()
 			params = normalizeEventsQuery(params, false)
 			result, err := store.queryEventsPage(context.Background(), params, now, maxRecords, 0)
@@ -7987,10 +8075,9 @@ func (s *RequestStatistics) QueryExportEventsPage(params EventsQuery, offset int
 	if snapshotAt.IsZero() {
 		snapshotAt = startedAt
 	}
-	s.mu.RLock()
-	store := s.eventStore
-	s.mu.RUnlock()
+	store, releaseStore := s.acquireEventStore()
 	if store != nil {
+		defer releaseStore()
 		params = normalizeEventsQuery(params, false)
 		params.Before = snapshotAt
 		pageCapacity := exportPageEventCapacity(pageLimit, offset, maxRecords)
@@ -8260,9 +8347,7 @@ func (s *RequestStatistics) QueryAPIDetailPageAt(api, rangeKey, clientAPI string
 	if s == nil {
 		return APIDetailResponse{}
 	}
-	s.mu.RLock()
-	store := s.eventStore
-	s.mu.RUnlock()
+	store, releaseStore := s.acquireEventStore()
 	if store == nil {
 		result := s.QueryAPIDetailForClientAPIAt(api, rangeKey, clientAPI, recentLimit, errorLimit, now)
 		result.RecentTotal = result.TotalEvents
@@ -8275,6 +8360,7 @@ func (s *RequestStatistics) QueryAPIDetailPageAt(api, rangeKey, clientAPI string
 		}
 		return result
 	}
+	defer releaseStore()
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -8593,11 +8679,13 @@ func (s *RequestStatistics) DetailCount() int64 {
 	if s == nil {
 		return 0
 	}
+	store, releaseStore := s.acquireEventStore()
+	defer releaseStore()
 	s.mu.RLock()
-	store := s.eventStore
+	maxDetails := s.maxDetailsPerModel
 	s.mu.RUnlock()
 	if store != nil {
-		count, err := store.count(context.Background())
+		count, err := store.countVisibleDetails(context.Background(), maxDetails)
 		if err == nil {
 			return count
 		}
@@ -8640,6 +8728,7 @@ func (s *RequestStatistics) Close() {
 	s.closeStorageLocked()
 	s.mu.Unlock()
 	if store != nil {
+		s.storageQueryWG.Wait()
 		_ = store.close()
 	}
 	s.storageControlMu.Unlock()

@@ -176,6 +176,17 @@ function groupedRows(rows, keyFn, nameFn) {
   rows.forEach((d) => { const key = keyFn(d); const r = map.get(key) || { name: nameFn(d), requests: 0, success: 0, failure: 0, tokens: 0, cached: 0, reasoning: 0, cost: 0, latency: [], ttft: [] }; r.requests++; d.failed ? r.failure++ : r.success++; r.tokens += d.total_tokens; r.cached += d.cached_tokens; r.reasoning += d.reasoning_tokens; r.cost += d.cost; if (num(d.latency_ms) > 0) r.latency.push(num(d.latency_ms)); if (num(d.ttft_ms) > 0) r.ttft.push(num(d.ttft_ms)); map.set(key, r) });
   return [...map.values()].sort((a, b) => b.requests - a.requests);
 }
+function decodeManagementBodyBytes(body) {
+  if (body == null) return new Uint8Array();
+  if (Array.isArray(body)) return Uint8Array.from(body);
+  if (typeof body !== 'string') return new TextEncoder().encode(JSON.stringify(body));
+  try {
+    const binary = atob(body);
+    return Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  } catch {
+    return new TextEncoder().encode(body);
+  }
+}
 function decodeManagementBody(body) {
   if (body == null) return '';
   if (Array.isArray(body)) return new TextDecoder().decode(Uint8Array.from(body));
@@ -271,5 +282,5 @@ function hourBucketValue(values, hour) {
 
 // Export for Node.js test environment
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { esc, num, compact, pct, formatMs, formatDurationAndTTFT, formatUsd, providerUsesExclusiveCache, usesExclusiveCacheInput, totalTokens, uncachedInputTokens, priceForModel, cacheTokenTotal, cacheReadTokens, tokenCost, detailCost, aggregateCost, looksLikeKey, looksLikeCredentialId, isCredentialMarker, isCredentialLabel, trimCredentialSuffix, sourceLabel, sourceKey, friendlyApiName, maskClientAPIKey, clientApiLabel, clientApiGroupKey, avg, bucketSeries, hourFromTimestamp, dashboardCurrentHour, orderedRecentHours, healthColor, healthCellStyle, timestampMs, pluginEndpoint, managementEndpoint, decodeManagementStorage, parseManagementStorage, currentManagementKey, groupedRows, decodeManagementBody, unwrapPluginPayloadWithMeta, unwrapPluginPayload, fetchAllEventPages, cacheRate, costPerMillion, hourBucketValue };
+  module.exports = { esc, num, compact, pct, formatMs, formatDurationAndTTFT, formatUsd, providerUsesExclusiveCache, usesExclusiveCacheInput, totalTokens, uncachedInputTokens, priceForModel, cacheTokenTotal, cacheReadTokens, tokenCost, detailCost, aggregateCost, looksLikeKey, looksLikeCredentialId, isCredentialMarker, isCredentialLabel, trimCredentialSuffix, sourceLabel, sourceKey, friendlyApiName, maskClientAPIKey, clientApiLabel, clientApiGroupKey, avg, bucketSeries, hourFromTimestamp, dashboardCurrentHour, orderedRecentHours, healthColor, healthCellStyle, timestampMs, pluginEndpoint, managementEndpoint, decodeManagementStorage, parseManagementStorage, currentManagementKey, groupedRows, decodeManagementBodyBytes, decodeManagementBody, unwrapPluginPayloadWithMeta, unwrapPluginPayload, fetchAllEventPages, cacheRate, costPerMillion, hourBucketValue };
 }

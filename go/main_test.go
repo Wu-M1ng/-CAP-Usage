@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -4026,6 +4028,80 @@ func TestRecordPrunesByRetentionDays(t *testing.T) {
 	}
 }
 
+func TestStorageRetentionPreservesTrimmedEventsUntilExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage-statistics.db")
+	retention := 24 * time.Hour
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{
+		MaxDetailsPerModel: 1,
+		RetentionDays:      1,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     true,
+		StoragePath:        path,
+	})
+	defer stats.Close()
+
+	stats.Record(UsageRecord{
+		Provider:    "openai",
+		Model:       "gpt-4.1",
+		RequestedAt: time.Now().Add(-12 * time.Hour),
+		Detail:      UsageDetail{TotalTokens: 11},
+	})
+	stats.Record(UsageRecord{
+		Provider:    "openai",
+		Model:       "gpt-4.1",
+		RequestedAt: time.Now(),
+		Detail:      UsageDetail{TotalTokens: 13},
+	})
+
+	if got := stats.Snapshot().TotalRequests; got != 2 {
+		t.Fatalf("trimmed-window snapshot requests = %d, want 2", got)
+	}
+	if got := stats.DetailCount(); got != 1 {
+		t.Fatalf("visible detail count = %d, want 1", got)
+	}
+
+	stats.mu.RLock()
+	store := stats.eventStore
+	stats.mu.RUnlock()
+	if store == nil {
+		t.Fatal("event store is nil")
+	}
+	if err := stats.pruneSQLite(store, 1, retention, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("expire retained events: %v", err)
+	}
+	if got := stats.Snapshot().TotalRequests; got != 0 {
+		t.Fatalf("expired aggregate requests = %d, want 0", got)
+	}
+}
+
+func TestEventStoreAppliesPragmasToReaderConnections(t *testing.T) {
+	store, err := openEventStore(filepath.Join(t.TempDir(), "usage-statistics.db"), false)
+	if err != nil {
+		t.Fatalf("open event store: %v", err)
+	}
+	defer store.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for i := 0; i < 4; i++ {
+		conn, err := store.readDB.Conn(ctx)
+		if err != nil {
+			t.Fatalf("open reader connection %d: %v", i, err)
+		}
+		var busyTimeout int
+		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+			conn.Close()
+			t.Fatalf("read busy timeout %d: %v", i, err)
+		}
+		if busyTimeout != 5000 {
+			conn.Close()
+			t.Fatalf("reader busy timeout = %d, want 5000", busyTimeout)
+		}
+		_ = conn.Close()
+	}
+}
+
 func TestParseRuntimeConfigFromLifecycleConfigYAML(t *testing.T) {
 	yaml := []byte(`
 plugins:
@@ -4847,6 +4923,191 @@ func TestDashboardEventsExportAsyncJobFiltersByAPI(t *testing.T) {
 		if event.Provider != "openai" || event.Model != "gpt-4.1" {
 			t.Fatalf("filtered export included wrong event: %#v", event)
 		}
+	}
+}
+
+func TestDashboardEventsExportAsyncJobSupportsChunkedDownload(t *testing.T) {
+	previousStats := stats
+	previousJobs := dashboardExportJobs
+	stats = NewRequestStatistics()
+	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, ExportMaxRecords: 100})
+	dashboardExportJobs = newDashboardExportJobManager()
+	t.Cleanup(func() {
+		dashboardExportJobs = previousJobs
+		stats = previousStats
+	})
+
+	stats.Record(UsageRecord{
+		Provider:    "openai",
+		Source:      "openai-prod",
+		Model:       "gpt-4",
+		RequestedAt: time.Now(),
+		Detail:      UsageDetail{InputTokens: 10, OutputTokens: 5},
+	})
+
+	var created dashboardExportJobResponse
+	createResp := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+		Method: "POST",
+		Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-jobs",
+		Query:  map[string][]string{"format": {"json"}},
+	}), &created)
+	if createResp.StatusCode != http.StatusAccepted || created.ID == "" {
+		t.Fatalf("created chunked export = status %d body %#v, want 202 with job id", createResp.StatusCode, created)
+	}
+
+	var status dashboardExportJobResponse
+	waitForTestCondition(t, func() bool {
+		decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+			Method: "GET",
+			Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-jobs",
+			Query:  map[string][]string{"id": {created.ID}},
+		}), &status)
+		return status.Status == dashboardExportJobSucceeded
+	})
+	if status.BodyBytes <= 0 {
+		t.Fatalf("chunked export body bytes = %d, want positive", status.BodyBytes)
+	}
+
+	var body []byte
+	totalBytes := int64(status.BodyBytes)
+	for offset := int64(0); offset < totalBytes; {
+		resp := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+			Method: "GET",
+			Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-download",
+			Query: map[string][]string{
+				"id":         {created.ID},
+				"offset":     {fmt.Sprintf("%d", offset)},
+				"chunk_size": {"32"},
+			},
+		}), nil)
+		if resp.StatusCode != http.StatusPartialContent {
+			t.Fatalf("chunk status at offset %d = %d, want 206", offset, resp.StatusCode)
+		}
+		if len(resp.Body) == 0 {
+			t.Fatalf("empty export chunk at offset %d", offset)
+		}
+		if got := resp.Headers["X-Export-Chunk-Offset"]; len(got) != 1 || got[0] != fmt.Sprintf("%d", offset) {
+			t.Fatalf("chunk offset header = %#v, want %d", got, offset)
+		}
+		if got := resp.Headers["X-Export-Chunk-Bytes"]; len(got) != 1 || got[0] != fmt.Sprintf("%d", len(resp.Body)) {
+			t.Fatalf("chunk byte header = %#v, want %d", got, len(resp.Body))
+		}
+		body = append(body, resp.Body...)
+		offset += int64(len(resp.Body))
+	}
+	if int64(len(body)) != totalBytes {
+		t.Fatalf("assembled export bytes = %d, want %d", len(body), totalBytes)
+	}
+	var result EventsResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal assembled export: %v; body=%q", err, string(body))
+	}
+	if result.Total != 1 || len(result.Events) != 1 {
+		t.Fatalf("assembled export payload = total %d rows %d, want 1/1", result.Total, len(result.Events))
+	}
+
+	empty := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+		Method: "GET",
+		Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-download",
+		Query: map[string][]string{
+			"id":         {created.ID},
+			"offset":     {fmt.Sprintf("%d", totalBytes)},
+			"chunk_size": {"32"},
+		},
+	}), nil)
+	if empty.StatusCode != http.StatusOK || len(empty.Body) != 0 {
+		t.Fatalf("empty terminal chunk = status %d body %d, want 200/0", empty.StatusCode, len(empty.Body))
+	}
+	if got := empty.Headers["Content-Range"]; len(got) != 1 || got[0] != fmt.Sprintf("bytes */%d", totalBytes) {
+		t.Fatalf("empty terminal range = %#v, want bytes */%d", got, totalBytes)
+	}
+}
+
+func TestDashboardEventsExportAsyncJobSupportsSmallUTF8AndGzipChunks(t *testing.T) {
+	previousStats := stats
+	previousJobs := dashboardExportJobs
+	stats = NewRequestStatistics()
+	stats.Configure(runtimeConfig{MaxDetailsPerModel: 100, DedupWindowMinutes: 0, ExportMaxRecords: 100})
+	dashboardExportJobs = newDashboardExportJobManager()
+	t.Cleanup(func() {
+		dashboardExportJobs = previousJobs
+		stats = previousStats
+	})
+
+	stats.Record(UsageRecord{
+		Provider: "openai",
+		Source:   "上游接口",
+		Model:    "gpt-4",
+		Detail:   UsageDetail{InputTokens: 10, OutputTokens: 5},
+	})
+
+	createJob := func(query map[string][]string) dashboardExportJobResponse {
+		var created dashboardExportJobResponse
+		response := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+			Method: "POST",
+			Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-jobs",
+			Query:  query,
+		}), &created)
+		if response.StatusCode != http.StatusAccepted || created.ID == "" {
+			t.Fatalf("created export = status %d body %#v", response.StatusCode, created)
+		}
+		var status dashboardExportJobResponse
+		waitForTestCondition(t, func() bool {
+			decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+				Method: "GET",
+				Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-jobs",
+				Query:  map[string][]string{"id": {created.ID}},
+			}), &status)
+			return status.Status == dashboardExportJobSucceeded
+		})
+		return status
+	}
+
+	downloadChunks := func(id string, totalBytes int, chunkSize int) []byte {
+		body := make([]byte, 0, totalBytes)
+		for offset := 0; offset < totalBytes; {
+			response := decodeManagementResponse(t, invokeManagement(t, ManagementRequest{
+				Method: "GET",
+				Path:   "/v0/management/plugins/usage-dashboard-zduu/dashboard-events-export-download",
+				Query: map[string][]string{
+					"id":         {id},
+					"offset":     {strconv.Itoa(offset)},
+					"chunk_size": {strconv.Itoa(chunkSize)},
+				},
+			}), nil)
+			if response.StatusCode != http.StatusPartialContent || len(response.Body) == 0 {
+				t.Fatalf("chunk at offset %d = status %d body %d, want non-empty 206", offset, response.StatusCode, len(response.Body))
+			}
+			body = append(body, response.Body...)
+			offset += len(response.Body)
+		}
+		return body
+	}
+
+	textStatus := createJob(map[string][]string{"format": {"json"}})
+	textBody := downloadChunks(textStatus.ID, textStatus.BodyBytes, 1)
+	if len(textBody) != textStatus.BodyBytes {
+		t.Fatalf("small UTF-8 chunks = %d bytes, want %d", len(textBody), textStatus.BodyBytes)
+	}
+
+	gzipStatus := createJob(map[string][]string{"format": {"json"}, "gzip": {"1"}})
+	gzipBody := downloadChunks(gzipStatus.ID, gzipStatus.BodyBytes, 7)
+	if len(gzipBody) != gzipStatus.BodyBytes {
+		t.Fatalf("gzip chunks = %d bytes, want %d", len(gzipBody), gzipStatus.BodyBytes)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(gzipBody))
+	if err != nil {
+		t.Fatalf("open chunked gzip export: %v", err)
+	}
+	decoded, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("read chunked gzip export: %v", err)
+	}
+	if !strings.Contains(string(decoded), "上游接口") {
+		t.Fatalf("chunked gzip export lost UTF-8 source: %q", string(decoded))
 	}
 }
 

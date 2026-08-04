@@ -40,7 +40,16 @@ let tokenTrendVisibility = null;
 let apiDetailSeq = 0;
 const apiDetailCache = new Map();
 const conditionalPayloadCache = new Map();
+const apiDetailCacheLimits = { maxEntries: 32, maxBytes: 8 * 1024 * 1024 };
+const conditionalPayloadCacheLimits = { maxEntries: 64, maxBytes: 4 * 1024 * 1024 };
+const boundedCacheMeta = new WeakMap();
+let modelPricesLoadedAt = 0;
+let modelPricesPromise = null;
+const modelPricesTtlMs = 5 * 60 * 1000;
+let dashboardLoadController = null;
+let dashboardLoadSequence = 0;
 let apiDetailLastRender = null;
+let eventsRequestSeq = 0;
 let eventsPageOffset = 0;
 let apiDetailRecentOffset = 0;
 let updatedState = { type: 'loading', generatedAt: null, message: '' };
@@ -239,6 +248,60 @@ function cloneHeaders(headers) {
   return Object.assign({}, headers);
 }
 
+function cacheValueSize(value) {
+  try {
+    const encoded = JSON.stringify(value);
+    return Math.max(1, encoded ? utf8ByteLength(encoded) : 1);
+  } catch {
+    return 1;
+  }
+}
+
+function boundedCacheSet(cache, key, value, limits) {
+  let meta = boundedCacheMeta.get(cache);
+  if (!meta) {
+    meta = { bytes: 0, sizes: new Map() };
+    boundedCacheMeta.set(cache, meta);
+  }
+  if (cache.has(key)) {
+    meta.bytes -= meta.sizes.get(key) || 0;
+    meta.sizes.delete(key);
+    cache.delete(key);
+  }
+  const size = cacheValueSize(value);
+  cache.set(key, value);
+  meta.sizes.set(key, size);
+  meta.bytes += size;
+  while (cache.size > limits.maxEntries || meta.bytes > limits.maxBytes) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    const oldestKey = oldest.value;
+    meta.bytes -= meta.sizes.get(oldestKey) || 0;
+    meta.sizes.delete(oldestKey);
+    cache.delete(oldestKey);
+  }
+}
+
+function boundedCacheDelete(cache, key) {
+  if (!cache.has(key)) return;
+  const meta = boundedCacheMeta.get(cache);
+  if (meta) {
+    meta.bytes -= meta.sizes.get(key) || 0;
+    meta.sizes.delete(key);
+  }
+  cache.delete(key);
+}
+
+function requestOptionsWithSignal(options, signal) {
+  const merged = Object.assign({}, options || {});
+  if (signal) merged.signal = signal;
+  return merged;
+}
+
+function isAbortError(error) {
+  return !!error && (error.name === 'AbortError' || error.code === 20);
+}
+
 function headerValue(headers, name) {
   if (!headers) return '';
   if (typeof headers.get === 'function') return headers.get(name) || headers.get(String(name).toLowerCase()) || '';
@@ -303,14 +366,50 @@ async function fetchTextPayload(url, options) {
 async function fetchTextPayloadWithMeta(url, options) {
   const response = await fetch(url, options);
   const text = await response.text();
+  const responseHeaders = cloneHeaders(response.headers);
   if (!response.ok) throw new Error(text || (t('request_failed_colon') + response.status));
-  if (!text) return { data: '', statusCode: response.status || 200, headers: {} };
+  if (!text) return { data: '', statusCode: response.status || 200, headers: responseHeaders };
   let payload = null;
-  try { payload = JSON.parse(text) } catch { return { data: text, statusCode: response.status || 200, headers: {} } }
+  try { payload = JSON.parse(text) } catch { return { data: text, statusCode: response.status || 200, headers: responseHeaders } }
   const meta = unwrapPluginPayloadWithMeta(payload);
   if (meta.data == null) meta.data = '';
   meta.data = typeof meta.data === 'string' ? meta.data : JSON.stringify(meta.data);
+  meta.headers = Object.assign({}, responseHeaders, meta.headers || {});
   return meta;
+}
+
+async function fetchBinaryPayloadWithMeta(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  const responseHeaders = cloneHeaders(response.headers);
+  if (!response.ok) throw new Error(text || (t('request_failed_colon') + response.status));
+  if (!text) return { data: new Uint8Array(), statusCode: response.status || 200, headers: responseHeaders };
+
+  let payload;
+  try { payload = JSON.parse(text); } catch { return { data: new TextEncoder().encode(text), statusCode: response.status || 200, headers: responseHeaders }; }
+  if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'ok')) {
+    return { data: decodeManagementBodyBytes(payload), statusCode: response.status || 200, headers: responseHeaders };
+  }
+  if (!payload.ok) {
+    const message = payload.error && payload.error.message ? payload.error.message : t('request_failed');
+    throw new Error(message);
+  }
+  let result = payload.result;
+  if (typeof result === 'string') {
+    try { result = JSON.parse(result); } catch {}
+  }
+  if (result && typeof result === 'object' && typeof result.status_code === 'number' && Object.prototype.hasOwnProperty.call(result, 'body')) {
+    const data = decodeManagementBodyBytes(result.body);
+    if (result.status_code >= 400) {
+      throw new Error(new TextDecoder().decode(data) || (t('request_failed_colon') + result.status_code));
+    }
+    return {
+      data,
+      statusCode: result.status_code,
+      headers: Object.assign({}, responseHeaders, result.headers || {}),
+    };
+  }
+  return { data: decodeManagementBodyBytes(result), statusCode: response.status || 200, headers: responseHeaders };
 }
 
 async function fetchConditionalJsonPayload(cacheKey, url, options) {
@@ -331,8 +430,8 @@ async function fetchConditionalJsonPayload(cacheKey, url, options) {
     if (meta.statusCode === 304) throw new Error(t('no_304_cache'));
   }
   const etag = headerValue(meta.headers, 'ETag');
-  if (etag) conditionalPayloadCache.set(cacheKey, { etag, data: meta.data });
-  else conditionalPayloadCache.delete(cacheKey);
+  if (etag) boundedCacheSet(conditionalPayloadCache, cacheKey, { etag, data: meta.data }, conditionalPayloadCacheLimits);
+  else boundedCacheDelete(conditionalPayloadCache, cacheKey);
   return meta.data;
 }
 
@@ -363,11 +462,24 @@ function pluginFetchOptions(options) {
   return managementFetchOptions(options);
 }
 
-async function loadModelPrices() {
-  const data = await fetchJsonPayload(pluginEndpoint('model-prices'), pluginFetchOptions({ cache: 'no-store' }));
-  modelPrices = (data && data.prices) || {};
-  manualModelPrices = manualPricesFromResponse(data);
-  return modelPrices;
+async function loadModelPrices(options) {
+  const opts = options || {};
+  const force = !!opts.force;
+  if (!force && modelPricesLoadedAt > 0 && Date.now() - modelPricesLoadedAt < modelPricesTtlMs) return modelPrices;
+  if (modelPricesPromise) return modelPricesPromise;
+  const request = (async () => {
+    const data = await fetchJsonPayload(pluginEndpoint('model-prices'), requestOptionsWithSignal(pluginFetchOptions({ cache: 'no-store' }), opts.signal));
+    modelPrices = (data && data.prices) || {};
+    manualModelPrices = manualPricesFromResponse(data);
+    modelPricesLoadedAt = Date.now();
+    return modelPrices;
+  })();
+  modelPricesPromise = request;
+  try {
+    return await request;
+  } finally {
+    if (modelPricesPromise === request) modelPricesPromise = null;
+  }
 }
 
 async function saveModelPrice(model, price) {
@@ -378,6 +490,7 @@ async function saveModelPrice(model, price) {
   });
   modelPrices = (data && data.prices) || {};
   manualModelPrices = manualPricesFromResponse(data);
+  modelPricesLoadedAt = Date.now();
   return modelPrices;
 }
 
@@ -387,6 +500,7 @@ async function deleteModelPrice(model) {
   const data = await fetchManagementJsonPayload('model-prices?' + params.toString(), { method: 'DELETE' });
   modelPrices = (data && data.prices) || {};
   manualModelPrices = manualPricesFromResponse(data);
+  modelPricesLoadedAt = Date.now();
   return modelPrices;
 }
 
@@ -956,7 +1070,7 @@ async function selectClientApiCard(selector, rows) {
   await rerender({ refreshEvents: true, refreshApiDetail: true });
 }
 
-async function refreshFilteredSummary() {
+async function refreshFilteredSummary(signal) {
   if (!selectedClientApi) return null;
   const context = clientApiFilterContext();
   const params = new URLSearchParams();
@@ -964,13 +1078,14 @@ async function refreshFilteredSummary() {
   params.set('client_api', selectedClientApi.selector);
   const url = pluginEndpoint('dashboard-summary') + '?' + params.toString();
   try {
-    const data = requireObjectPayload(await fetchConditionalJsonPayload('dashboard-summary:' + url, url, pluginFetchOptions({ cache: 'no-store' })), 'dashboard-summary');
+    const data = requireObjectPayload(await fetchConditionalJsonPayload('dashboard-summary:' + url, url, requestOptionsWithSignal(pluginFetchOptions({ cache: 'no-store' }), signal)), 'dashboard-summary');
     if (context !== clientApiFilterContext()) return null;
     filteredSummaryData = data;
     filteredSummaryContext = context;
     filteredSummaryError = null;
     return data;
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (context === clientApiFilterContext()) {
       if (filteredSummaryContext !== context) filteredSummaryData = null;
       filteredSummaryError = error;
@@ -1054,7 +1169,7 @@ function normalizeApiDetailEvent(d) {
   });
 }
 
-async function fetchApiDetailData(api, recentOffset) {
+async function fetchApiDetailData(api, recentOffset, signal) {
   if (!Number.isFinite(Number(recentOffset)) || recentOffset < 0) recentOffset = 0;
   const params = new URLSearchParams();
   params.set('range', $('range').value);
@@ -1063,7 +1178,7 @@ async function fetchApiDetailData(api, recentOffset) {
   params.set('recent_offset', String(recentOffset));
   if (selectedClientApiSelector()) params.set('client_api', selectedClientApiSelector());
   const url = pluginEndpoint('dashboard-api-detail') + '?' + params.toString();
-  const data = requireObjectPayload(await fetchConditionalJsonPayload('dashboard-api-detail:' + url, url, pluginFetchOptions({ cache: 'no-store' })), 'dashboard-api-detail');
+  const data = requireObjectPayload(await fetchConditionalJsonPayload('dashboard-api-detail:' + url, url, requestOptionsWithSignal(pluginFetchOptions({ cache: 'no-store' }), signal)), 'dashboard-api-detail');
   data.recent_events = (data.recent_events || []).map(normalizeApiDetailEvent);
   return data;
 }
@@ -1164,7 +1279,7 @@ function renderApiDetailContent(apiData, detailState) {
   };
 }
 
-async function renderApiDetail() {
+async function renderApiDetail(signal) {
   const panelData = dashboardPanelData();
   const usage = panelData && panelData.usage;
   const apiData = usage && usage.apis && usage.apis[selectedApi];
@@ -1177,17 +1292,18 @@ async function renderApiDetail() {
   setText('apiDetailTitle', friendlyApiName(api));
   renderApiDetailContent(apiData, cached ? { detail: cached, loading: true } : { loading: true });
   try {
-    const result = await fetchApiDetailData(api, requestedOffset);
+    const result = await fetchApiDetailData(api, requestedOffset, signal);
     if (seq !== apiDetailSeq || api !== selectedApi || requestedOffset !== apiDetailRecentOffset) return;
     const total = apiDetailRecentTotal(result);
     const limit = Math.max(1, num(result && result.recent_limit) || apiDetailRecentPageSize);
     if (total > 0 && requestedOffset >= total) {
       apiDetailRecentOffset = Math.floor((total - 1) / limit) * limit;
-      if (apiDetailRecentOffset !== requestedOffset) return renderApiDetail();
+      if (apiDetailRecentOffset !== requestedOffset) return renderApiDetail(signal);
     }
-    apiDetailCache.set(cacheKey, result);
+    boundedCacheSet(apiDetailCache, cacheKey, result, apiDetailCacheLimits);
     renderApiDetailContent(apiData, { detail: result });
   } catch (e) {
+    if (isAbortError(e)) throw e;
     if (seq !== apiDetailSeq || api !== selectedApi || requestedOffset !== apiDetailRecentOffset) return;
     renderApiDetailContent(apiData, cached ? { detail: cached, error: e } : { error: e });
   }
@@ -1986,7 +2102,8 @@ function renderEventsContent() {
   renderFilters();
 }
 
-async function renderEvents() {
+async function renderEvents(signal) {
+  const requestSeq = ++eventsRequestSeq;
   const params = new URLSearchParams();
   params.set('limit', String(eventsLimit));
   params.set('offset', String(eventsPageOffset));
@@ -1997,20 +2114,25 @@ async function renderEvents() {
   if (selectedClientApiSelector()) params.set('client_api', selectedClientApiSelector());
   try {
     const url = pluginEndpoint('dashboard-events') + '?' + params.toString();
-    eventsData = normalizeEventsPayload(await fetchConditionalJsonPayload('dashboard-events:' + url, url, pluginFetchOptions({ cache: 'no-store' })));
+    const payload = await fetchConditionalJsonPayload('dashboard-events:' + url, url, requestOptionsWithSignal(pluginFetchOptions({ cache: 'no-store' }), signal));
+    if (requestSeq !== eventsRequestSeq) return;
+    eventsData = normalizeEventsPayload(payload);
     eventsDataUrl = url;
   } catch (e) {
+    if (isAbortError(e)) throw e;
+    if (requestSeq !== eventsRequestSeq) return;
     const url = pluginEndpoint('dashboard-events') + '?' + params.toString();
     if (!eventsData || eventsDataUrl !== url) {
       eventsData = { events: [], total: 0, limit: eventsLimit, offset: eventsPageOffset };
       eventsDataUrl = url;
     }
   }
+  if (requestSeq !== eventsRequestSeq) return;
   const normalized = normalizeEventsPayload(eventsData);
   const effectiveLimit = Math.max(1, normalized.limit || eventsPageSize);
   if (normalized.total > 0 && eventsPageOffset >= normalized.total) {
     eventsPageOffset = Math.floor((normalized.total - 1) / effectiveLimit) * effectiveLimit;
-    if (eventsPageOffset !== normalized.offset) return renderEvents();
+    if (eventsPageOffset !== normalized.offset) return renderEvents(signal);
   }
   renderEventsContent();
 }
@@ -2061,13 +2183,64 @@ async function waitForExportJob(job) {
   throw new Error(t('export_job_timeout'));
 }
 
+const exportDownloadChunkSize = 1 << 20;
+
+function utf8ByteLength(value) {
+  const text = String(value || '');
+  if (!text) return 0;
+  if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length;
+  try {
+    return encodeURIComponent(text).replace(/%[0-9A-F]{2}|./gi, 'x').length;
+  } catch {
+    return text.length;
+  }
+}
+
+async function fetchExportJobFileChunks(job, downloadPath) {
+  const totalBytes = Math.max(0, num(job && job.body_bytes));
+  if (totalBytes <= 0) {
+    return fetchTextPayloadWithMeta(managementEndpoint(downloadPath), pluginFetchOptions({ cache: 'no-store' }));
+  }
+  const chunks = [];
+  let offset = 0;
+  let responseHeaders = {};
+  while (offset < totalBytes) {
+    const separator = String(downloadPath).includes('?') ? '&' : '?';
+    const chunkPath = String(downloadPath) + separator + 'offset=' + encodeURIComponent(String(offset)) + '&chunk_size=' + encodeURIComponent(String(exportDownloadChunkSize));
+    const meta = job && job.gzip
+      ? await fetchBinaryPayloadWithMeta(managementEndpoint(chunkPath), pluginFetchOptions({ cache: 'no-store' }))
+      : await fetchTextPayloadWithMeta(managementEndpoint(chunkPath), pluginFetchOptions({ cache: 'no-store' }));
+    const chunk = job && job.gzip
+      ? (meta.data instanceof Uint8Array ? meta.data : new Uint8Array(meta.data || []))
+      : (typeof meta.data === 'string' ? meta.data : String(meta.data || ''));
+    if (!Object.keys(responseHeaders).length) responseHeaders = meta.headers || {};
+    const advertisedBytes = num(headerValue(meta.headers, 'X-Export-Chunk-Bytes'));
+    const chunkBytes = advertisedBytes > 0 ? advertisedBytes : (job && job.gzip ? chunk.byteLength : utf8ByteLength(chunk));
+    if (chunkBytes <= 0 || (chunk instanceof Uint8Array ? chunk.byteLength === 0 : !chunk)) throw new Error(t('export_failed'));
+    if (offset + chunkBytes > totalBytes) throw new Error(t('export_failed'));
+    chunks.push(chunk);
+    offset += chunkBytes;
+  }
+  if (offset !== totalBytes) throw new Error(t('export_failed'));
+  if (job && job.gzip) {
+    const data = new Uint8Array(totalBytes);
+    let position = 0;
+    chunks.forEach((chunk) => {
+      data.set(chunk, position);
+      position += chunk.byteLength;
+    });
+    return { data, statusCode: 200, headers: responseHeaders };
+  }
+  return { data: chunks.join(''), statusCode: 200, headers: responseHeaders };
+}
+
 async function fetchExportJobResult(params) {
   const job = await createExportJob(params);
   if (!job || !job.id) throw new Error(t('export_no_id'));
   try {
     const completed = await waitForExportJob(job);
     const downloadPath = completed.download_path || ('dashboard-events-export-download?id=' + encodeURIComponent(job.id));
-    return await fetchTextPayloadWithMeta(managementEndpoint(downloadPath), pluginFetchOptions({ cache: 'no-store' }));
+    return await fetchExportJobFileChunks(completed, downloadPath);
   } finally {
     await deleteExportJob(job.id);
   }
@@ -2649,9 +2822,9 @@ async function rerender(options) {
   renderModelStats();
   initTrendChart();
   renderTrendChart();
-  if (opts.refreshEvents) await renderEvents();
+  if (opts.refreshEvents) await renderEvents(opts.signal);
   else renderEventsContent();
-  if (opts.refreshApiDetail || previousApi !== selectedApi) await renderApiDetail();
+  if (opts.refreshApiDetail || previousApi !== selectedApi) await renderApiDetail(opts.signal);
   else renderApiDetailFromCache();
 }
 
@@ -2661,6 +2834,12 @@ function nextFailureDelay() { return Math.min(300000, [5000, 15000, 45000, 90000
 
 async function load(options) {
   const forceDetails = options && options.forceDetails;
+  const loadSequence = ++dashboardLoadSequence;
+  if (dashboardLoadController && typeof dashboardLoadController.abort === 'function') dashboardLoadController.abort();
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  dashboardLoadController = controller;
+  const signal = controller && controller.signal;
+  const isCurrentLoad = () => loadSequence === dashboardLoadSequence;
   try {
     const previousSummary = summaryData;
     const selectedRange = $('range').value;
@@ -2670,26 +2849,31 @@ async function load(options) {
     // compatibility data path; stale prices are better than replacing
     // range-scoped stats with reconstructed fallback data.
     const [data] = await Promise.all([
-      fetchConditionalJsonPayload('dashboard-summary:' + summaryUrl, summaryUrl, pluginFetchOptions({ cache: 'no-store' })),
-      loadModelPrices().catch(function() { /* prices failure tolerated; stale prices beat wrong stats */ }),
+      fetchConditionalJsonPayload('dashboard-summary:' + summaryUrl, summaryUrl, requestOptionsWithSignal(pluginFetchOptions({ cache: 'no-store' }), signal)),
+      loadModelPrices({ signal }).catch(function() { /* prices failure tolerated; stale prices beat wrong stats */ }),
     ]);
+    if (!isCurrentLoad()) return;
     summaryData = requireObjectPayload(data, 'dashboard-summary');
-    if (selectedClientApi) await refreshFilteredSummary();
+    if (selectedClientApi) await refreshFilteredSummary(signal);
+    if (!isCurrentLoad()) return;
     updatedState = { type: 'success', generatedAt: data.generated_at || Date.now(), message: '' };
     renderUpdated();
     const refreshDetails = !!selectedClientApi || shouldRefreshDetails(previousSummary, summaryData, forceDetails);
-    await rerender({ refreshEvents: refreshDetails, refreshApiDetail: refreshDetails });
+    await rerender({ refreshEvents: refreshDetails, refreshApiDetail: refreshDetails, signal });
+    if (!isCurrentLoad()) return;
     currentRange = selectedRange;
     pollFailures = 0; schedulePoll(pollDelay());
   } catch (error) {
+    if (!isCurrentLoad() || isAbortError(error)) return;
     // Fallback: try old dashboard-data endpoint
     try {
       const previousSummary = summaryData;
       const selectedRange = $('range').value;
       const [data] = await Promise.all([
-        fetchJsonPayload(pluginEndpoint('dashboard-data'), pluginFetchOptions({ cache: 'no-store' })),
-        loadModelPrices().catch(function() { /* prices failure tolerated */ }),
+        fetchJsonPayload(pluginEndpoint('dashboard-data'), requestOptionsWithSignal(pluginFetchOptions({ cache: 'no-store' }), signal)),
+        loadModelPrices({ signal }).catch(function() { /* prices failure tolerated */ }),
       ]);
+      if (!isCurrentLoad()) return;
       summaryData = buildSummaryFromFullUsage(data, selectedRange);
       if (selectedClientApi) {
         filteredSummaryData = null;
@@ -2699,14 +2883,18 @@ async function load(options) {
       updatedState = { type: 'compat', generatedAt: data.generated_at || Date.now(), message: '' };
       renderUpdated();
       const refreshDetails = shouldRefreshDetails(previousSummary, summaryData, forceDetails);
-      await rerender({ refreshEvents: refreshDetails, refreshApiDetail: refreshDetails });
+      await rerender({ refreshEvents: refreshDetails, refreshApiDetail: refreshDetails, signal });
+      if (!isCurrentLoad()) return;
       currentRange = selectedRange;
       pollFailures = 0; schedulePoll(pollDelay());
     } catch (fallbackError) {
+      if (!isCurrentLoad() || isAbortError(fallbackError)) return;
       updatedState = { type: 'error', generatedAt: null, message: (fallbackError && fallbackError.message) || (error && error.message) || '' };
       renderUpdated();
       pollFailures++; schedulePoll(nextFailureDelay());
     }
+  } finally {
+    if (dashboardLoadController === controller) dashboardLoadController = null;
   }
 }
 

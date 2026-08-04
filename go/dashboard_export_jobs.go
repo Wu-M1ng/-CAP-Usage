@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -160,16 +161,110 @@ func handleDashboardEventsExportDownload(query map[string][]string) ([]byte, err
 		return dashboardExportJobJSON(http.StatusAccepted, dashboardExportJobSnapshot(job))
 	}
 
-	body, err := os.ReadFile(job.FilePath)
+	chunked := queryValue(query, "offset") != "" || queryValue(query, "chunk_size") != ""
+	if !chunked {
+		body, err := os.ReadFile(job.FilePath)
+		if err != nil {
+			return dashboardExportJobJSON(http.StatusGone, dashboardExportJobErrorResponse{Error: "export job file is no longer available"})
+		}
+		resp := ManagementResponse{
+			StatusCode: http.StatusOK,
+			Headers:    dashboardExportJobDownloadHeaders(job),
+			Body:       body,
+		}
+		return okEnvelopeJSON(string(mustMarshal(resp)))
+	}
+
+	offsetValue, err := dashboardExportDownloadInt(query, "offset", 0)
+	if err != nil {
+		return dashboardExportJobJSON(http.StatusBadRequest, dashboardExportJobErrorResponse{Error: "invalid export offset"})
+	}
+	offset := int64(offsetValue)
+	chunkSize, err := dashboardExportDownloadInt(query, "chunk_size", dashboardExportDownloadChunkSize)
+	if err != nil || chunkSize <= 0 {
+		return dashboardExportJobJSON(http.StatusBadRequest, dashboardExportJobErrorResponse{Error: "invalid export chunk size"})
+	}
+	if chunkSize > dashboardExportDownloadMaxChunkSize {
+		chunkSize = dashboardExportDownloadMaxChunkSize
+	}
+	if !job.Options.Gzip && chunkSize < utf8.UTFMax {
+		chunkSize = utf8.UTFMax
+	}
+	file, err := os.Open(job.FilePath)
 	if err != nil {
 		return dashboardExportJobJSON(http.StatusGone, dashboardExportJobErrorResponse{Error: "export job file is no longer available"})
 	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return dashboardExportJobJSON(http.StatusGone, dashboardExportJobErrorResponse{Error: "export job file is no longer available"})
+	}
+	totalBytes := info.Size()
+	if offset < 0 || offset >= totalBytes {
+		if offset == totalBytes {
+			return okEnvelopeJSON(string(mustMarshal(ManagementResponse{
+				StatusCode: http.StatusOK,
+				Headers:    dashboardExportJobChunkHeaders(job, offset, 0, totalBytes),
+				Body:       []byte{},
+			})))
+		}
+		return dashboardExportJobJSON(http.StatusRequestedRangeNotSatisfiable, dashboardExportJobErrorResponse{Error: "export offset is outside the file"})
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return dashboardExportJobJSON(http.StatusGone, dashboardExportJobErrorResponse{Error: "export job file is no longer available"})
+	}
+	body := make([]byte, chunkSize)
+	read, readErr := io.ReadFull(file, body)
+	if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+		return dashboardExportJobJSON(http.StatusGone, dashboardExportJobErrorResponse{Error: "read export job file failed"})
+	}
+	body = body[:read]
+	// JSON and CSV exports are UTF-8 text. Keep chunk boundaries valid so the
+	// management envelope can decode each response independently. gzip files
+	// are opaque binary data and must retain every byte.
+	if !job.Options.Gzip {
+		for len(body) > 0 && !utf8.Valid(body) {
+			body = body[:len(body)-1]
+		}
+	}
 	resp := ManagementResponse{
-		StatusCode: http.StatusOK,
-		Headers:    dashboardExportJobDownloadHeaders(job),
+		StatusCode: http.StatusPartialContent,
+		Headers:    dashboardExportJobChunkHeaders(job, offset, int64(len(body)), totalBytes),
 		Body:       body,
 	}
 	return okEnvelopeJSON(string(mustMarshal(resp)))
+}
+
+const (
+	dashboardExportDownloadChunkSize    = 1 << 20
+	dashboardExportDownloadMaxChunkSize = 4 << 20
+)
+
+func dashboardExportDownloadInt(query map[string][]string, key string, fallback int) (int, error) {
+	value := strings.TrimSpace(queryValue(query, key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0, err
+	}
+	return parsed, nil
+}
+
+func dashboardExportJobChunkHeaders(job dashboardExportJob, offset, chunkBytes, totalBytes int64) map[string][]string {
+	headers := dashboardExportJobDownloadHeaders(job)
+	headers["Content-Length"] = []string{strconv.FormatInt(chunkBytes, 10)}
+	if chunkBytes > 0 {
+		headers["Content-Range"] = []string{fmt.Sprintf("bytes %d-%d/%d", offset, offset+chunkBytes-1, totalBytes)}
+	} else {
+		headers["Content-Range"] = []string{fmt.Sprintf("bytes */%d", totalBytes)}
+	}
+	headers["Accept-Ranges"] = []string{"bytes"}
+	headers["X-Export-Chunk-Offset"] = []string{strconv.FormatInt(offset, 10)}
+	headers["X-Export-Chunk-Bytes"] = []string{strconv.FormatInt(chunkBytes, 10)}
+	headers["X-Export-Total-Bytes"] = []string{strconv.FormatInt(totalBytes, 10)}
+	return headers
 }
 
 func (m *dashboardExportJobManager) create(params EventsQuery, opts dashboardEventsExportOptions) (dashboardExportJob, int, string) {
@@ -205,12 +300,15 @@ func (m *dashboardExportJobManager) create(params EventsQuery, opts dashboardEve
 	snapshot := *job
 	m.mu.Unlock()
 
-	go m.run(id, params, opts, filePath)
+	go m.run(id, params, opts, filePath, now)
 	return snapshot, http.StatusAccepted, ""
 }
 
-func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dashboardEventsExportOptions, filePath string) {
+func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dashboardEventsExportOptions, filePath string, snapshotAt time.Time) {
 	startedAt := time.Now()
+	if snapshotAt.IsZero() {
+		snapshotAt = startedAt
+	}
 	m.update(id, func(job *dashboardExportJob) {
 		job.Status = dashboardExportJobRunning
 		job.StartedAt = startedAt
@@ -222,7 +320,7 @@ func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dash
 		return
 	}
 	tmpPath := filePath + ".tmp"
-	encoded, err := encodeDashboardEventsExportFile(params, opts, tmpPath, startedAt)
+	encoded, err := encodeDashboardEventsExportFile(params, opts, tmpPath, snapshotAt)
 	if err != nil {
 		_ = os.Remove(tmpPath)
 		m.fail(id, err)

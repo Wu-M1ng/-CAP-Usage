@@ -15,18 +15,19 @@ const (
 	defaultDedupWindowMinutes        = 24 * 60
 	// Retained for source compatibility with the removed JSONL implementation.
 	// These values are no longer exposed or read from runtime configuration.
-	defaultStorageFlushSeconds     = 30
-	defaultStorageSnapshotSeconds  = 300
-	defaultStorageSnapshotRecords  = 1000
-	defaultStorageSyncSeconds      = 0
-	defaultStorageSyncRecords      = 0
-	defaultStorageWriteQueueSize   = 4096
-	defaultStorageWriteBatchSize   = 128
-	defaultExportMaxRecords        = 100000
-	defaultEventStorePath          = "data/usage-statistics.db"
-	defaultPriceStoragePath        = "usage-statistics-prices.json"
-	defaultModelsDevPricesURL      = "https://models.dev/api.json"
-	defaultModelsDevRefreshSeconds = 12 * 60 * 60
+	defaultStorageFlushSeconds      = 30
+	defaultStorageSnapshotSeconds   = 300
+	defaultStorageSnapshotRecords   = 1000
+	defaultStorageSyncSeconds       = 0
+	defaultStorageSyncRecords       = 0
+	defaultStorageWriteQueueSize    = 4096
+	defaultStorageWriteBatchSize    = 128
+	defaultEventStoreWriteQueueSize = 256
+	defaultExportMaxRecords         = 100000
+	defaultEventStorePath           = "data/usage-statistics.db"
+	defaultPriceStoragePath         = "usage-statistics-prices.json"
+	defaultModelsDevPricesURL       = "https://models.dev/api.json"
+	defaultModelsDevRefreshSeconds  = 12 * 60 * 60
 )
 
 type envelope struct {

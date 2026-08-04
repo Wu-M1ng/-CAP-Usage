@@ -22,6 +22,12 @@ import (
 
 const eventStoreSchemaVersion = 2
 
+const (
+	eventStoreReadTimeout      = 10 * time.Second
+	eventStoreWriteTimeout     = 5 * time.Second
+	eventStoreBulkWriteTimeout = 60 * time.Second
+)
+
 const eventStoreSchema = `
 CREATE TABLE IF NOT EXISTS request_events (
 	id INTEGER PRIMARY KEY,
@@ -92,11 +98,12 @@ CREATE INDEX IF NOT EXISTS idx_events_fingerprint ON request_events(fingerprint,
 // eventStore owns the SQLite database that retains request event details and
 // the durable aggregate snapshot used to restore lightweight runtime state.
 type eventStore struct {
-	mu        sync.Mutex
-	db        *sql.DB
-	readDB    *sql.DB
-	path      string
-	temporary bool
+	mu                sync.Mutex
+	db                *sql.DB
+	readDB            *sql.DB
+	path              string
+	temporary         bool
+	beforeDirectWrite func()
 }
 
 // eventRow is the storage representation supplied by the statistics layer.
@@ -203,7 +210,8 @@ func openEventStore(path string, temporary bool) (*eventStore, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dsn)
+	dsnWithPragmas := sqliteEventStoreDSN(dsn)
+	db, err := sql.Open("sqlite", dsnWithPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("open event store: %w", err)
 	}
@@ -256,7 +264,7 @@ func openEventStore(path string, temporary bool) (*eventStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("ensure event store indexes: %w", err)
 	}
-	readDB, err := sql.Open("sqlite", dsn)
+	readDB, err := sql.Open("sqlite", dsnWithPragmas)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("open event store reader: %w", err)
@@ -276,6 +284,21 @@ func openEventStore(path string, temporary bool) (*eventStore, error) {
 		}
 	}
 	return &eventStore{db: db, readDB: readDB, path: dsn, temporary: temporary}, nil
+}
+
+func sqliteEventStoreDSN(path string) string {
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + "_pragma=busy_timeout%3d5000&_pragma=cache_size%3d-4096&_pragma=foreign_keys%3d1&_pragma=journal_mode%3dWAL&_pragma=synchronous%3d1"
+}
+
+func eventStoreContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 func ensureAggregateStateWatermark(ctx context.Context, db *sql.DB) error {
@@ -328,6 +351,16 @@ func sameEventStorePath(left, right string) bool {
 }
 
 func (s *eventStore) insertEvent(ctx context.Context, row eventRow, fingerprint string, exact bool, cutoff time.Time) (int64, bool, error) {
+	if s != nil {
+		s.mu.Lock()
+		beforeWrite := s.beforeDirectWrite
+		s.mu.Unlock()
+		if beforeWrite != nil {
+			beforeWrite()
+		}
+	}
+	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
+	defer cancel()
 	db, err := s.database()
 	if err != nil {
 		return 0, false, err
@@ -455,6 +488,8 @@ INSERT INTO request_events (
 }
 
 func (s *eventStore) enrichEvent(ctx context.Context, fingerprint string, timestamp time.Time, update RequestDetail) (bool, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
+	defer cancel()
 	db, err := s.database()
 	if err != nil {
 		return false, err
@@ -534,6 +569,8 @@ func (s *eventStore) queryEvents(ctx context.Context, q EventsQuery, now time.Ti
 }
 
 func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now time.Time, limit, offset int) (EventsResult, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return EventsResult{}, err
@@ -591,6 +628,8 @@ func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now tim
 // expressions intentionally mirror detailTotalsFromRequest so grouped rows
 // produce the same token and cost inputs as the detail path.
 func (s *eventStore) queryDashboardRange(ctx context.Context, q EventsQuery, now time.Time) (dashboardRangeQueryResult, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return dashboardRangeQueryResult{}, err
@@ -670,6 +709,8 @@ ORDER BY day_key ASC, hour_key ASC, total_requests DESC, api ASC, model ASC,
 }
 
 func (s *eventStore) forEachEvent(ctx context.Context, q EventsQuery, now time.Time, fn func(RequestDetail) error) error {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	if fn == nil {
 		return nil
 	}
@@ -711,6 +752,8 @@ func (s *eventStore) forEachEvent(ctx context.Context, q EventsQuery, now time.T
 }
 
 func (s *eventStore) forEachEventAfterID(ctx context.Context, afterID int64, fn func(RequestDetail) error) error {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	if fn == nil {
 		return nil
 	}
@@ -742,6 +785,8 @@ func (s *eventStore) forEachEventAfterID(ctx context.Context, afterID int64, fn 
 }
 
 func (s *eventStore) eventsAfterID(ctx context.Context, afterID int64) ([]RequestDetail, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	events := make([]RequestDetail, 0)
 	if err := s.forEachEventAfterID(ctx, afterID, func(detail RequestDetail) error {
 		events = append(events, detail)
@@ -753,6 +798,8 @@ func (s *eventStore) eventsAfterID(ctx context.Context, afterID int64) ([]Reques
 }
 
 func (s *eventStore) queryAPIDetail(ctx context.Context, api, rangeKey, clientAPI string, recentLimit, recentOffset, errorLimit int, now time.Time) (APIDetailResponse, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return APIDetailResponse{}, err
@@ -1084,7 +1131,9 @@ func restoredLatencyCount(avg float64, count int64) int64 {
 	return count
 }
 
-func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *StatisticsSnapshot) error {
+func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *StatisticsSnapshot, maxDetailsPerModel int) error {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	if snapshot == nil {
 		return nil
 	}
@@ -1118,7 +1167,13 @@ func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *Stat
 		}
 		modelName := normalizeModelName(detail.Model)
 		modelSnapshot := apiSnapshot.Models[modelName]
-		modelSnapshot.Details = append(modelSnapshot.Details, detail)
+		if maxDetailsPerModel != 0 {
+			modelSnapshot.Details = append(modelSnapshot.Details, detail)
+			if maxDetailsPerModel > 0 && len(modelSnapshot.Details) > maxDetailsPerModel {
+				copy(modelSnapshot.Details, modelSnapshot.Details[len(modelSnapshot.Details)-maxDetailsPerModel:])
+				modelSnapshot.Details = modelSnapshot.Details[:maxDetailsPerModel]
+			}
+		}
 		apiSnapshot.Models[modelName] = modelSnapshot
 		snapshot.APIs[apiName] = apiSnapshot
 	}
@@ -1129,6 +1184,8 @@ func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *Stat
 }
 
 func (s *eventStore) count(ctx context.Context) (int64, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return 0, err
@@ -1140,7 +1197,40 @@ func (s *eventStore) count(ctx context.Context) (int64, error) {
 	return total, nil
 }
 
+func (s *eventStore) countVisibleDetails(ctx context.Context, maxDetailsPerModel int) (int64, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
+	if maxDetailsPerModel == 0 {
+		return 0, nil
+	}
+	db, err := s.readDatabase()
+	if err != nil {
+		return 0, err
+	}
+	query := `
+SELECT COUNT(*)
+FROM (
+	SELECT ROW_NUMBER() OVER (
+		PARTITION BY api, model
+		ORDER BY timestamp_ns DESC, id DESC
+	) AS row_number
+	FROM request_events
+)
+WHERE row_number <= ?`
+	limit := maxDetailsPerModel
+	if limit < 0 {
+		limit = int(^uint(0) >> 1)
+	}
+	var total int64
+	if err := db.QueryRowContext(ctx, query, limit).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count visible event details: %w", err)
+	}
+	return total, nil
+}
+
 func (s *eventStore) maxEventID(ctx context.Context) (int64, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return 0, err
@@ -1153,6 +1243,8 @@ func (s *eventStore) maxEventID(ctx context.Context) (int64, error) {
 }
 
 func (s *eventStore) prune(ctx context.Context, maxDetailsPerModel int, retention time.Duration, now time.Time) (eventPruneResult, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
+	defer cancel()
 	db, err := s.database()
 	if err != nil {
 		return eventPruneResult{}, err
@@ -1215,7 +1307,10 @@ func (s *eventStore) pruneTxScoped(ctx context.Context, tx *sql.Tx, maxDetailsPe
 			return eventPruneResult{}, fmt.Errorf("prune expired events: %w", err)
 		}
 	}
-	if maxDetailsPerModel >= 0 {
+	// Keep every event inside the retention window in SQLite. The in-memory
+	// detail view remains capped, but deleting a retained row here would make
+	// it impossible to subtract that event when it expires later.
+	if maxDetailsPerModel >= 0 && retention <= 0 {
 		query := `DELETE FROM request_events
 WHERE id IN (
 	SELECT id FROM (
@@ -1292,6 +1387,8 @@ func (s *eventStore) loadAggregate(ctx context.Context) (StatisticsSnapshot, boo
 }
 
 func (s *eventStore) loadAggregateState(ctx context.Context) (aggregateState, bool, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return aggregateState{}, false, err
@@ -1321,6 +1418,8 @@ func (s *eventStore) loadAggregateState(ctx context.Context) (aggregateState, bo
 }
 
 func (s *eventStore) isEmpty(ctx context.Context) (bool, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
 	db, err := s.readDatabase()
 	if err != nil {
 		return false, err
@@ -1340,6 +1439,8 @@ SELECT
 // newly selected database is empty, so an existing destination is never
 // overwritten during configuration reload.
 func (s *eventStore) copyFrom(ctx context.Context, source *eventStore) error {
+	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
+	defer cancel()
 	if s == nil || source == nil || s == source {
 		return nil
 	}
@@ -1478,6 +1579,8 @@ failure, fingerprint, created_at_ns
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *eventStore) saveAggregate(ctx context.Context, snapshot StatisticsSnapshot) error {
+	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
+	defer cancel()
 	db, err := s.database()
 	if err != nil {
 		return err
@@ -1497,6 +1600,8 @@ func (s *eventStore) saveAggregate(ctx context.Context, snapshot StatisticsSnaps
 }
 
 func (s *eventStore) saveAggregateTx(ctx context.Context, tx *sql.Tx, snapshot StatisticsSnapshot) error {
+	ctx, cancel := eventStoreContext(ctx, eventStoreWriteTimeout)
+	defer cancel()
 	if tx == nil {
 		return errors.New("aggregate state transaction is nil")
 	}
