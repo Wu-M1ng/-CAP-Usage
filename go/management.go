@@ -17,16 +17,31 @@ func handleUsage(requestBody []byte) ([]byte, error) {
 		usageRecord.RequestedAt = time.Now()
 	}
 
-	authIndexes.Learn(usageRecord.AuthID, usageRecord.AuthIndex)
-	accepted := true
-	if usageFallbacks != nil {
-		usageRecord, accepted = usageFallbacks.HandleNative(usageRecord)
+	statistics := stats
+	fallbacks := usageFallbacks
+	process := func() {
+		processUsageRecord(statistics, fallbacks, usageRecord)
 	}
-	if accepted {
-		stats.Record(usageRecord)
+	if deferUsageCallback(statistics, process) {
+		return okEnvelopeJSON("{}")
 	}
+	process()
 
 	return okEnvelopeJSON("{}")
+}
+
+func processUsageRecord(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, record UsageRecord) {
+	if statistics == nil {
+		return
+	}
+	authIndexes.Learn(record.AuthID, record.AuthIndex)
+	accepted := true
+	if fallbacks != nil {
+		record, accepted = fallbacks.HandleNativeForStats(statistics, record)
+	}
+	if accepted {
+		statistics.Record(record)
+	}
 }
 
 func handleManagement(requestBody []byte) ([]byte, error) {

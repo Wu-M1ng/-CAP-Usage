@@ -1300,7 +1300,7 @@ func requestDetailFromUsageRecord(record UsageRecord, timestamp time.Time, white
 		AuthID:     strings.TrimSpace(record.AuthID),
 		AuthIndex:  strings.TrimSpace(record.AuthIndex),
 		AuthType:   strings.TrimSpace(record.AuthType),
-		Endpoint:   normalizeRequestEndpoint(record.Endpoint),
+		Endpoint:   inferRequestEndpoint(record.Endpoint, record.Provider, record.Source, record.ExecutorType),
 		BaseURL:    strings.TrimSpace(record.BaseURL),
 		Stream:     record.Stream,
 		Thinking:   usageThinking(record),
@@ -2735,7 +2735,7 @@ func (s *RequestStatistics) addStorageSnapshotResidualModelLocked(apiName, model
 
 func normalizeStorageSnapshotDetail(modelName string, detail RequestDetail, now time.Time) RequestDetail {
 	detail.Model = normalizeDetailModelName(modelName, detail.Model)
-	detail.Endpoint = normalizeRequestEndpoint(detail.Endpoint)
+	detail.Endpoint = inferRequestEndpoint(detail.Endpoint, detail.Provider, detail.Source)
 	if detail.Timestamp.IsZero() {
 		detail.Timestamp = now
 	}
@@ -5389,6 +5389,23 @@ func normalizeRequestEndpoint(raw string) string {
 	default:
 		return value
 	}
+}
+
+// inferRequestEndpoint preserves endpoint information for records produced by
+// older CPA versions that stored the upstream identity but left endpoint
+// empty. Only identities that explicitly describe OpenAI Responses are
+// inferred; generic OpenAI-compatible records may use chat completions.
+func inferRequestEndpoint(raw string, identities ...string) string {
+	if endpoint := normalizeRequestEndpoint(raw); endpoint != "" {
+		return endpoint
+	}
+	for _, identity := range identities {
+		value := strings.ToLower(strings.TrimSpace(identity))
+		if strings.Contains(value, "openai") && strings.Contains(value, "response") {
+			return "/v1/responses"
+		}
+	}
+	return ""
 }
 
 func isHTTPMethod(value string) bool {
@@ -8246,6 +8263,7 @@ func (s *RequestStatistics) Close() {
 	if s == nil {
 		return
 	}
+	waitForUsageCallbacks()
 	s.stopStorageWorker()
 	s.stopModelsDevPriceWorker()
 	s.storageControlMu.Lock()

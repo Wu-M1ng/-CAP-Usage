@@ -112,6 +112,9 @@ func cliproxyPluginShutdown() {
 	if dashboardExportJobs != nil {
 		dashboardExportJobs.close()
 	}
+	// Host callbacks return before SQLite writes and response parsing finish.
+	// Drain that queue before flushing fallback timers or closing the store.
+	shutdownUsageCallbacks()
 	if usageFallbacks != nil {
 		usageFallbacks.Flush()
 	}

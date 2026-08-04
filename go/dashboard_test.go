@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"path/filepath"
@@ -146,6 +147,78 @@ func TestEnrichRecordedUsageMovesUnknownClientAPIToRealKeyInSQLite(t *testing.T)
 	events := stats.QueryEvents(EventsQuery{Limit: 10})
 	if len(events.Events) != 1 || events.Events[0].APIKey != "s******" || events.Events[0].Endpoint != "/v1/responses" {
 		t.Fatalf("SQLite event after enrichment = %#v, want persisted key and endpoint", events.Events)
+	}
+}
+
+func TestSQLiteHistoricalOpenAIResponsesEventsInferEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage-statistics.db")
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     true,
+		StoragePath:        path,
+	})
+	defer stats.Close()
+
+	stats.mu.RLock()
+	store := stats.eventStore
+	stats.mu.RUnlock()
+	if store == nil {
+		t.Fatal("event store is nil")
+	}
+
+	// Simulate a row written by an older version: the provider is retained,
+	// but the endpoint column is empty.
+	detail := RequestDetail{
+		Model:     "gpt-5.5",
+		Timestamp: time.Now().Add(-time.Minute),
+		Source:    "openai-responses",
+		Provider:  "openai-responses",
+		Tokens:    TokenStats{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	}
+	_, _, err := store.insertEvent(context.Background(), eventRow{
+		API:       "openai-responses",
+		Model:     detail.Model,
+		Detail:    detail,
+		SourceKey: "openai-responses",
+	}, "", false, time.Time{})
+	if err != nil {
+		t.Fatalf("insert historical event: %v", err)
+	}
+
+	events := stats.QueryEvents(EventsQuery{API: "openai-responses", Limit: 10})
+	if len(events.Events) != 1 || events.Events[0].Endpoint != "/v1/responses" {
+		t.Fatalf("historical events = %#v, want /v1/responses", events.Events)
+	}
+	detailResult := stats.QueryAPIDetail("openai-responses", "24h", 10, 10)
+	if len(detailResult.RecentEvents) != 1 || detailResult.RecentEvents[0].Endpoint != "/v1/responses" {
+		t.Fatalf("historical api detail = %#v, want /v1/responses", detailResult.RecentEvents)
+	}
+}
+
+func TestOpenAIResponsesUsageRecordInfersEndpoint(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+		StorageEnabled:     false,
+	})
+
+	stats.Record(UsageRecord{
+		Provider:     "openai",
+		ExecutorType: "OpenAIResponsesExecutor",
+		Source:       "openai",
+		Model:        "gpt-5.5",
+		RequestedAt:  time.Now().Add(-time.Minute),
+		Detail:       UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+
+	events := stats.QueryEvents(EventsQuery{Limit: 10})
+	if len(events.Events) != 1 || events.Events[0].Endpoint != "/v1/responses" {
+		t.Fatalf("new OpenAI Responses events = %#v, want /v1/responses", events.Events)
 	}
 }
 

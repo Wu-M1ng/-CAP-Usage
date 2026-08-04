@@ -267,6 +267,72 @@ func TestHandleUsageAcceptsOpenAICompatibleLoosePayload(t *testing.T) {
 	}
 }
 
+func TestHandleUsageDoesNotWaitForSQLiteWrite(t *testing.T) {
+	previousStats := stats
+	previousFallbacks := usageFallbacks
+	storagePath := filepath.Join(t.TempDir(), "usage-statistics.db")
+	stats = NewRequestStatistics()
+	usageFallbacks = newUsageFallbackCoordinator()
+	t.Cleanup(func() {
+		usageFallbacks.Flush()
+		usageFallbacks = previousFallbacks
+		stats.Close()
+		stats = previousStats
+	})
+
+	stats.Configure(runtimeConfig{
+		StorageEnabled:     true,
+		StoragePath:        storagePath,
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+	})
+	store := stats.eventStore
+	if store == nil {
+		t.Fatal("event store is nil, want SQLite-backed test")
+	}
+
+	// Hold the store's only database connection. The old synchronous callback
+	// path blocks in stats.Record until this transaction is released.
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatalf("begin SQLite blocker: %v", err)
+	}
+
+	request := []byte(`{
+		"provider":"openai-compatible",
+		"executor_type":"OpenAICompatExecutor",
+		"model":"test-model",
+		"detail":{"input_tokens":10,"output_tokens":2,"total_tokens":12}
+	}`)
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, callErr := handleUsage(request)
+		done <- callErr
+	}()
+
+	select {
+	case callErr := <-done:
+		if callErr != nil {
+			t.Fatalf("handleUsage() error = %v", callErr)
+		}
+		if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+			t.Fatalf("handleUsage() waited %v for SQLite, want immediate callback return", elapsed)
+		}
+	case <-time.After(250 * time.Millisecond):
+		_ = tx.Rollback()
+		t.Fatal("handleUsage() waited for SQLite write before returning")
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("release SQLite blocker: %v", err)
+	}
+	waitForTestCondition(t, func() bool {
+		return stats.Snapshot().TotalRequests == 1
+	})
+}
+
 func TestRegisterAdvertisesResponseInterceptor(t *testing.T) {
 	raw, err := handleRegister(nil)
 	if err != nil {
@@ -1120,6 +1186,67 @@ func TestResponseInterceptFallbackDoesNotDoubleCountNativeMissingOptionalUsage(t
 	}
 }
 
+func TestResponseInterceptEnrichesNativeOpenAIResponsesEndpoint(t *testing.T) {
+	previousStats := stats
+	previousFallbacks := usageFallbacks
+	previousDelay := usageFallbackRecordDelay
+	stats = NewRequestStatistics()
+	usageFallbacks = newUsageFallbackCoordinator()
+	usageFallbackRecordDelay = 10 * time.Millisecond
+	t.Cleanup(func() {
+		usageFallbacks.Flush()
+		usageFallbacks = previousFallbacks
+		usageFallbackRecordDelay = previousDelay
+		stats = previousStats
+	})
+
+	interceptReq := ResponseInterceptRequest{
+		SourceFormat:   "openai-responses",
+		Model:          "gpt-5.5",
+		RequestedModel: "gpt-5.5",
+		RequestHeaders: map[string][]string{
+			"Authorization": {"Bearer client-responses-key"},
+		},
+		RequestBody: []byte(`{"model":"gpt-5.5"}`),
+		Body:        []byte(`{"model":"gpt-5.5","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}`),
+		StatusCode:  http.StatusOK,
+		Metadata:    map[string]any{},
+	}
+	interceptBody, err := json.Marshal(interceptReq)
+	if err != nil {
+		t.Fatalf("marshal response intercept request: %v", err)
+	}
+	if _, err := handleResponseIntercept(interceptBody); err != nil {
+		t.Fatalf("handleResponseIntercept() error = %v", err)
+	}
+
+	native := UsageRecord{
+		Provider:     "openai-responses",
+		ExecutorType: "OpenAIResponsesExecutor",
+		Model:        "gpt-5.5",
+		Alias:        "gpt-5.5",
+		APIKey:       "client-responses-key",
+		RequestedAt:  time.Now(),
+		Detail:       UsageDetail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120},
+	}
+	nativeBody, err := json.Marshal(native)
+	if err != nil {
+		t.Fatalf("marshal native usage record: %v", err)
+	}
+	if _, err := handleUsage(nativeBody); err != nil {
+		t.Fatalf("handleUsage() error = %v", err)
+	}
+
+	waitForTestCondition(t, func() bool {
+		events := stats.QueryEventsAt(EventsQuery{Range: "24h", Limit: 10}, time.Now())
+		return len(events.Events) == 1 && events.Events[0].Endpoint == "/v1/responses"
+	})
+	summary := stats.SummaryWithoutDetailsForRangeAt("24h", time.Now().Add(time.Second))
+	if summary.Usage.TotalRequests != 1 || summary.Usage.TotalTokens != 120 {
+		t.Fatalf("summary usage = %#v, want one native response record", summary.Usage)
+	}
+}
+
 func TestResponseInterceptDeduplicatesOpenAIResponsesAndGeminiVariants(t *testing.T) {
 	previousStats := stats
 	previousFallbacks := usageFallbacks
@@ -1601,6 +1728,139 @@ func TestResponseInterceptMetadataEnrichesRecentNativeUsage(t *testing.T) {
 	event := detail.RecentEvents[0]
 	if event.Endpoint != "/v1/responses" || event.Thinking.Intensity != "xhigh" || !event.Stream {
 		t.Fatalf("enriched endpoint/thinking/stream = %q/%#v/%t", event.Endpoint, event.Thinking, event.Stream)
+	}
+}
+
+func TestResponseInterceptMatchesDelayedNativeWithoutClientAPIKey(t *testing.T) {
+	previousStats := stats
+	previousDelay := usageFallbackRecordDelay
+	stats = NewRequestStatistics()
+	usageFallbackRecordDelay = 10 * time.Millisecond
+	t.Cleanup(func() {
+		usageFallbackRecordDelay = previousDelay
+		stats = previousStats
+	})
+
+	coordinator := newUsageFallbackCoordinator()
+	native := UsageRecord{
+		Provider:    "antigravity",
+		Model:       "gemini-2.5-flash",
+		Alias:       "gemini-2.5-flash",
+		AuthID:      "antigravity-user@example.com.json",
+		RequestedAt: time.Now(),
+		Detail: UsageDetail{
+			InputTokens:  200,
+			OutputTokens: 80,
+			TotalTokens:  280,
+		},
+	}
+	var accepted bool
+	native, accepted = coordinator.HandleNative(native)
+	if !accepted {
+		t.Fatal("HandleNative() = false, want native record accepted")
+	}
+	stats.Record(native)
+
+	// The host can deliver the response interceptor callback after the native
+	// usage callback. The association must survive that handoff delay.
+	time.Sleep(900 * time.Millisecond)
+	fallback, ok := usageRecordFromResponseIntercept(ResponseInterceptRequest{
+		SourceFormat:   "antigravity",
+		Model:          "gemini-2.5-flash",
+		RequestedModel: "gemini-2.5-flash",
+		RequestHeaders: map[string][]string{
+			"Authorization": {"Bearer client-key"},
+		},
+		Body:       []byte(`{"model":"gemini-2.5-flash","usageMetadata":{"promptTokenCount":200,"candidatesTokenCount":80}}`),
+		StatusCode: http.StatusOK,
+		Metadata: map[string]any{
+			"request_path": "/v1beta/models/gemini-2.5-flash:generateContent",
+		},
+	})
+	if !ok {
+		t.Fatal("usageRecordFromResponseIntercept() ok = false, want true")
+	}
+	if fallback.Provider != "antigravity" {
+		t.Fatalf("fallback provider = %q, want antigravity provider identity", fallback.Provider)
+	}
+	coordinator.Schedule(fallback)
+
+	waitForTestCondition(t, func() bool {
+		snapshot := stats.Snapshot()
+		if snapshot.TotalRequests >= 2 {
+			return true
+		}
+		events := stats.QueryEventsAt(EventsQuery{Range: "24h", Limit: 10}, time.Now())
+		return snapshot.TotalRequests == 1 && len(events.Events) == 1 && events.Events[0].Endpoint != ""
+	})
+	summary := stats.SummaryWithoutDetailsForRangeAt("24h", time.Now().Add(time.Second))
+	if summary.Usage.TotalRequests != 1 || summary.Usage.TotalTokens != 280 {
+		t.Fatalf("summary usage = %#v, want one native record", summary.Usage)
+	}
+	if _, ok := summary.Usage.APIs["gemini"]; ok {
+		t.Fatalf("summary APIs = %#v, did not expect duplicate gemini fallback", summary.Usage.APIs)
+	}
+	events := stats.QueryEventsAt(EventsQuery{Range: "24h", Limit: 10}, time.Now().Add(time.Second))
+	if len(events.Events) != 1 || events.Events[0].Endpoint != "/v1beta/models/gemini-2.5-flash:generateContent" {
+		t.Fatalf("events = %#v, want one enriched endpoint event", events.Events)
+	}
+}
+
+func TestResponseInterceptEnrichesCommittedFallbackFromLateNative(t *testing.T) {
+	previousStats := stats
+	previousDelay := usageFallbackRecordDelay
+	stats = NewRequestStatistics()
+	usageFallbackRecordDelay = 10 * time.Millisecond
+	t.Cleanup(func() {
+		usageFallbackRecordDelay = previousDelay
+		stats = previousStats
+	})
+
+	coordinator := newUsageFallbackCoordinator()
+	fallback := UsageRecord{
+		Provider:    "antigravity",
+		Model:       "gemini-2.5-flash",
+		Alias:       "gemini-2.5-flash",
+		APIKey:      "client-key",
+		RequestedAt: time.Now(),
+		Detail:      UsageDetail{InputTokens: 200, OutputTokens: 80, TotalTokens: 280},
+	}
+	coordinator.Schedule(fallback)
+	waitForTestCondition(t, func() bool {
+		return stats.Snapshot().TotalRequests == 1
+	})
+
+	native := fallback
+	native.Endpoint = "/v1beta/models/gemini-2.5-flash:generateContent"
+	native.RequestedAt = time.Now()
+	native, accepted := coordinator.HandleNative(native)
+	if accepted {
+		t.Fatal("HandleNative() = true, want committed fallback to suppress late native duplicate")
+	}
+	events := stats.QueryEventsAt(EventsQuery{Range: "24h", Limit: 10}, time.Now().Add(time.Second))
+	if len(events.Events) != 1 || events.Events[0].Endpoint != "/v1beta/models/gemini-2.5-flash:generateContent" {
+		t.Fatalf("events = %#v, want committed fallback enriched by native endpoint", events.Events)
+	}
+}
+
+func TestUsageFallbackKeepsDifferentClientAPIKeysSeparate(t *testing.T) {
+	left := UsageRecord{
+		Provider: "antigravity",
+		Model:    "gemini-2.5-flash",
+		Alias:    "gemini-2.5-flash",
+		APIKey:   "client-key-a",
+		Detail:   UsageDetail{InputTokens: 200, OutputTokens: 80, TotalTokens: 280},
+	}
+	right := left
+	right.APIKey = "client-key-b"
+	if usageFallbackMatchKey(left) != usageFallbackMatchKey(right) {
+		t.Fatal("fallback match keys differ, want optional client API identity")
+	}
+	if usageFallbackRecordsCompatible(left, right) {
+		t.Fatal("different non-empty client API keys matched, want separate requests")
+	}
+	if usageRecordFingerprint(left) == usageRecordFingerprint(right) {
+		t.Fatal("exact fingerprints equal, want client API identity preserved")
 	}
 }
 

@@ -114,6 +114,7 @@ func eventRowFromDetail(api, model string, detail RequestDetail) eventRow {
 	if model == "" {
 		model = detail.Model
 	}
+	detail.Endpoint = inferRequestEndpoint(detail.Endpoint, detail.Provider, detail.Source)
 	return eventRow{
 		API:       api,
 		Model:     model,
@@ -1503,7 +1504,7 @@ func scanEvent(scanner eventScanner) (RequestDetail, error) {
 		AuthID:      authID,
 		AuthIndex:   authIndex,
 		AuthType:    authType,
-		Endpoint:    normalizeRequestEndpoint(endpoint),
+		Endpoint:    inferRequestEndpoint(endpoint, provider, source),
 		BaseURL:     baseURL,
 		Stream:      stream != 0,
 		Tokens: TokenStats{

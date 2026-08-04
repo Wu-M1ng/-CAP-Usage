@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	defaultUsageFallbackDelay       = 2 * time.Second
-	usageFallbackNativeRecentWindow = 750 * time.Millisecond
+	defaultUsageFallbackDelay = 2 * time.Second
+	// Native usage and response interception are delivered by independent host
+	// callbacks. Keep the native observation long enough to cover a slow handoff
+	// without making the fallback wait longer before it becomes usable.
+	usageFallbackNativeRecentWindow = 5 * time.Second
 	usageFallbackLateNativeWindow   = 30 * time.Second
 )
 
@@ -171,26 +174,63 @@ func unmarshalResponseInterceptRequest(data []byte, r *ResponseInterceptRequest)
 }
 
 func handleResponseIntercept(requestBody []byte) ([]byte, error) {
+	statistics := stats
+	fallbacks := usageFallbacks
+	if deferUsageCallback(statistics, func() {
+		processResponseIntercept(statistics, fallbacks, requestBody)
+	}) {
+		return okEnvelopeJSON("{}")
+	}
+
 	var req ResponseInterceptRequest
 	if err := json.Unmarshal(requestBody, &req); err != nil {
 		return nil, fmt.Errorf("failed to parse response intercept request: %w", err)
 	}
-	if record, ok := usageRecordFromResponseIntercept(req); ok && usageFallbacks != nil {
-		usageFallbacks.Schedule(record)
+	if record, ok := usageRecordFromResponseIntercept(req); ok && fallbacks != nil {
+		fallbacks.ScheduleForStats(statistics, record)
 	}
 	return okEnvelopeJSON("{}")
 }
 
 func handleResponseStreamChunk(requestBody []byte) ([]byte, error) {
+	statistics := stats
+	fallbacks := usageFallbacks
+	if deferUsageCallback(statistics, func() {
+		processResponseStreamChunk(statistics, fallbacks, requestBody)
+	}) {
+		return okEnvelopeJSON("{}")
+	}
+
 	var req ResponseStreamChunkRequest
 	if err := json.Unmarshal(requestBody, &req); err != nil {
 		return nil, fmt.Errorf("failed to parse response stream chunk request: %w", err)
 	}
-	if record, ok := usageRecordFromResponseStreamChunk(req); ok && usageFallbacks != nil {
-		usageFallbacks.Supersede(supersededStreamUsageFingerprints(req))
-		usageFallbacks.Schedule(record)
+	if record, ok := usageRecordFromResponseStreamChunk(req); ok && fallbacks != nil {
+		fallbacks.Supersede(supersededStreamUsageFingerprints(req))
+		fallbacks.ScheduleForStats(statistics, record)
 	}
 	return okEnvelopeJSON("{}")
+}
+
+func processResponseIntercept(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, requestBody []byte) {
+	var req ResponseInterceptRequest
+	if err := json.Unmarshal(requestBody, &req); err != nil {
+		return
+	}
+	if record, ok := usageRecordFromResponseIntercept(req); ok && fallbacks != nil {
+		fallbacks.ScheduleForStats(statistics, record)
+	}
+}
+
+func processResponseStreamChunk(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, requestBody []byte) {
+	var req ResponseStreamChunkRequest
+	if err := json.Unmarshal(requestBody, &req); err != nil {
+		return
+	}
+	if record, ok := usageRecordFromResponseStreamChunk(req); ok && fallbacks != nil {
+		fallbacks.Supersede(supersededStreamUsageFingerprints(req))
+		fallbacks.ScheduleForStats(statistics, record)
+	}
 }
 
 // supersededStreamUsageFingerprints returns dedup fingerprints for usage
@@ -212,7 +252,7 @@ func supersededStreamUsageFingerprints(req ResponseStreamChunkRequest) []string 
 		if !ok {
 			continue
 		}
-		key := usageRecordFingerprint(record)
+		key := usageFallbackMatchKey(record)
 		if key == "" {
 			continue
 		}
@@ -254,10 +294,6 @@ func usageRecordFromStreamValues(req ResponseInterceptRequest, responseValues []
 }
 
 func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, detailPaths []string) (UsageRecord, bool) {
-	sourceFormat := strings.ToLower(strings.TrimSpace(req.SourceFormat))
-	if sourceFormat == "openai-responses" || sourceFormat == "openai-response" {
-		return UsageRecord{}, false
-	}
 	detail, ok := usageDetailFromResponseValues(responseValues, detailPaths)
 	if !ok {
 		return UsageRecord{}, false
@@ -298,7 +334,7 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		AuthID:          authID,
 		AuthIndex:       fallbackAuthIndex(req.Metadata, authID),
 		AuthType:        fallbackAuthType(req.Metadata, authID),
-		Endpoint:        metadataString(req.Metadata, "request_path", "endpoint", "request_endpoint", "path", "uri", "url", "route"),
+		Endpoint:        responseInterceptEndpoint(req),
 		ReasoningEffort: metadataString(req.Metadata, "reasoning_effort"),
 		ServiceTier:     firstNonEmpty(metadataString(req.Metadata, "service_tier"), jsonStringPath(requestRoot, "service_tier")),
 		Stream:          req.Stream,
@@ -308,6 +344,18 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		Source:          metadataString(req.Metadata, "upstream_source", "provider_source", "selected_source"),
 		ResponseHeaders: req.ResponseHeaders,
 	}, true
+}
+
+func responseInterceptEndpoint(req ResponseInterceptRequest) string {
+	if endpoint := metadataString(req.Metadata, "request_path", "endpoint", "request_endpoint", "path", "uri", "url", "route"); endpoint != "" {
+		return endpoint
+	}
+	switch strings.ToLower(strings.TrimSpace(req.SourceFormat)) {
+	case "openai-response", "openai-responses":
+		return "/v1/responses"
+	default:
+		return ""
+	}
 }
 
 func responseUsesAnthropicUsageAccounting(req ResponseInterceptRequest) bool {
@@ -542,12 +590,14 @@ type pendingUsageFallback struct {
 	requestAt time.Time
 	timer     *time.Timer
 	cancelled bool
+	stats     *RequestStatistics
 }
 
 type usageFallbackOccurrence struct {
 	requestAt  time.Time
 	observedAt time.Time
 	record     UsageRecord
+	stats      *RequestStatistics
 }
 
 func newUsageFallbackCoordinator() *usageFallbackCoordinator {
@@ -559,10 +609,18 @@ func newUsageFallbackCoordinator() *usageFallbackCoordinator {
 }
 
 func (c *usageFallbackCoordinator) Schedule(record UsageRecord) {
+	c.scheduleForStats(nil, record)
+}
+
+func (c *usageFallbackCoordinator) ScheduleForStats(statistics *RequestStatistics, record UsageRecord) {
+	c.scheduleForStats(statistics, record)
+}
+
+func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistics, record UsageRecord) {
 	if c == nil {
 		return
 	}
-	key := usageRecordFingerprint(record)
+	key := usageFallbackMatchKey(record)
 	if key == "" {
 		return
 	}
@@ -575,7 +633,12 @@ func (c *usageFallbackCoordinator) Schedule(record UsageRecord) {
 	if delay < 0 {
 		delay = 0
 	}
-	pending := &pendingUsageFallback{key: key, record: record, requestAt: requestAt}
+	pending := &pendingUsageFallback{
+		key:       key,
+		record:    record,
+		requestAt: requestAt,
+		stats:     usageFallbackStats(statistics),
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -583,9 +646,14 @@ func (c *usageFallbackCoordinator) Schedule(record UsageRecord) {
 	}
 	now := time.Now()
 	c.cleanupLocked(now)
-	if nativeRecord, ok := c.consumeNativeRecentLocked(key, requestAt, now); ok {
+	if nativeRecord, nativeStats, ok := c.consumeNativeRecentLocked(key, record, requestAt, now); ok {
 		c.mu.Unlock()
-		stats.EnrichRecordedUsage(nativeRecord, record)
+		if nativeStats == nil {
+			nativeStats = pending.stats
+		}
+		if nativeStats != nil {
+			nativeStats.EnrichRecordedUsage(nativeRecord, record)
+		}
 		return
 	}
 	c.pending[key] = append(c.pending[key], pending)
@@ -596,10 +664,14 @@ func (c *usageFallbackCoordinator) Schedule(record UsageRecord) {
 }
 
 func (c *usageFallbackCoordinator) HandleNative(record UsageRecord) (UsageRecord, bool) {
+	return c.HandleNativeForStats(nil, record)
+}
+
+func (c *usageFallbackCoordinator) HandleNativeForStats(statistics *RequestStatistics, record UsageRecord) (UsageRecord, bool) {
 	if c == nil {
 		return record, true
 	}
-	key := usageRecordFingerprint(record)
+	key := usageFallbackMatchKey(record)
 	if key == "" {
 		return record, true
 	}
@@ -609,21 +681,43 @@ func (c *usageFallbackCoordinator) HandleNative(record UsageRecord) (UsageRecord
 		record.RequestedAt = requestAt
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := time.Now()
 	c.cleanupLocked(now)
-	if pending := c.popPendingLocked(key); pending != nil {
+	if pending := c.popPendingLocked(key, record); pending != nil {
 		pending.cancelled = true
 		if pending.timer != nil {
 			pending.timer.Stop()
 		}
+		c.mu.Unlock()
 		return enrichUsageRecord(record, pending.record), true
 	}
-	if c.matchesFallbackRecentLocked(key, requestAt, now) {
+	if fallbackRecord, fallbackStats, ok := c.matchesFallbackRecentLocked(key, record, requestAt, now); ok {
+		c.mu.Unlock()
+		// The fallback is already counted. Late native usage only contributes
+		// metadata such as the endpoint and must not create a second event.
+		if fallbackStats == nil {
+			fallbackStats = usageFallbackStats(statistics)
+		}
+		if fallbackStats != nil {
+			fallbackStats.EnrichRecordedUsage(fallbackRecord, record)
+		}
 		return record, false
 	}
-	c.nativeRecent[key] = append(c.nativeRecent[key], usageFallbackOccurrence{requestAt: requestAt, observedAt: now, record: record})
+	c.nativeRecent[key] = append(c.nativeRecent[key], usageFallbackOccurrence{
+		requestAt:  requestAt,
+		observedAt: now,
+		record:     record,
+		stats:      usageFallbackStats(statistics),
+	})
+	c.mu.Unlock()
 	return record, true
+}
+
+func usageFallbackStats(statistics *RequestStatistics) *RequestStatistics {
+	if statistics != nil {
+		return statistics
+	}
+	return stats
 }
 
 func enrichUsageRecord(record UsageRecord, enrichment UsageRecord) UsageRecord {
@@ -659,7 +753,7 @@ func (c *usageFallbackCoordinator) Supersede(keys []string) {
 		if key == "" {
 			continue
 		}
-		if pending := c.popPendingLocked(key); pending != nil {
+		if pending := c.popPendingLocked(key, UsageRecord{}); pending != nil {
 			pending.cancelled = true
 			if pending.timer != nil {
 				pending.timer.Stop()
@@ -672,7 +766,7 @@ func (c *usageFallbackCoordinator) Flush() {
 	if c == nil {
 		return
 	}
-	var records []UsageRecord
+	var records []*pendingUsageFallback
 	c.mu.Lock()
 	c.closed = true
 	for key, pending := range c.pending {
@@ -684,13 +778,19 @@ func (c *usageFallbackCoordinator) Flush() {
 			if item.timer != nil {
 				item.timer.Stop()
 			}
-			records = append(records, item.record)
+			records = append(records, item)
 		}
 		delete(c.pending, key)
 	}
 	c.mu.Unlock()
-	for _, record := range records {
-		stats.Record(record)
+	for _, pending := range records {
+		if pending == nil {
+			continue
+		}
+		statistics := usageFallbackStats(pending.stats)
+		if statistics != nil {
+			statistics.Record(pending.record)
+		}
 	}
 }
 
@@ -710,6 +810,8 @@ func (c *usageFallbackCoordinator) commit(pending *pendingUsageFallback) {
 	c.fallbackRecent[pending.key] = append(c.fallbackRecent[pending.key], usageFallbackOccurrence{
 		requestAt:  pending.requestAt,
 		observedAt: now,
+		record:     pending.record,
+		stats:      pending.stats,
 	})
 	c.cleanupLocked(now)
 	record := pending.record
@@ -721,13 +823,19 @@ func (c *usageFallbackCoordinator) commit(pending *pendingUsageFallback) {
 			record.AuthIndex = learned
 		}
 	}
-	stats.Record(record)
+	statistics := usageFallbackStats(pending.stats)
+	if statistics != nil {
+		statistics.Record(record)
+	}
 }
 
-func (c *usageFallbackCoordinator) popPendingLocked(key string) *pendingUsageFallback {
+func (c *usageFallbackCoordinator) popPendingLocked(key string, record UsageRecord) *pendingUsageFallback {
 	items := c.pending[key]
 	for i, item := range items {
 		if item == nil || item.cancelled {
+			continue
+		}
+		if !usageFallbackRecordsCompatible(item.record, record) {
 			continue
 		}
 		c.pending[key] = append(items[:i], items[i+1:]...)
@@ -758,39 +866,75 @@ func (c *usageFallbackCoordinator) removePendingLocked(pending *pendingUsageFall
 	}
 }
 
-func (c *usageFallbackCoordinator) consumeNativeRecentLocked(key string, requestAt time.Time, now time.Time) (UsageRecord, bool) {
+func (c *usageFallbackCoordinator) consumeNativeRecentLocked(key string, record UsageRecord, requestAt time.Time, now time.Time) (UsageRecord, *RequestStatistics, bool) {
 	items := c.nativeRecent[key]
 	for i, item := range items {
 		if now.Sub(item.observedAt) > usageFallbackNativeRecentWindow {
 			continue
 		}
-		if !item.requestAt.IsZero() && item.requestAt.After(requestAt.Add(time.Second)) {
+		if !usageFallbackRecordsCompatible(item.record, record) ||
+			!usageFallbackNativeRequestTimeCompatible(item.requestAt, requestAt) {
 			continue
 		}
 		c.nativeRecent[key] = append(items[:i], items[i+1:]...)
 		if len(c.nativeRecent[key]) == 0 {
 			delete(c.nativeRecent, key)
 		}
-		return item.record, true
+		return item.record, item.stats, true
 	}
-	return UsageRecord{}, false
+	return UsageRecord{}, nil, false
 }
 
-func (c *usageFallbackCoordinator) matchesFallbackRecentLocked(key string, requestAt time.Time, now time.Time) bool {
+func (c *usageFallbackCoordinator) matchesFallbackRecentLocked(key string, record UsageRecord, requestAt time.Time, now time.Time) (UsageRecord, *RequestStatistics, bool) {
 	items := c.fallbackRecent[key]
 	for i, item := range items {
 		if now.Sub(item.observedAt) > usageFallbackLateNativeWindow {
 			continue
 		}
-		if requestAt.IsZero() || !requestAt.After(item.requestAt.Add(time.Second)) {
+		if usageFallbackRecordsCompatible(item.record, record) &&
+			usageFallbackNativeRequestTimeCompatible(requestAt, item.requestAt) {
 			c.fallbackRecent[key] = append(items[:i], items[i+1:]...)
 			if len(c.fallbackRecent[key]) == 0 {
 				delete(c.fallbackRecent, key)
 			}
-			return true
+			return item.record, item.stats, true
 		}
 	}
-	return false
+	return UsageRecord{}, nil, false
+}
+
+func usageFallbackNativeRequestTimeCompatible(nativeAt, fallbackAt time.Time) bool {
+	if nativeAt.IsZero() || fallbackAt.IsZero() {
+		return true
+	}
+	// Native RequestedAt can represent the start of a long request, while the
+	// fallback timestamp is captured when the response callback is delivered.
+	return !nativeAt.After(fallbackAt.Add(time.Second))
+}
+
+func usageFallbackClientAPIKey(record UsageRecord) string {
+	key := canonicalClientAPIKey(record.APIKey)
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "", "unknown", "(unknown)", "unknown api", "\u672a\u77e5", "\u672a\u77e5 api":
+		return ""
+	default:
+		return key
+	}
+}
+
+// usageFallbackRecordsCompatible keeps the client API key as a strict
+// discriminator when both callbacks provide it, while treating a missing key
+// on either side as unknown metadata that can be enriched later.
+func usageFallbackRecordsCompatible(left, right UsageRecord) bool {
+	if !usageDetailHasTokens(left.Detail) || !usageDetailHasTokens(right.Detail) {
+		return true
+	}
+	if usageFallbackMatchKey(left) != usageFallbackMatchKey(right) {
+		return false
+	}
+	leftKey := usageFallbackClientAPIKey(left)
+	rightKey := usageFallbackClientAPIKey(right)
+	return leftKey == "" || rightKey == "" || leftKey == rightKey
 }
 
 func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
@@ -858,6 +1002,17 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 // deliberately excluded: the two sides derive them from different sources and
 // the token triple already discriminates requests.
 func usageRecordFingerprint(record UsageRecord) string {
+	return usageRecordFingerprintWithClientAPI(record, true)
+}
+
+// usageFallbackMatchKey is the correlation key shared by native and
+// interceptor callbacks. Client API identity is checked separately because
+// one callback may omit it even though the other callback has it.
+func usageFallbackMatchKey(record UsageRecord) string {
+	return usageRecordFingerprintWithClientAPI(record, false)
+}
+
+func usageRecordFingerprintWithClientAPI(record UsageRecord, includeClientAPI bool) string {
 	if !usageDetailHasTokens(record.Detail) {
 		return ""
 	}
@@ -874,11 +1029,15 @@ func usageRecordFingerprint(record UsageRecord) string {
 	parts := []string{
 		upstreamIdentity,
 		strings.ToLower(strings.TrimSpace(firstNonEmpty(record.Alias, record.Model))),
-		canonicalClientAPIKey(record.APIKey),
+	}
+	if includeClientAPI {
+		parts = append(parts, usageFallbackClientAPIKey(record))
+	}
+	parts = append(parts,
 		fmt.Sprintf("%d", inputTokens),
 		fmt.Sprintf("%d", outputTokens),
 		fmt.Sprintf("%d", inputTokens+outputTokens),
-	}
+	)
 	return strings.Join(parts, "\x00")
 }
 
@@ -909,7 +1068,9 @@ func fallbackUsageProvider(req ResponseInterceptRequest) string {
 	switch {
 	case source == "openai" || source == "openai-response" || source == "openai-responses":
 		return "openai-compatible"
-	case strings.Contains(source, "gemini") || strings.Contains(source, "antigravity"):
+	case strings.Contains(source, "antigravity"):
+		return "antigravity"
+	case strings.Contains(source, "gemini"):
 		return "gemini"
 	case strings.Contains(source, "claude") || strings.Contains(source, "anthropic"):
 		return "claude"
