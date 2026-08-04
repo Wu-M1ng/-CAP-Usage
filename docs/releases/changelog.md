@@ -8,6 +8,7 @@
 
 ### 请求链路性能优化
 - 将启用 SQLite 时的 `usage.handle` 写入、响应体解析和流式历史扫描移到有序后台队列，宿主回调快速返回，避免统计处理延长 API 响应时间。
+- 流式回调在 C ABI 入口直接检查当前 `Body`；无 usage 的普通 chunk 不再执行 `C.GoBytes`，避免把累计 `HistoryChunks` 复制到 Go 堆，只有 usage 结算块才进入后台统计。
 - 保持 native usage 与 response interceptor 的处理顺序，继续支持 fallback 去重和元数据补全。
 - 插件关闭前排空后台任务，避免最后的 usage 记录未完成持久化。
 - 新增 SQLite 写入阻塞回归测试，验证 usage 回调不会同步等待数据库。

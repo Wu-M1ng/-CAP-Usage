@@ -71,13 +71,17 @@ type RequestStatistics struct {
 	credentialStats   map[string]*CredentialStat
 	clientAPIStats    map[string]*clientAPIStatAccumulator
 
-	logResponseHeaders  headerWhitelist
-	eventStore          *eventStore
-	eventStorePath      string
-	eventStoreLastError string
-	eventStoreLastWrite time.Time
-	droppedEvents       int64
-	eventStoreTemporary bool
+	logResponseHeaders            headerWhitelist
+	eventStore                    *eventStore
+	eventStorePath                string
+	eventStoreLastError           string
+	eventStoreLastWrite           time.Time
+	eventStoreEventCount          int64
+	eventStoreSizeBytes           int64
+	eventStoreLastEventID         int64
+	eventStoreLastRetentionCutoff int64
+	droppedEvents                 int64
+	eventStoreTemporary           bool
 
 	// Historical file-storage state is kept for source compatibility with the
 	// old implementation. Runtime records and configuration use eventStore;
@@ -312,6 +316,13 @@ func modelProviderStatsKey(provider string) string {
 }
 
 func incrementModelProviderStats(stats map[string]*ModelProviderStat, provider string, failed bool, totals detailTotals) map[string]*ModelProviderStat {
+	if failed {
+		return incrementModelProviderStatsAggregate(stats, provider, 1, 0, 1, totals)
+	}
+	return incrementModelProviderStatsAggregate(stats, provider, 1, 1, 0, totals)
+}
+
+func incrementModelProviderStatsAggregate(stats map[string]*ModelProviderStat, provider string, requests, successes, failures int64, totals detailTotals) map[string]*ModelProviderStat {
 	if stats == nil {
 		stats = make(map[string]*ModelProviderStat)
 	}
@@ -321,12 +332,9 @@ func incrementModelProviderStats(stats map[string]*ModelProviderStat, provider s
 		stat = &ModelProviderStat{Provider: strings.TrimSpace(provider)}
 		stats[key] = stat
 	}
-	stat.TotalRequests++
-	if failed {
-		stat.FailureCount++
-	} else {
-		stat.SuccessCount++
-	}
+	stat.TotalRequests += requests
+	stat.SuccessCount += successes
+	stat.FailureCount += failures
 	stat.TotalTokens += totals.totalTokens
 	stat.InputTokens += totals.inputTokens
 	stat.OutputTokens += totals.outputTokens
@@ -442,15 +450,20 @@ func newEndpointStatAccumulator(endpoint string) *endpointStatAccumulator {
 }
 
 func incrementEndpointStat(acc *endpointStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if detail.Failed {
+		incrementEndpointStatAggregate(acc, modelName, detail, 1, 0, 1, totals)
+		return
+	}
+	incrementEndpointStatAggregate(acc, modelName, detail, 1, 1, 0, totals)
+}
+
+func incrementEndpointStatAggregate(acc *endpointStatAccumulator, modelName string, detail RequestDetail, requests, successes, failures int64, totals detailTotals) {
 	if acc == nil {
 		return
 	}
-	acc.stat.TotalRequests++
-	if detail.Failed {
-		acc.stat.FailureCount++
-	} else {
-		acc.stat.SuccessCount++
-	}
+	acc.stat.TotalRequests += requests
+	acc.stat.SuccessCount += successes
+	acc.stat.FailureCount += failures
 	acc.stat.TotalTokens += totals.totalTokens
 	acc.stat.InputTokens += totals.inputTokens
 	acc.stat.OutputTokens += totals.outputTokens
@@ -464,12 +477,9 @@ func incrementEndpointStat(acc *endpointStatAccumulator, modelName string, detai
 		modelStat = &ModelStat{Model: modelName}
 		acc.models[modelName] = modelStat
 	}
-	modelStat.TotalRequests++
-	if detail.Failed {
-		modelStat.FailureCount++
-	} else {
-		modelStat.SuccessCount++
-	}
+	modelStat.TotalRequests += requests
+	modelStat.SuccessCount += successes
+	modelStat.FailureCount += failures
 	modelStat.TotalTokens += totals.totalTokens
 	modelStat.InputTokens += totals.inputTokens
 	modelStat.OutputTokens += totals.outputTokens
@@ -478,7 +488,7 @@ func incrementEndpointStat(acc *endpointStatAccumulator, modelName string, detai
 	modelStat.ReasoningTokens += totals.reasoningTokens
 	modelStat.latencySum += totals.latencySum
 	modelStat.latencyN += totals.latencyN
-	modelStat.providerStats = incrementModelProviderStats(modelStat.providerStats, detail.Provider, detail.Failed, totals)
+	modelStat.providerStats = incrementModelProviderStatsAggregate(modelStat.providerStats, detail.Provider, requests, successes, failures, totals)
 }
 
 func decrementEndpointStat(acc *endpointStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
@@ -802,6 +812,20 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	var candidate *eventStore
 	var candidateSnapshot StatisticsSnapshot
 	var candidateHasSnapshot bool
+	var candidateEventCount int64
+	var candidateCountErr error
+	var candidateLastEventID int64
+	var candidateMaxEventID int64
+	var candidateMaxEventIDErr error
+	var candidateTail []RequestDetail
+	var candidateTailErr error
+	var candidateDerivedDetails []RequestDetail
+	var candidateDerivedErr error
+	var candidateNeedsDerivedRebuild bool
+	var candidateRebuildAll bool
+	var candidateNeedsAggregateSave bool
+	var candidateRecoveredSnapshot StatisticsSnapshot
+	var candidateSizeBytes int64
 	var storageError error
 	var switchStore bool
 	var legacyWarning error
@@ -872,7 +896,11 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					}
 				}
 				if storageError == nil {
-					candidateSnapshot, candidateHasSnapshot, storageError = candidate.loadAggregate(context.Background())
+					candidateState, hasState, loadErr := candidate.loadAggregateState(context.Background())
+					candidateSnapshot = candidateState.Snapshot
+					candidateLastEventID = candidateState.LastEventID
+					candidateHasSnapshot = hasState
+					storageError = loadErr
 					if storageError != nil {
 						// A damaged aggregate_state must not hide recoverable event rows.
 						// Keep the database when it contains events and rebuild the
@@ -883,12 +911,50 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 							storageError = nil
 						}
 					}
+					if storageError == nil {
+						candidateEventCount, candidateCountErr = candidate.count(context.Background())
+						if candidateCountErr != nil {
+							storageError = candidateCountErr
+						} else {
+							candidateMaxEventID, candidateMaxEventIDErr = candidate.maxEventID(context.Background())
+							if candidateMaxEventIDErr != nil {
+								storageError = candidateMaxEventIDErr
+							} else if candidateLastEventID > 0 && candidateLastEventID < candidateMaxEventID {
+								candidateTail, candidateTailErr = candidate.eventsAfterID(context.Background(), candidateLastEventID)
+								if candidateTailErr != nil {
+									storageError = candidateTailErr
+								}
+							}
+							if storageError == nil {
+								switch {
+								case candidateHasSnapshot && candidateLastEventID > 0 && (len(candidateSnapshot.APIs) > 0 || candidateEventCount == 0):
+									candidateNeedsDerivedRebuild = true
+								case candidateHasSnapshot && candidateLastEventID == 0 && candidateEventCount > 0:
+									candidateNeedsDerivedRebuild = true
+									candidateRebuildAll = true
+								case candidateEventCount > 0:
+									candidateNeedsDerivedRebuild = true
+									candidateRebuildAll = true
+								case candidateHasSnapshot:
+									candidateNeedsDerivedRebuild = true
+								}
+								if candidateNeedsDerivedRebuild {
+									candidateDerivedDetails, candidateDerivedErr = loadSQLiteEventDetails(candidate, time.Now())
+									if candidateDerivedErr != nil {
+										storageError = candidateDerivedErr
+									}
+								}
+							}
+						}
+					}
 				}
 				if storageError != nil {
 					if candidate != nil {
 						_ = candidate.close()
 					}
 					candidate = nil
+				} else {
+					candidateSizeBytes = eventStoreFileSize(candidate.path)
 				}
 			}
 		}
@@ -905,6 +971,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	}
 	if cfg.RetentionDays != nil && *cfg.RetentionDays >= 0 {
 		s.retention = time.Duration(*cfg.RetentionDays) * 24 * time.Hour
+		s.eventStoreLastRetentionCutoff = 0
 	}
 	if cfg.DedupWindowMinutes != nil && *cfg.DedupWindowMinutes >= 0 {
 		s.dedupWindow = time.Duration(*cfg.DedupWindowMinutes) * time.Minute
@@ -969,52 +1036,98 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					s.eventStorePath = candidate.path
 					s.eventStoreTemporary = candidate.temporary
 					restoreNow := time.Now()
-					eventCount, countErr := candidate.count(context.Background())
+					eventCount, countErr := candidateEventCount, candidateCountErr
+					s.eventStoreEventCount = maxInt64(eventCount, 0)
+					s.eventStoreLastEventID = maxInt64(candidateLastEventID, 0)
+					s.eventStoreLastRetentionCutoff = 0
+					s.eventStoreSizeBytes = candidateSizeBytes
 					if countErr != nil {
 						s.eventStoreLastError = countErr.Error()
 						if candidateHasSnapshot {
 							s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
 						}
-					} else if candidateHasSnapshot && (len(candidateSnapshot.APIs) > 0 || eventCount == 0) {
+					} else if candidateHasSnapshot && candidateLastEventID > 0 && (len(candidateSnapshot.APIs) > 0 || eventCount == 0) {
 						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
-						if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
-							s.eventStoreLastError = err.Error()
+						if candidateNeedsDerivedRebuild {
+							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+						}
+						{
+							for _, detail := range candidateTail {
+								apiName := strings.TrimSpace(detail.UpstreamAPI)
+								s.recordAggregateTailLocked(apiName, normalizeModelName(detail.Model), detail)
+							}
+							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, s.eventStoreLastEventID)
+							candidateNeedsAggregateSave = len(candidateTail) > 0
+							if candidateNeedsAggregateSave {
+								candidateRecoveredSnapshot = s.snapshotLocked()
+							}
+						}
+					} else if candidateHasSnapshot && candidateLastEventID == 0 && eventCount > 0 {
+						s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
+						if candidateNeedsDerivedRebuild {
+							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+						}
+						{
+							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, 0)
+							candidateNeedsAggregateSave = true
+							candidateRecoveredSnapshot = s.snapshotLocked()
 						}
 					} else if eventCount > 0 {
 						s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
-						if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, true); err != nil {
-							s.eventStoreLastError = err.Error()
-						} else {
-							snapshot := s.snapshotLocked()
-							if err := candidate.saveAggregate(context.Background(), snapshot); err != nil {
-								s.eventStoreLastError = err.Error()
-							}
+						if candidateNeedsDerivedRebuild {
+							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+						}
+						{
+							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, 0)
+							candidateNeedsAggregateSave = true
+							candidateRecoveredSnapshot = s.snapshotLocked()
 						}
 					} else if candidateHasSnapshot {
 						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
-						if err := s.rebuildSQLiteDerivedAggregatesLocked(candidate, restoreNow, false); err != nil {
-							s.eventStoreLastError = err.Error()
+						if candidateNeedsDerivedRebuild {
+							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
 						}
 					}
 				} else {
 					s.eventStorePath = ""
 					s.eventStoreTemporary = false
+					s.eventStoreEventCount = 0
+					s.eventStoreLastEventID = 0
+					s.eventStoreSizeBytes = 0
 				}
 			}
 		}
-	}
-	if storageError == nil && (storageConfigTouched || pruneConfigTouched) && s.eventStore != nil {
-		if err := s.pruneSQLiteLocked(s.eventStore, time.Now()); err != nil {
-			s.eventStoreLastError = err.Error()
-		}
-	} else if storageError == nil && pruneConfigTouched && s.eventStore == nil {
-		s.pruneLocked(time.Now(), true)
 	}
 	s.configureModelsDevPriceWorkerLocked()
 	s.loadModelPricesLocked()
 	s.rebuildCostSeriesLocked()
 	s.invalidateSummaryLocked()
 	s.mu.Unlock()
+	if candidateNeedsAggregateSave && candidate != nil {
+		if err := candidate.saveAggregate(context.Background(), candidateRecoveredSnapshot); err != nil {
+			s.mu.Lock()
+			s.eventStoreLastError = err.Error()
+			s.mu.Unlock()
+		}
+	}
+	if storageError == nil && (storageConfigTouched || pruneConfigTouched) {
+		s.mu.RLock()
+		pruneStore := s.eventStore
+		pruneMaxDetails := s.maxDetailsPerModel
+		pruneRetention := s.retention
+		s.mu.RUnlock()
+		if pruneStore != nil {
+			if err := s.pruneSQLite(pruneStore, pruneMaxDetails, pruneRetention, time.Now()); err != nil {
+				s.mu.Lock()
+				s.eventStoreLastError = err.Error()
+				s.mu.Unlock()
+			}
+		} else if pruneConfigTouched {
+			s.mu.Lock()
+			s.pruneLocked(time.Now(), true)
+			s.mu.Unlock()
+		}
+	}
 	if previousStore != nil && previousStore != candidate {
 		_ = previousStore.close()
 	}
@@ -1208,7 +1321,13 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	s.mu.RLock()
 	store := s.eventStore
 	whitelist := s.logResponseHeaders
+	maxDetails := s.maxDetailsPerModel
+	retention := s.retention
+	lastRetentionCutoff := s.eventStoreLastRetentionCutoff
 	s.mu.RUnlock()
+	pruneNow := time.Now()
+	retentionCutoff := retentionPruneCutoff(pruneNow, retention)
+	retentionDue := retentionCutoff > 0 && (lastRetentionCutoff == 0 || retentionCutoff > lastRetentionCutoff)
 	detail := requestDetailFromUsageRecord(record, timestamp, whitelist)
 	if store == nil {
 		now := time.Now()
@@ -1234,19 +1353,20 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 		return
 	}
 	defer tx.Rollback()
-	if _, _, err := store.insertEventTx(context.Background(), tx, eventRowFromDetail(apiName, modelName, detail), "", false, time.Time{}); err != nil {
+	insertedEventID, _, err := store.insertEventTx(context.Background(), tx, eventRowFromDetail(apiName, modelName, detail), "", false, time.Time{})
+	if err != nil {
 		s.recordEventStoreFailure(err, true)
 		return
 	}
-	s.mu.RLock()
-	maxDetails := s.maxDetailsPerModel
-	retention := s.retention
-	s.mu.RUnlock()
 	var pruneResult eventPruneResult
 	var previousLastRecordedAt time.Time
 	var previousEvictedTotal int64
 	var previousSummaryVersion uint64
-	if pruneResult, err = store.pruneTx(context.Background(), tx, maxDetails, retention, time.Now()); err != nil {
+	if pruneResult, err = store.pruneTxScoped(context.Background(), tx, maxDetails, retention, pruneNow, eventPruneScope{
+		API:            apiName,
+		Model:          modelName,
+		ApplyRetention: retentionDue,
+	}); err != nil {
 		s.recordEventStoreFailure(err, false)
 		return
 	} else {
@@ -1278,6 +1398,16 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 		}
 		lockedNow := time.Now()
 		s.mu.Lock()
+		s.eventStoreEventCount += 1 - pruneResult.Removed
+		if s.eventStoreEventCount < 0 {
+			s.eventStoreEventCount = 0
+		}
+		if retentionDue {
+			s.eventStoreLastRetentionCutoff = retentionCutoff
+		}
+		if insertedEventID > s.eventStoreLastEventID {
+			s.eventStoreLastEventID = insertedEventID
+		}
 		s.eventStoreLastError = ""
 		s.eventStoreLastWrite = lockedNow
 		s.mu.Unlock()
@@ -2255,14 +2385,26 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 	}
 }
 
-// rebuildSQLiteDerivedAggregatesLocked restores dashboard dimensions that are
-// intentionally not serialized in aggregate_state. SQLite remains the source
-// of truth for event details, while only bounded aggregate maps are retained in
-// memory. When rebuildAll is true, the event rows also reconstruct the primary
-// counters because no usable aggregate snapshot was available.
-func (s *RequestStatistics) rebuildSQLiteDerivedAggregatesLocked(store *eventStore, now time.Time, rebuildAll bool) error {
-	if s == nil || store == nil {
+// loadSQLiteEventDetails reads the event rows needed to rebuild in-memory
+// dimensions before the statistics lock is acquired.
+func loadSQLiteEventDetails(store *eventStore, now time.Time) ([]RequestDetail, error) {
+	if store == nil {
+		return nil, nil
+	}
+	details := make([]RequestDetail, 0)
+	err := store.forEachEvent(context.Background(), EventsQuery{}, now, func(detail RequestDetail) error {
+		details = append(details, detail)
 		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return details, nil
+}
+
+func (s *RequestStatistics) applySQLiteDerivedAggregatesLocked(details []RequestDetail, now time.Time, rebuildAll bool) {
+	if s == nil {
+		return
 	}
 	if now.IsZero() {
 		now = time.Now()
@@ -2280,7 +2422,7 @@ func (s *RequestStatistics) rebuildSQLiteDerivedAggregatesLocked(store *eventSto
 		}
 	}
 
-	return store.forEachEvent(context.Background(), EventsQuery{}, now, func(detail RequestDetail) error {
+	for _, detail := range details {
 		apiName := strings.TrimSpace(detail.UpstreamAPI)
 		if apiName == "" {
 			apiName = usageGroupKey(UsageRecord{})
@@ -2288,7 +2430,7 @@ func (s *RequestStatistics) rebuildSQLiteDerivedAggregatesLocked(store *eventSto
 		modelName := normalizeModelName(detail.Model)
 		if rebuildAll {
 			s.recordDetailLocked(apiName, modelName, detail, requestDedupKey{}, now, false, false)
-			return nil
+			continue
 		}
 
 		totals := detailTotalsFromRequest(detail)
@@ -2300,8 +2442,84 @@ func (s *RequestStatistics) rebuildSQLiteDerivedAggregatesLocked(store *eventSto
 		if detail.Timestamp.After(s.lastRecordedAt) {
 			s.lastRecordedAt = detail.Timestamp
 		}
-		return nil
-	})
+	}
+}
+
+// recordAggregateTailLocked applies a post-checkpoint event to counters that
+// are persisted in aggregate_state. Dimension indexes are rebuilt from the
+// complete event table separately, so this helper intentionally does not touch
+// source, endpoint, credential, client-API, or health accumulators.
+func (s *RequestStatistics) recordAggregateTailLocked(apiName, modelName string, detail RequestDetail) {
+	if s == nil {
+		return
+	}
+	apiName = strings.TrimSpace(apiName)
+	if apiName == "" {
+		apiName = usageGroupKey(UsageRecord{})
+	}
+	modelName = normalizeModelName(modelName)
+	apiSt := s.apis[apiName]
+	if apiSt == nil {
+		apiSt = &apiStats{Models: make(map[string]*modelStats), Sources: make(map[string]*sourceStatAccumulator)}
+		s.apis[apiName] = apiSt
+	}
+	if apiSt.Models == nil {
+		apiSt.Models = make(map[string]*modelStats)
+	}
+	totals := s.updateAPIStats(apiSt, modelName, detail, false)
+	s.totalRequests++
+	if detail.Failed {
+		s.failureCount++
+	} else {
+		s.successCount++
+	}
+	s.totalTokens += totals.totalTokens
+	s.inputTokens += totals.inputTokens
+	s.outputTokens += totals.outputTokens
+	s.cachedTokens += totals.cachedTokens
+	s.cacheWriteTokens += totals.cacheWriteTokens
+	s.reasoningTokens += totals.reasoningTokens
+	s.latencySum += totals.latencySum
+	s.latencyN += totals.latencyN
+	dayKey, hourKey := dashboardLocalDayHour(detail.Timestamp)
+	cost := s.detailCostLocked(modelName, detail, totals)
+	if s.requestsByDay == nil {
+		s.requestsByDay = make(map[string]int64)
+	}
+	if s.requestsByHour == nil {
+		s.requestsByHour = make(map[int]int64)
+	}
+	if s.tokensByDay == nil {
+		s.tokensByDay = make(map[string]int64)
+	}
+	if s.tokensByHour == nil {
+		s.tokensByHour = make(map[int]int64)
+	}
+	if s.costByDay == nil {
+		s.costByDay = make(map[string]float64)
+	}
+	if s.costByHour == nil {
+		s.costByHour = make(map[int]float64)
+	}
+	if s.costTokensByDay == nil {
+		s.costTokensByDay = make(map[string]map[string]*TimeSeriesTokenStat)
+	}
+	if s.costTokensByHour == nil {
+		s.costTokensByHour = make(map[int]map[string]*TimeSeriesTokenStat)
+	}
+	s.requestsByDay[dayKey]++
+	s.requestsByHour[hourKey]++
+	s.tokensByDay[dayKey] += totals.totalTokens
+	s.tokensByHour[hourKey] += totals.totalTokens
+	s.costByDay[dayKey] += cost
+	s.costByHour[hourKey] += cost
+	s.costTokensByDay[dayKey] = incrementTimeSeriesTokenStats(s.costTokensByDay[dayKey], detailModel(modelName, detail), detail.Provider, totals)
+	s.costTokensByHour[hourKey] = incrementTimeSeriesTokenStats(s.costTokensByHour[hourKey], detailModel(modelName, detail), detail.Provider, totals)
+	s.incrementModelSummaryStatsLocked(modelName, detail, totals)
+	if detail.Timestamp.After(s.lastRecordedAt) {
+		s.lastRecordedAt = detail.Timestamp
+	}
+	s.invalidateSummaryLocked()
 }
 
 func mergeRestoredModelStats(apiSt *apiStats, modelName string, modelSt *modelStats) {
@@ -4896,10 +5114,10 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	return result
 }
 
-// pruneSQLiteLocked applies the current SQL retention policy and aggregate
-// state update as one transaction. The caller must hold storageControlMu and
-// s.mu.
-func (s *RequestStatistics) pruneSQLiteLocked(store *eventStore, now time.Time) error {
+// pruneSQLite applies the SQL retention policy and aggregate state update as
+// one transaction. It may be called while storageControlMu is held, but it
+// never performs SQLite work while holding s.mu.
+func (s *RequestStatistics) pruneSQLite(store *eventStore, maxDetails int, retention time.Duration, now time.Time) error {
 	if s == nil || store == nil {
 		return nil
 	}
@@ -4912,10 +5130,15 @@ func (s *RequestStatistics) pruneSQLiteLocked(store *eventStore, now time.Time) 
 		return fmt.Errorf("begin sqlite prune: %w", err)
 	}
 	defer tx.Rollback()
-	pruneResult, err := store.pruneTx(context.Background(), tx, s.maxDetailsPerModel, s.retention, now)
+	pruneResult, err := store.pruneTx(context.Background(), tx, maxDetails, retention, now)
 	if err != nil {
 		return err
 	}
+
+	// The database transaction is already prepared. Apply only the in-memory
+	// consequences while holding s.mu, then release it before saving the
+	// aggregate or committing the transaction.
+	s.mu.Lock()
 	previousLastRecordedAt := s.lastRecordedAt
 	previousEvictedTotal := s.evictedTotal
 	previousSummaryVersion := s.summaryVersion
@@ -4933,14 +5156,28 @@ func (s *RequestStatistics) pruneSQLiteLocked(store *eventStore, now time.Time) 
 		s.invalidateSummaryLocked()
 		s.summaryVersion = previousSummaryVersion
 	}
+	s.mu.Unlock()
 	if err := store.saveAggregateTx(context.Background(), tx, aggregate); err != nil {
+		s.mu.Lock()
 		rollback()
+		s.mu.Unlock()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		s.mu.Lock()
 		rollback()
+		s.mu.Unlock()
 		return fmt.Errorf("commit sqlite prune: %w", err)
 	}
+	s.mu.Lock()
+	s.eventStoreEventCount -= pruneResult.Removed
+	if s.eventStoreEventCount < 0 {
+		s.eventStoreEventCount = 0
+	}
+	if retention > 0 {
+		s.eventStoreLastRetentionCutoff = retentionPruneCutoff(now, retention)
+	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -4969,11 +5206,44 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 	}
 	defer tx.Rollback()
 	type importedEvent struct {
-		api    string
-		model  string
-		detail RequestDetail
+		api     string
+		model   string
+		detail  RequestDetail
+		eventID int64
+	}
+	type queuedImport struct {
+		event   importedEvent
+		request eventInsertRequest
 	}
 	addedEvents := make([]importedEvent, 0)
+	queued := make([]queuedImport, 0, defaultStorageWriteBatchSize)
+	flushBatch := func() error {
+		if len(queued) == 0 {
+			return nil
+		}
+		requests := make([]eventInsertRequest, len(queued))
+		for i := range queued {
+			requests[i] = queued[i].request
+		}
+		inserted, insertErr := store.insertEventsTx(context.Background(), tx, requests)
+		if insertErr != nil {
+			return insertErr
+		}
+		if len(inserted) != len(queued) {
+			return errors.New("snapshot import batch returned an unexpected result count")
+		}
+		for i, outcome := range inserted {
+			if !outcome.Added {
+				result.Skipped++
+				continue
+			}
+			queued[i].event.eventID = outcome.ID
+			addedEvents = append(addedEvents, queued[i].event)
+			result.Added++
+		}
+		queued = queued[:0]
+		return nil
+	}
 	for apiName, apiSnapshot := range snapshot.APIs {
 		apiName = strings.TrimSpace(apiName)
 		if apiName == "" {
@@ -5002,17 +5272,22 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 				}
 				row := eventRowFromDetail(apiKey, detail.Model, detail)
 				fingerprint := eventFingerprint(apiKey, detail.Model, detail)
-				if _, added, err := store.insertEventTx(context.Background(), tx, row, fingerprint, true, cutoff); err != nil {
-					s.recordEventStoreFailure(err, false)
-					return MergeResult{}
-				} else if !added {
-					result.Skipped++
-					continue
+				queued = append(queued, queuedImport{
+					event:   importedEvent{api: apiKey, model: detail.Model, detail: detail},
+					request: eventInsertRequest{Row: row, Fingerprint: fingerprint, Exact: true, Cutoff: cutoff},
+				})
+				if len(queued) >= defaultStorageWriteBatchSize {
+					if err := flushBatch(); err != nil {
+						s.recordEventStoreFailure(err, false)
+						return MergeResult{}
+					}
 				}
-				addedEvents = append(addedEvents, importedEvent{api: apiKey, model: detail.Model, detail: detail})
-				result.Added++
 			}
 		}
+	}
+	if err := flushBatch(); err != nil {
+		s.recordEventStoreFailure(err, false)
+		return MergeResult{}
 	}
 	pruneResult, err := store.pruneTx(context.Background(), tx, maxDetails, retention, now)
 	if err != nil {
@@ -5060,6 +5335,20 @@ func (s *RequestStatistics) mergeSnapshotSQLite(store *eventStore, snapshot Stat
 		s.recordEventStoreFailure(fmt.Errorf("commit snapshot import: %w", err), false)
 		return MergeResult{}
 	}
+	s.mu.Lock()
+	s.eventStoreEventCount += int64(len(addedEvents)) - pruneResult.Removed
+	if s.eventStoreEventCount < 0 {
+		s.eventStoreEventCount = 0
+	}
+	if s.retention > 0 {
+		s.eventStoreLastRetentionCutoff = retentionPruneCutoff(now, s.retention)
+	}
+	for _, added := range addedEvents {
+		if added.eventID > s.eventStoreLastEventID {
+			s.eventStoreLastEventID = added.eventID
+		}
+	}
+	s.mu.Unlock()
 	return result
 }
 
@@ -5697,8 +5986,9 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 
 	s.storageControlMu.Lock()
 	defer s.storageControlMu.Unlock()
+
+	// Check the range cache before doing the potentially expensive SQL query.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.summaryRangeCache == nil {
 		s.summaryRangeCache = make(map[string]DashboardSummary)
@@ -5710,12 +6000,37 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 		if window, hasWindow := s.summaryRangeCacheWindow[cacheKey]; hasWindow && window.Equal(healthWindow) {
 			s.summaryCacheHits++
 			s.lastSummaryDuration = time.Since(startedAt)
-			return cloneDashboardSummary(cached)
+			result := cloneDashboardSummary(cached)
+			s.mu.Unlock()
+			return result
 		}
 	}
 
 	s.summaryCacheMisses++
-	summary := s.buildSummaryWithoutDetailsForRangeLocked(now, healthWindow, cutoff, rangeKey, clientAPI)
+	store := s.eventStore
+	s.mu.Unlock()
+
+	var rangeResult *dashboardRangeQueryResult
+	if store != nil {
+		queried, queryErr := store.queryDashboardRange(context.Background(), EventsQuery{Range: rangeKey, ClientAPI: clientAPI}, now)
+		rangeResult = &queried
+		if queryErr != nil {
+			s.mu.Lock()
+			s.eventStoreLastError = queryErr.Error()
+			s.mu.Unlock()
+			rangeResult = &dashboardRangeQueryResult{}
+		} else {
+			s.mu.Lock()
+			if s.eventStore == store {
+				s.eventStoreLastError = ""
+			}
+			s.mu.Unlock()
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	summary := s.buildSummaryWithoutDetailsForRangeLocked(now, healthWindow, cutoff, rangeKey, clientAPI, rangeResult)
 	s.summaryRangeCache[cacheKey] = cloneDashboardSummary(summary)
 	s.summaryRangeCacheWindow[cacheKey] = healthWindow
 	s.pruneSummaryRangeCacheLocked(cacheKey)
@@ -6119,10 +6434,10 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsLocked(now time.Time, heal
 	return summary
 }
 
-// buildSummaryWithoutDetailsForRangeLocked scans all events within the cutoff window
-// and builds a fresh DashboardSummary. Caller must hold s.mu and the storage
-// control lock when a SQLite store is configured.
-func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Time, healthWindow time.Time, cutoff time.Time, rangeKey string, clientAPI string) DashboardSummary {
+// buildSummaryWithoutDetailsForRangeLocked builds a fresh DashboardSummary
+// from a pre-aggregated SQLite result or the in-memory detail path. Caller
+// must hold s.mu; SQLite queries are completed by the caller beforehand.
+func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Time, healthWindow time.Time, cutoff time.Time, rangeKey string, clientAPI string, rangeResult *dashboardRangeQueryResult) DashboardSummary {
 	summary := DashboardSummary{}
 
 	// Usage accumulators
@@ -6147,39 +6462,53 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 	clientAPIAgg := make(map[string]*clientAPIStatAccumulator)
 	apiAgg := make(map[string]*apiRangeAgg)
 
-	accumulateDetail := func(apiName, modelName string, detail RequestDetail) {
-		totals := detailTotalsFromRequest(detail)
+	accumulateAggregate := func(apiName, modelName string, detail RequestDetail, dayKey string, hourKey int, requests, successes, failures int64, totals detailTotals) {
+		if requests <= 0 {
+			return
+		}
 		dModel := detailModel(modelName, detail)
+		if dayKey == "" {
+			dayKey, hourKey = dashboardLocalDayHour(detail.Timestamp)
+		}
+		if hourKey < 0 || hourKey >= 24 {
+			hourKey = 0
+		}
 
 		// Global usage
-		totalRequests++
-		if detail.Failed {
-			failureCount++
-		} else {
-			successCount++
-		}
+		totalRequests += requests
+		successCount += successes
+		failureCount += failures
 		totalTokens += totals.totalTokens
 		inputTokens += totals.inputTokens
 		outputTokens += totals.outputTokens
 		cachedTokens += totals.cachedTokens
 		cacheWriteTokens += totals.cacheWriteTokens
 		reasoningTokens += totals.reasoningTokens
-		if detail.LatencyMs > 0 {
-			latencySum += detail.LatencyMs
-			latencyN++
-		}
+		latencySum += totals.latencySum
+		latencyN += totals.latencyN
 
 		// Day/hour time series
-		dayKey, hourKey := dashboardLocalDayHour(detail.Timestamp)
 		cost := s.detailCostLocked(modelName, detail, totals)
-		requestsByDay[dayKey]++
-		requestsByHour[hourKey]++
+		requestsByDay[dayKey] += requests
+		requestsByHour[hourKey] += requests
 		tokensByDay[dayKey] += totals.totalTokens
 		tokensByHour[hourKey] += totals.totalTokens
 		costByDay[dayKey] += cost
 		costByHour[hourKey] += cost
-		addTokenPartStat(tokenPartsByDay, dayKey, totals)
-		addTokenPartStat(tokenPartsByHour, hourKeys[hourKey], totals)
+		parts := tokenPartsByDay[dayKey]
+		parts.InputTokens += totals.inputTokens
+		parts.OutputTokens += totals.outputTokens
+		parts.CacheReadTokens += totals.cachedTokens
+		parts.CacheWriteTokens += totals.cacheWriteTokens
+		parts.ReasoningTokens += totals.reasoningTokens
+		tokenPartsByDay[dayKey] = parts
+		hourParts := tokenPartsByHour[hourKeys[hourKey]]
+		hourParts.InputTokens += totals.inputTokens
+		hourParts.OutputTokens += totals.outputTokens
+		hourParts.CacheReadTokens += totals.cachedTokens
+		hourParts.CacheWriteTokens += totals.cacheWriteTokens
+		hourParts.ReasoningTokens += totals.reasoningTokens
+		tokenPartsByHour[hourKeys[hourKey]] = hourParts
 
 		endpoint := summaryEndpointKey(detail)
 		endpointStats, ok := endpointAgg[endpoint]
@@ -6187,27 +6516,22 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 			endpointStats = newEndpointStatAccumulator(endpoint)
 			endpointAgg[endpoint] = endpointStats
 		}
-		incrementEndpointStat(endpointStats, dModel, detail, totals)
+		incrementEndpointStatAggregate(endpointStats, dModel, detail, requests, successes, failures, totals)
 
 		// Per-API aggregation
 		api := getOrCreateAPIRangeAgg(apiAgg, apiName)
-		api.TotalRequests++
-		if detail.Failed {
-			api.FailureCount++
-		} else {
-			api.SuccessCount++
-		}
+		api.TotalRequests += requests
+		api.SuccessCount += successes
+		api.FailureCount += failures
 		api.TotalTokens += totals.totalTokens
 		api.InputTokens += totals.inputTokens
 		api.OutputTokens += totals.outputTokens
 		api.CachedTokens += totals.cachedTokens
 		api.CacheWriteTokens += totals.cacheWriteTokens
 		api.ReasoningTokens += totals.reasoningTokens
-		if detail.LatencyMs > 0 {
-			api.latencySum += detail.LatencyMs
-			api.latencyN++
-		}
-		rangeIncrementAPIModel(api, dModel, detail, totals)
+		api.latencySum += totals.latencySum
+		api.latencyN += totals.latencyN
+		rangeIncrementAPIModelAggregate(api, dModel, detail, requests, successes, failures, totals)
 
 		// Model summary stats
 		ms, ok := modelAgg[dModel]
@@ -6215,23 +6539,18 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 			ms = &ModelStat{Model: dModel}
 			modelAgg[dModel] = ms
 		}
-		ms.TotalRequests++
-		if detail.Failed {
-			ms.FailureCount++
-		} else {
-			ms.SuccessCount++
-		}
+		ms.TotalRequests += requests
+		ms.SuccessCount += successes
+		ms.FailureCount += failures
 		ms.TotalTokens += totals.totalTokens
 		ms.InputTokens += totals.inputTokens
 		ms.OutputTokens += totals.outputTokens
 		ms.CachedTokens += totals.cachedTokens
 		ms.CacheWriteTokens += totals.cacheWriteTokens
 		ms.ReasoningTokens += totals.reasoningTokens
-		ms.providerStats = incrementModelProviderStats(ms.providerStats, detail.Provider, detail.Failed, totals)
-		if detail.LatencyMs > 0 {
-			ms.latencySum += detail.LatencyMs
-			ms.latencyN++
-		}
+		ms.latencySum += totals.latencySum
+		ms.latencyN += totals.latencyN
+		ms.providerStats = incrementModelProviderStatsAggregate(ms.providerStats, detail.Provider, requests, successes, failures, totals)
 
 		// Source stats
 		source := summarySourceKey(detail)
@@ -6246,12 +6565,9 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 		if src.stat.Provider == "" {
 			src.stat.Provider = detail.Provider
 		}
-		src.stat.TotalRequests++
-		if detail.Failed {
-			src.stat.FailureCount++
-		} else {
-			src.stat.SuccessCount++
-		}
+		src.stat.TotalRequests += requests
+		src.stat.SuccessCount += successes
+		src.stat.FailureCount += failures
 		src.stat.TotalTokens += totals.totalTokens
 
 		// Credential stats
@@ -6261,20 +6577,63 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 			cred = &CredentialStat{AuthIndex: credKey}
 			credentialAgg[credKey] = cred
 		}
-		cred.TotalRequests++
-		if detail.Failed {
-			cred.FailureCount++
-		} else {
-			cred.SuccessCount++
-		}
+		cred.TotalRequests += requests
+		cred.SuccessCount += successes
+		cred.FailureCount += failures
 		cred.TotalTokens += totals.totalTokens
 
 		// Client API stats. Requests without a caller API key remain in the
 		// global dimensions but do not create a misleading selector group.
-		incrementClientAPIStat(clientAPIAgg, dModel, detail, totals)
+		incrementClientAPIStatAggregate(clientAPIAgg, dModel, detail, requests, successes, failures, totals)
 	}
 
-	if s.eventStore != nil {
+	accumulateDetail := func(apiName, modelName string, detail RequestDetail) {
+		totals := detailTotalsFromRequest(detail)
+		dayKey, hourKey := dashboardLocalDayHour(detail.Timestamp)
+		if detail.Failed {
+			accumulateAggregate(apiName, modelName, detail, dayKey, hourKey, 1, 0, 1, totals)
+			return
+		}
+		accumulateAggregate(apiName, modelName, detail, dayKey, hourKey, 1, 1, 0, totals)
+	}
+
+	if rangeResult != nil {
+		for _, row := range rangeResult.Rows {
+			detail := RequestDetail{
+				UpstreamAPI: row.API,
+				Model:       row.Model,
+				Source:      row.Source,
+				Provider:    row.Provider,
+				AuthID:      row.AuthID,
+				AuthIndex:   row.AuthIndex,
+				AuthType:    row.AuthType,
+				APIKey:      row.APIKey,
+				APIKeyHash:  row.APIKeyHash,
+				Endpoint:    inferRequestEndpoint(row.Endpoint, row.Provider, row.Source),
+				Tokens: TokenStats{
+					InputTokens:      row.InputTokens,
+					OutputTokens:     row.OutputTokens,
+					ReasoningTokens:  row.ReasoningTokens,
+					CachedTokens:     row.CachedTokens,
+					CacheWriteTokens: row.CacheWriteTokens,
+					TotalTokens:      row.TotalTokens,
+				},
+				Failed: row.FailureCount > 0,
+			}
+			modelName := normalizeModelName(row.Model)
+			totals := detailTotals{
+				totalTokens:      row.TotalTokens,
+				inputTokens:      row.InputTokens,
+				outputTokens:     row.OutputTokens,
+				cachedTokens:     row.CachedTokens,
+				cacheWriteTokens: row.CacheWriteTokens,
+				reasoningTokens:  row.ReasoningTokens,
+				latencySum:       row.LatencySum,
+				latencyN:         row.LatencyCount,
+			}
+			accumulateAggregate(row.API, modelName, detail, row.DayKey, row.Hour, row.TotalRequests, row.SuccessCount, row.FailureCount, totals)
+		}
+	} else if s.eventStore != nil {
 		q := EventsQuery{Range: rangeKey, ClientAPI: clientAPI}
 		if err := s.eventStore.forEachEvent(context.Background(), q, now, func(detail RequestDetail) error {
 			if !cutoff.IsZero() && (detail.Timestamp.IsZero() || detail.Timestamp.Before(cutoff)) {
@@ -6515,49 +6874,57 @@ func getOrCreateAPIRangeAgg(apiAgg map[string]*apiRangeAgg, apiName string) *api
 }
 
 func rangeIncrementAPIModel(api *apiRangeAgg, modelName string, detail RequestDetail, totals detailTotals) {
+	if detail.Failed {
+		rangeIncrementAPIModelAggregate(api, modelName, detail, 1, 0, 1, totals)
+		return
+	}
+	rangeIncrementAPIModelAggregate(api, modelName, detail, 1, 1, 0, totals)
+}
+
+func rangeIncrementAPIModelAggregate(api *apiRangeAgg, modelName string, detail RequestDetail, requests, successes, failures int64, totals detailTotals) {
 	m, ok := api.models[modelName]
 	if !ok {
 		m = &modelRangeAgg{}
 		api.models[modelName] = m
 	}
-	m.TotalRequests++
-	if detail.Failed {
-		m.FailureCount++
-	} else {
-		m.SuccessCount++
-	}
+	m.TotalRequests += requests
+	m.SuccessCount += successes
+	m.FailureCount += failures
 	m.TotalTokens += totals.totalTokens
 	m.InputTokens += totals.inputTokens
 	m.OutputTokens += totals.outputTokens
 	m.CachedTokens += totals.cachedTokens
 	m.CacheWriteTokens += totals.cacheWriteTokens
 	m.ReasoningTokens += totals.reasoningTokens
-	m.providerStats = incrementModelProviderStats(m.providerStats, detail.Provider, detail.Failed, totals)
-	if detail.LatencyMs > 0 {
-		m.latencySum += detail.LatencyMs
-		m.latencyN++
-	}
+	m.providerStats = incrementModelProviderStatsAggregate(m.providerStats, detail.Provider, requests, successes, failures, totals)
+	m.latencySum += totals.latencySum
+	m.latencyN += totals.latencyN
 }
 
 func rangeIncrementClientModel(client *clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if detail.Failed {
+		rangeIncrementClientModelAggregate(client, modelName, detail, 1, 0, 1, totals)
+		return
+	}
+	rangeIncrementClientModelAggregate(client, modelName, detail, 1, 1, 0, totals)
+}
+
+func rangeIncrementClientModelAggregate(client *clientAPIStatAccumulator, modelName string, detail RequestDetail, requests, successes, failures int64, totals detailTotals) {
 	cm, ok := client.models[modelName]
 	if !ok {
 		cm = &ClientAPIModelStat{Model: modelName}
 		client.models[modelName] = cm
 	}
-	cm.TotalRequests++
-	if detail.Failed {
-		cm.FailureCount++
-	} else {
-		cm.SuccessCount++
-	}
+	cm.TotalRequests += requests
+	cm.SuccessCount += successes
+	cm.FailureCount += failures
 	cm.TotalTokens += totals.totalTokens
 	cm.InputTokens += totals.inputTokens
 	cm.OutputTokens += totals.outputTokens
 	cm.CachedTokens += totals.cachedTokens
 	cm.CacheWriteTokens += totals.cacheWriteTokens
 	cm.ReasoningTokens += totals.reasoningTokens
-	cm.providerStats = incrementModelProviderStats(cm.providerStats, detail.Provider, detail.Failed, totals)
+	cm.providerStats = incrementModelProviderStatsAggregate(cm.providerStats, detail.Provider, requests, successes, failures, totals)
 }
 
 func detailModel(modelName string, detail RequestDetail) string {
@@ -6592,6 +6959,14 @@ func hasClientAPIIdentity(detail RequestDetail) bool {
 }
 
 func incrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
+	if detail.Failed {
+		incrementClientAPIStatAggregate(accumulators, modelName, detail, 1, 0, 1, totals)
+		return
+	}
+	incrementClientAPIStatAggregate(accumulators, modelName, detail, 1, 1, 0, totals)
+}
+
+func incrementClientAPIStatAggregate(accumulators map[string]*clientAPIStatAccumulator, modelName string, detail RequestDetail, requests, successes, failures int64, totals detailTotals) {
 	if accumulators == nil || !hasClientAPIIdentity(detail) {
 		return
 	}
@@ -6607,12 +6982,9 @@ func incrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, m
 		}
 		accumulators[clientKey] = clientAgg
 	}
-	clientAgg.stat.TotalRequests++
-	if detail.Failed {
-		clientAgg.stat.FailureCount++
-	} else {
-		clientAgg.stat.SuccessCount++
-	}
+	clientAgg.stat.TotalRequests += requests
+	clientAgg.stat.SuccessCount += successes
+	clientAgg.stat.FailureCount += failures
 	clientAgg.stat.TotalTokens += totals.totalTokens
 	clientAgg.stat.InputTokens += totals.inputTokens
 	clientAgg.stat.OutputTokens += totals.outputTokens
@@ -6626,19 +6998,16 @@ func incrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, m
 		clientModel = &ClientAPIModelStat{Model: modelName}
 		clientAgg.models[modelName] = clientModel
 	}
-	clientModel.TotalRequests++
-	if detail.Failed {
-		clientModel.FailureCount++
-	} else {
-		clientModel.SuccessCount++
-	}
+	clientModel.TotalRequests += requests
+	clientModel.SuccessCount += successes
+	clientModel.FailureCount += failures
 	clientModel.TotalTokens += totals.totalTokens
 	clientModel.InputTokens += totals.inputTokens
 	clientModel.OutputTokens += totals.outputTokens
 	clientModel.CachedTokens += totals.cachedTokens
 	clientModel.CacheWriteTokens += totals.cacheWriteTokens
 	clientModel.ReasoningTokens += totals.reasoningTokens
-	clientModel.providerStats = incrementModelProviderStats(clientModel.providerStats, detail.Provider, detail.Failed, totals)
+	clientModel.providerStats = incrementModelProviderStatsAggregate(clientModel.providerStats, detail.Provider, requests, successes, failures, totals)
 }
 
 func decrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
@@ -8215,9 +8584,7 @@ func (s *RequestStatistics) currentDetailCountLocked() int64 {
 		return 0
 	}
 	if s.eventStore != nil {
-		if count, err := s.eventStore.count(context.Background()); err == nil {
-			return count
-		}
+		return maxInt64(s.eventStoreEventCount, 0)
 	}
 	return s.countDetailsLocked()
 }
@@ -8313,8 +8680,15 @@ func (s *RequestStatistics) StorageStatus() StorageStatus {
 		return StorageStatus{}
 	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.storageStatusLocked()
+	status := s.storageStatusLocked()
+	path := status.DatabasePath
+	s.mu.RUnlock()
+	if path != "" {
+		if info, err := os.Stat(path); err == nil {
+			status.DatabaseSizeBytes = info.Size()
+		}
+	}
+	return status
 }
 
 func (s *RequestStatistics) storageStatusLocked() StorageStatus {
@@ -8327,17 +8701,32 @@ func (s *RequestStatistics) storageStatusLocked() StorageStatus {
 	}
 	if s.eventStore != nil {
 		status.DatabasePath = s.eventStore.path
-		if count, err := s.eventStore.count(context.Background()); err == nil {
-			status.EventCount = count
-		}
-		if info, err := os.Stat(s.eventStore.path); err == nil {
-			status.DatabaseSizeBytes = info.Size()
-		}
+		status.EventCount = maxInt64(s.eventStoreEventCount, 0)
+		status.DatabaseSizeBytes = maxInt64(s.eventStoreSizeBytes, 0)
 	}
 	if !s.eventStoreLastWrite.IsZero() {
 		status.LastWriteAt = s.eventStoreLastWrite.UTC().Format(time.RFC3339)
 	}
 	return status
+}
+
+func eventStoreFileSize(path string) int64 {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return maxInt64(info.Size(), 0)
+}
+
+func retentionPruneCutoff(now time.Time, retention time.Duration) int64 {
+	if now.IsZero() || retention <= 0 {
+		return 0
+	}
+	return now.Add(-retention).UTC().Truncate(time.Minute).UnixNano()
 }
 
 func storageWritePressure(queueLength int, queueCapacity int, avgWait time.Duration) string {

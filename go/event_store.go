@@ -20,7 +20,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const eventStoreSchemaVersion = 1
+const eventStoreSchemaVersion = 2
 
 const eventStoreSchema = `
 CREATE TABLE IF NOT EXISTS request_events (
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS aggregate_state (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	version INTEGER NOT NULL,
 	state_json TEXT NOT NULL,
-	updated_at_ns INTEGER NOT NULL
+	updated_at_ns INTEGER NOT NULL,
+	last_event_id INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS pending_enrichments (
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS pending_enrichments (
 
 CREATE INDEX IF NOT EXISTS idx_events_time ON request_events(timestamp_ns DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_api_time ON request_events(api, timestamp_ns DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_events_api_model_time ON request_events(api, model, timestamp_ns DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_model_time ON request_events(model, timestamp_ns DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_source_time ON request_events(source_key, timestamp_ns DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_auth_time ON request_events(auth_index, timestamp_ns DESC, id DESC);
@@ -92,6 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_events_fingerprint ON request_events(fingerprint,
 type eventStore struct {
 	mu        sync.Mutex
 	db        *sql.DB
+	readDB    *sql.DB
 	path      string
 	temporary bool
 }
@@ -108,6 +111,57 @@ type eventRow struct {
 type eventPruneResult struct {
 	Removed          int64
 	RetentionDetails []RequestDetail
+}
+
+type eventPruneScope struct {
+	API            string
+	Model          string
+	ApplyRetention bool
+}
+
+type eventInsertRequest struct {
+	Row         eventRow
+	Fingerprint string
+	Exact       bool
+	Cutoff      time.Time
+}
+
+type eventInsertResult struct {
+	ID    int64
+	Added bool
+}
+
+// dashboardRangeAggregate is one grouped row from the range summary query.
+// The grouping keeps the dimensions needed by the dashboard while collapsing
+// repeated events before they cross the SQLite/Go boundary.
+type dashboardRangeAggregate struct {
+	API              string
+	Model            string
+	Source           string
+	Provider         string
+	AuthID           string
+	AuthIndex        string
+	AuthType         string
+	APIKey           string
+	APIKeyHash       string
+	Endpoint         string
+	DayKey           string
+	Hour             int
+	TotalRequests    int64
+	SuccessCount     int64
+	FailureCount     int64
+	TotalTokens      int64
+	InputTokens      int64
+	OutputTokens     int64
+	CachedTokens     int64
+	CacheWriteTokens int64
+	ReasoningTokens  int64
+	LatencySum       int64
+	LatencyCount     int64
+}
+
+type dashboardRangeQueryResult struct {
+	Rows []dashboardRangeAggregate
 }
 
 func eventRowFromDetail(api, model string, detail RequestDetail) eventRow {
@@ -186,12 +240,77 @@ func openEventStore(path string, temporary bool) (*eventStore, error) {
 			db.Close()
 			return nil, fmt.Errorf("initialize event store schema: %w", err)
 		}
+		if err := ensureAggregateStateWatermark(ctx, db); err != nil {
+			db.Close()
+			return nil, err
+		}
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", eventStoreSchemaVersion)); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("write event store schema version: %w", err)
 		}
 	}
-	return &eventStore{db: db, path: dsn, temporary: temporary}, nil
+	// Index additions are intentionally idempotent and run for already-opened
+	// schema versions as well. This keeps targeted per-model pruning fast for
+	// databases created before the composite index was introduced.
+	if _, err := db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_events_api_model_time ON request_events(api, model, timestamp_ns DESC, id DESC)"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ensure event store indexes: %w", err)
+	}
+	readDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open event store reader: %w", err)
+	}
+	readDB.SetMaxOpenConns(4)
+	readDB.SetMaxIdleConns(4)
+	for _, statement := range []string{
+		"PRAGMA synchronous = NORMAL",
+		"PRAGMA foreign_keys = ON",
+		"PRAGMA busy_timeout = 5000",
+		"PRAGMA cache_size = -4096",
+	} {
+		if _, err := readDB.ExecContext(ctx, statement); err != nil {
+			_ = readDB.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("configure event store reader: %w", err)
+		}
+	}
+	return &eventStore{db: db, readDB: readDB, path: dsn, temporary: temporary}, nil
+}
+
+func ensureAggregateStateWatermark(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return errors.New("event store database is nil while checking aggregate watermark")
+	}
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(aggregate_state)")
+	if err != nil {
+		return fmt.Errorf("inspect aggregate state schema: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan aggregate state schema: %w", err)
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "last_event_id") {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate aggregate state schema: %w", err)
+	}
+	rows.Close()
+	if found {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE aggregate_state ADD COLUMN last_event_id INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("add aggregate event watermark: %w", err)
+	}
+	return nil
 }
 
 func sameEventStorePath(left, right string) bool {
@@ -233,6 +352,46 @@ func (s *eventStore) insertEvent(ctx context.Context, row eventRow, fingerprint 
 }
 
 func (s *eventStore) insertEventTx(ctx context.Context, tx *sql.Tx, row eventRow, fingerprint string, exact bool, cutoff time.Time) (int64, bool, error) {
+	results, err := s.insertEventsTx(ctx, tx, []eventInsertRequest{{
+		Row:         row,
+		Fingerprint: fingerprint,
+		Exact:       exact,
+		Cutoff:      cutoff,
+	}})
+	if err != nil {
+		return 0, false, err
+	}
+	if len(results) != 1 {
+		return 0, false, errors.New("event batch insert returned an unexpected result count")
+	}
+	return results[0].ID, results[0].Added, nil
+}
+
+func (s *eventStore) insertEventsTx(ctx context.Context, tx *sql.Tx, requests []eventInsertRequest) ([]eventInsertResult, error) {
+	if tx == nil {
+		return nil, errors.New("event batch insert transaction is nil")
+	}
+	if len(requests) == 0 {
+		return nil, nil
+	}
+	statement, err := tx.PrepareContext(ctx, storedEventInsertSQL)
+	if err != nil {
+		return nil, fmt.Errorf("prepare event batch insert: %w", err)
+	}
+	defer statement.Close()
+
+	results := make([]eventInsertResult, 0, len(requests))
+	for _, request := range requests {
+		id, added, err := s.insertEventTxPrepared(ctx, tx, statement, request.Row, request.Fingerprint, request.Exact, request.Cutoff)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, eventInsertResult{ID: id, Added: added})
+	}
+	return results, nil
+}
+
+func (s *eventStore) insertEventTxPrepared(ctx context.Context, tx *sql.Tx, statement *sql.Stmt, row eventRow, fingerprint string, exact bool, cutoff time.Time) (int64, bool, error) {
 	if strings.TrimSpace(fingerprint) == "" {
 		fingerprint = eventFingerprint(row.API, eventRowModel(row), row.Detail)
 	}
@@ -271,7 +430,11 @@ func (s *eventStore) insertEventTx(ctx context.Context, tx *sql.Tx, row eventRow
 	if err != nil {
 		return 0, false, err
 	}
-	result, err := tx.ExecContext(ctx, `
+	var result sql.Result
+	if statement != nil {
+		result, err = statement.ExecContext(ctx, args...)
+	} else {
+		result, err = tx.ExecContext(ctx, `
 INSERT INTO request_events (
 	timestamp_ns, timestamp_zero, api, model, source, source_key, provider,
 	auth_id, auth_index, auth_type, api_key, api_key_hash, api_key_label_hash,
@@ -280,6 +443,7 @@ INSERT INTO request_events (
 	cache_write_tokens, total_tokens, latency_ms, ttft_ms, failed, status_code,
 	failure, fingerprint, created_at_ns
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+	}
 	if err != nil {
 		return 0, false, fmt.Errorf("insert event: %w", err)
 	}
@@ -370,7 +534,7 @@ func (s *eventStore) queryEvents(ctx context.Context, q EventsQuery, now time.Ti
 }
 
 func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now time.Time, limit, offset int) (EventsResult, error) {
-	db, err := s.database()
+	db, err := s.readDatabase()
 	if err != nil {
 		return EventsResult{}, err
 	}
@@ -423,12 +587,94 @@ func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now tim
 	}, nil
 }
 
+// queryDashboardRange performs the range aggregation in SQLite. The SQL
+// expressions intentionally mirror detailTotalsFromRequest so grouped rows
+// produce the same token and cost inputs as the detail path.
+func (s *eventStore) queryDashboardRange(ctx context.Context, q EventsQuery, now time.Time) (dashboardRangeQueryResult, error) {
+	db, err := s.readDatabase()
+	if err != nil {
+		return dashboardRangeQueryResult{}, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	where, args := eventQueryWhere(q, now)
+	dayBucket := `CASE
+WHEN timestamp_zero <> 0 THEN '0001-01-01'
+ELSE strftime('%Y-%m-%d', timestamp_ns / 1000000000, 'unixepoch', '+8 hours')
+END`
+	hourBucket := `CASE
+WHEN timestamp_zero <> 0 THEN 8
+ELSE CAST(strftime('%H', timestamp_ns / 1000000000, 'unixepoch', '+8 hours') AS INTEGER)
+END`
+	query := fmt.Sprintf(`
+SELECT api,
+       model,
+       source,
+       provider,
+       auth_id,
+       auth_index,
+       auth_type,
+       api_key,
+       api_key_hash,
+       endpoint,
+       %s AS day_key,
+       %s AS hour_key,
+       COUNT(*) AS total_requests,
+       SUM(CASE WHEN failed = 0 THEN 1 ELSE 0 END) AS success_count,
+       SUM(CASE WHEN failed <> 0 THEN 1 ELSE 0 END) AS failure_count,
+       SUM(%s) AS total_tokens,
+       SUM(MAX(input_tokens, 0)) AS input_tokens,
+       SUM(MAX(output_tokens, 0)) AS output_tokens,
+       SUM(%s) AS cached_tokens,
+       SUM(MAX(cache_write_tokens, 0)) AS cache_write_tokens,
+       SUM(MAX(reasoning_tokens, 0)) AS reasoning_tokens,
+       SUM(CASE WHEN latency_ms > 0 THEN latency_ms ELSE 0 END) AS latency_sum,
+       SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_count
+FROM request_events%s
+GROUP BY api, model, source, provider, auth_id, auth_index, auth_type,
+         api_key, api_key_hash, endpoint, timestamp_zero, day_key, hour_key
+ORDER BY day_key ASC, hour_key ASC, total_requests DESC, api ASC, model ASC,
+         provider ASC, endpoint ASC`, dayBucket, hourBucket, eventTotalTokensSQL, eventCachedTokensSQL, where)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return dashboardRangeQueryResult{}, fmt.Errorf("begin dashboard range query: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return dashboardRangeQueryResult{}, fmt.Errorf("aggregate dashboard range: %w", err)
+	}
+	defer rows.Close()
+
+	result := dashboardRangeQueryResult{Rows: make([]dashboardRangeAggregate, 0)}
+	for rows.Next() {
+		var row dashboardRangeAggregate
+		if err := rows.Scan(
+			&row.API, &row.Model, &row.Source, &row.Provider, &row.AuthID,
+			&row.AuthIndex, &row.AuthType, &row.APIKey, &row.APIKeyHash,
+			&row.Endpoint, &row.DayKey, &row.Hour, &row.TotalRequests,
+			&row.SuccessCount, &row.FailureCount, &row.TotalTokens,
+			&row.InputTokens, &row.OutputTokens, &row.CachedTokens,
+			&row.CacheWriteTokens, &row.ReasoningTokens, &row.LatencySum,
+			&row.LatencyCount,
+		); err != nil {
+			return dashboardRangeQueryResult{}, fmt.Errorf("scan dashboard range aggregate: %w", err)
+		}
+		result.Rows = append(result.Rows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return dashboardRangeQueryResult{}, fmt.Errorf("iterate dashboard range aggregates: %w", err)
+	}
+	return result, nil
+}
+
 func (s *eventStore) forEachEvent(ctx context.Context, q EventsQuery, now time.Time, fn func(RequestDetail) error) error {
 	if fn == nil {
 		return nil
 	}
 	q = normalizeEventsQuery(q, false)
-	db, err := s.database()
+	db, err := s.readDatabase()
 	if err != nil {
 		return err
 	}
@@ -464,8 +710,50 @@ func (s *eventStore) forEachEvent(ctx context.Context, q EventsQuery, now time.T
 	return nil
 }
 
+func (s *eventStore) forEachEventAfterID(ctx context.Context, afterID int64, fn func(RequestDetail) error) error {
+	if fn == nil {
+		return nil
+	}
+	db, err := s.readDatabase()
+	if err != nil {
+		return err
+	}
+	rows, err := db.QueryContext(ctx, eventSelectColumns+" WHERE id > ? ORDER BY id ASC", maxInt64(afterID, 0))
+	if err != nil {
+		return fmt.Errorf("scan aggregate event tail: %w", err)
+	}
+	for rows.Next() {
+		detail, scanErr := scanEvent(rows)
+		if scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		if callbackErr := fn(detail); callbackErr != nil {
+			rows.Close()
+			return callbackErr
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate aggregate event tail: %w", err)
+	}
+	rows.Close()
+	return nil
+}
+
+func (s *eventStore) eventsAfterID(ctx context.Context, afterID int64) ([]RequestDetail, error) {
+	events := make([]RequestDetail, 0)
+	if err := s.forEachEventAfterID(ctx, afterID, func(detail RequestDetail) error {
+		events = append(events, detail)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
 func (s *eventStore) queryAPIDetail(ctx context.Context, api, rangeKey, clientAPI string, recentLimit, recentOffset, errorLimit int, now time.Time) (APIDetailResponse, error) {
-	db, err := s.database()
+	db, err := s.readDatabase()
 	if err != nil {
 		return APIDetailResponse{}, err
 	}
@@ -800,7 +1088,7 @@ func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *Stat
 	if snapshot == nil {
 		return nil
 	}
-	db, err := s.database()
+	db, err := s.readDatabase()
 	if err != nil {
 		return err
 	}
@@ -841,7 +1129,7 @@ func (s *eventStore) populateSnapshotDetails(ctx context.Context, snapshot *Stat
 }
 
 func (s *eventStore) count(ctx context.Context) (int64, error) {
-	db, err := s.database()
+	db, err := s.readDatabase()
 	if err != nil {
 		return 0, err
 	}
@@ -850,6 +1138,18 @@ func (s *eventStore) count(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("count events: %w", err)
 	}
 	return total, nil
+}
+
+func (s *eventStore) maxEventID(ctx context.Context) (int64, error) {
+	db, err := s.readDatabase()
+	if err != nil {
+		return 0, err
+	}
+	var maxID int64
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0) FROM request_events").Scan(&maxID); err != nil {
+		return 0, fmt.Errorf("read maximum event id: %w", err)
+	}
+	return maxInt64(maxID, 0), nil
 }
 
 func (s *eventStore) prune(ctx context.Context, maxDetailsPerModel int, retention time.Duration, now time.Time) (eventPruneResult, error) {
@@ -876,6 +1176,10 @@ func (s *eventStore) prune(ctx context.Context, maxDetailsPerModel int, retentio
 }
 
 func (s *eventStore) pruneTx(ctx context.Context, tx *sql.Tx, maxDetailsPerModel int, retention time.Duration, now time.Time) (eventPruneResult, error) {
+	return s.pruneTxScoped(ctx, tx, maxDetailsPerModel, retention, now, eventPruneScope{ApplyRetention: true})
+}
+
+func (s *eventStore) pruneTxScoped(ctx context.Context, tx *sql.Tx, maxDetailsPerModel int, retention time.Duration, now time.Time, scope eventPruneScope) (eventPruneResult, error) {
 	result := eventPruneResult{}
 	deleteRows := func(query string, args ...any) error {
 		execResult, execErr := tx.ExecContext(ctx, query, args...)
@@ -888,7 +1192,7 @@ func (s *eventStore) pruneTx(ctx context.Context, tx *sql.Tx, maxDetailsPerModel
 		}
 		return nil
 	}
-	if retention > 0 {
+	if scope.ApplyRetention && retention > 0 {
 		cutoff := now.Add(-retention).UTC().UnixNano()
 		rows, err := tx.QueryContext(ctx, eventSelectColumns+" WHERE timestamp_zero = 0 AND timestamp_ns < ? ORDER BY id ASC", cutoff)
 		if err != nil {
@@ -912,18 +1216,30 @@ func (s *eventStore) pruneTx(ctx context.Context, tx *sql.Tx, maxDetailsPerModel
 		}
 	}
 	if maxDetailsPerModel >= 0 {
-		if err := deleteRows(`DELETE FROM request_events
+		query := `DELETE FROM request_events
 WHERE id IN (
 	SELECT id FROM (
 		SELECT id, ROW_NUMBER() OVER (PARTITION BY api, model ORDER BY timestamp_ns DESC, id DESC) AS row_number
 		FROM request_events
 	) ranked
 	WHERE row_number > ?
-)`, maxDetailsPerModel); err != nil {
+)`
+		args := []any{maxDetailsPerModel}
+		if strings.TrimSpace(scope.API) != "" && strings.TrimSpace(scope.Model) != "" {
+			query = `DELETE FROM request_events
+WHERE id IN (
+	SELECT id FROM request_events
+	WHERE api = ? AND model = ?
+	ORDER BY timestamp_ns DESC, id DESC
+	LIMIT -1 OFFSET ?
+)`
+			args = []any{scope.API, scope.Model, maxDetailsPerModel}
+		}
+		if err := deleteRows(query, args...); err != nil {
 			return eventPruneResult{}, fmt.Errorf("prune model event limit: %w", err)
 		}
 	}
-	if retention > 0 {
+	if scope.ApplyRetention && retention > 0 {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM pending_enrichments WHERE timestamp_zero = 0 AND timestamp_ns < ?", now.Add(-retention).UTC().UnixNano()); err != nil {
 			return eventPruneResult{}, fmt.Errorf("prune pending enrichments: %w", err)
 		}
@@ -937,12 +1253,24 @@ func (s *eventStore) close() error {
 	}
 	s.mu.Lock()
 	db := s.db
+	readDB := s.readDB
 	s.db = nil
+	s.readDB = nil
 	s.mu.Unlock()
-	if db == nil {
+	if db == nil && readDB == nil {
 		return nil
 	}
-	err := db.Close()
+	var err error
+	if readDB != nil && readDB != db {
+		if closeErr := readDB.Close(); closeErr != nil {
+			err = closeErr
+		}
+	}
+	if db != nil {
+		if closeErr := db.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
 	if s.temporary && s.path != "" {
 		for _, path := range []string{s.path, s.path + "-wal", s.path + "-shm"} {
 			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && err == nil {
@@ -953,22 +1281,33 @@ func (s *eventStore) close() error {
 	return err
 }
 
+type aggregateState struct {
+	Snapshot    StatisticsSnapshot
+	LastEventID int64
+}
+
 func (s *eventStore) loadAggregate(ctx context.Context) (StatisticsSnapshot, bool, error) {
-	db, err := s.database()
+	state, found, err := s.loadAggregateState(ctx)
+	return state.Snapshot, found, err
+}
+
+func (s *eventStore) loadAggregateState(ctx context.Context) (aggregateState, bool, error) {
+	db, err := s.readDatabase()
 	if err != nil {
-		return StatisticsSnapshot{}, false, err
+		return aggregateState{}, false, err
 	}
 	var encoded string
-	err = db.QueryRowContext(ctx, "SELECT state_json FROM aggregate_state WHERE id = 1").Scan(&encoded)
+	var lastEventID int64
+	err = db.QueryRowContext(ctx, "SELECT state_json, last_event_id FROM aggregate_state WHERE id = 1").Scan(&encoded, &lastEventID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StatisticsSnapshot{}, false, nil
+		return aggregateState{}, false, nil
 	}
 	if err != nil {
-		return StatisticsSnapshot{}, false, fmt.Errorf("read aggregate state: %w", err)
+		return aggregateState{}, false, fmt.Errorf("read aggregate state: %w", err)
 	}
 	var snapshot StatisticsSnapshot
 	if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
-		return StatisticsSnapshot{}, false, fmt.Errorf("decode aggregate state: %w", err)
+		return aggregateState{}, false, fmt.Errorf("decode aggregate state: %w", err)
 	}
 	migrateLegacyDashboardHourlySeries(&snapshot)
 	for apiName, apiSnapshot := range snapshot.APIs {
@@ -978,11 +1317,11 @@ func (s *eventStore) loadAggregate(ctx context.Context) (StatisticsSnapshot, boo
 		}
 		snapshot.APIs[apiName] = apiSnapshot
 	}
-	return snapshot, true, nil
+	return aggregateState{Snapshot: snapshot, LastEventID: maxInt64(lastEventID, 0)}, true, nil
 }
 
 func (s *eventStore) isEmpty(ctx context.Context) (bool, error) {
-	db, err := s.database()
+	db, err := s.readDatabase()
 	if err != nil {
 		return false, err
 	}
@@ -1004,7 +1343,7 @@ func (s *eventStore) copyFrom(ctx context.Context, source *eventStore) error {
 	if s == nil || source == nil || s == source {
 		return nil
 	}
-	sourceDB, err := source.database()
+	sourceDB, err := source.readDatabase()
 	if err != nil {
 		return err
 	}
@@ -1096,14 +1435,15 @@ VALUES (?, ?, ?, ?, ?)`, fingerprint, timestampNS, timestampZero, updateJSON, up
 	var aggregateVersion int
 	var aggregateJSON string
 	var aggregateUpdatedAt int64
+	var aggregateLastEventID int64
 	err = sourceTx.QueryRowContext(ctx, `
-SELECT version, state_json, updated_at_ns
+SELECT version, state_json, updated_at_ns, last_event_id
 FROM aggregate_state
-WHERE id = 1`).Scan(&aggregateVersion, &aggregateJSON, &aggregateUpdatedAt)
+WHERE id = 1`).Scan(&aggregateVersion, &aggregateJSON, &aggregateUpdatedAt, &aggregateLastEventID)
 	if err == nil {
 		if _, err := destinationTx.ExecContext(ctx, `
-INSERT INTO aggregate_state (id, version, state_json, updated_at_ns)
-VALUES (1, ?, ?, ?)`, aggregateVersion, aggregateJSON, aggregateUpdatedAt); err != nil {
+	INSERT INTO aggregate_state (id, version, state_json, updated_at_ns, last_event_id)
+	VALUES (1, ?, ?, ?, ?)`, aggregateVersion, aggregateJSON, aggregateUpdatedAt, aggregateLastEventID); err != nil {
 			return fmt.Errorf("write copied aggregate state: %w", err)
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -1157,6 +1497,9 @@ func (s *eventStore) saveAggregate(ctx context.Context, snapshot StatisticsSnaps
 }
 
 func (s *eventStore) saveAggregateTx(ctx context.Context, tx *sql.Tx, snapshot StatisticsSnapshot) error {
+	if tx == nil {
+		return errors.New("aggregate state transaction is nil")
+	}
 	for apiName, apiSnapshot := range snapshot.APIs {
 		for modelName, modelSnapshot := range apiSnapshot.Models {
 			modelSnapshot.Details = nil
@@ -1168,13 +1511,18 @@ func (s *eventStore) saveAggregateTx(ctx context.Context, tx *sql.Tx, snapshot S
 	if err != nil {
 		return fmt.Errorf("encode aggregate state: %w", err)
 	}
+	var lastEventID int64
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0) FROM request_events").Scan(&lastEventID); err != nil {
+		return fmt.Errorf("read aggregate event watermark: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO aggregate_state (id, version, state_json, updated_at_ns)
-VALUES (1, ?, ?, ?)
+INSERT INTO aggregate_state (id, version, state_json, updated_at_ns, last_event_id)
+VALUES (1, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	version = excluded.version,
 	state_json = excluded.state_json,
-	updated_at_ns = excluded.updated_at_ns`, eventStoreSchemaVersion, string(encoded), time.Now().UTC().UnixNano()); err != nil {
+	updated_at_ns = excluded.updated_at_ns,
+	last_event_id = excluded.last_event_id`, eventStoreSchemaVersion, string(encoded), time.Now().UTC().UnixNano(), maxInt64(lastEventID, 0)); err != nil {
 		return fmt.Errorf("write aggregate state: %w", err)
 	}
 	return nil
@@ -1186,6 +1534,22 @@ func (s *eventStore) database() (*sql.DB, error) {
 	}
 	s.mu.Lock()
 	db := s.db
+	s.mu.Unlock()
+	if db == nil {
+		return nil, errors.New("event store is closed")
+	}
+	return db, nil
+}
+
+func (s *eventStore) readDatabase() (*sql.DB, error) {
+	if s == nil {
+		return nil, errors.New("event store is nil")
+	}
+	s.mu.Lock()
+	db := s.readDB
+	if db == nil {
+		db = s.db
+	}
 	s.mu.Unlock()
 	if db == nil {
 		return nil, errors.New("event store is closed")

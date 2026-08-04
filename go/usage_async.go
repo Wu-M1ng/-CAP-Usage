@@ -2,17 +2,32 @@ package main
 
 import "sync"
 
+const (
+	// Response interceptor payloads can include the complete stream history.
+	// Bound both task count and retained payload bytes so a slow SQLite writer
+	// cannot turn callback traffic into unbounded heap growth.
+	usageCallbackQueueMaxTasks = 256
+	usageCallbackQueueMaxBytes = 16 << 20
+	usageCallbackTaskOverhead  = 1024
+)
+
 // usageCallbackProcessor keeps host callbacks short while preserving the
 // order in which native usage and response-interceptor callbacks are received.
 // The queue is only used for SQLite-backed statistics; the in-memory path stays
 // synchronous for callers that depend on immediate visibility.
 type usageCallbackProcessor struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	queue    []func()
-	active   bool
-	stopping bool
-	done     chan struct{}
+	mu          sync.Mutex
+	cond        *sync.Cond
+	queue       []usageCallbackTask
+	queuedBytes int
+	active      bool
+	stopping    bool
+	done        chan struct{}
+}
+
+type usageCallbackTask struct {
+	fn       func()
+	retained int
 }
 
 func newUsageCallbackProcessor() *usageCallbackProcessor {
@@ -24,19 +39,40 @@ func newUsageCallbackProcessor() *usageCallbackProcessor {
 
 var usageCallbacks = newUsageCallbackProcessor()
 
-func (p *usageCallbackProcessor) enqueue(task func()) bool {
+func (p *usageCallbackProcessor) enqueue(task func(), payloadBytes int) bool {
 	if p == nil || task == nil {
 		return false
 	}
-	p.mu.Lock()
-	if p.stopping {
-		p.mu.Unlock()
-		return false
+	if payloadBytes < 0 {
+		payloadBytes = 0
 	}
-	p.queue = append(p.queue, task)
-	p.cond.Signal()
-	p.mu.Unlock()
-	return true
+	retainedBytes := payloadBytes + usageCallbackTaskOverhead
+	if retainedBytes < payloadBytes {
+		retainedBytes = usageCallbackQueueMaxBytes + 1
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for {
+		if p.stopping {
+			return false
+		}
+		fits := len(p.queue) < usageCallbackQueueMaxTasks &&
+			(retainedBytes <= usageCallbackQueueMaxBytes-p.queuedBytes)
+		if fits {
+			p.queue = append(p.queue, usageCallbackTask{fn: task, retained: retainedBytes})
+			p.queuedBytes += retainedBytes
+			p.cond.Signal()
+			return true
+		}
+		// A single oversized payload is handled synchronously, but only after
+		// all earlier callbacks have drained so callback ordering is preserved.
+		if len(p.queue) == 0 && !p.active {
+			return false
+		}
+		// Backpressure is deliberate: dropping usage records or running this
+		// task ahead of queued callbacks would corrupt native/fallback pairing.
+		p.cond.Wait()
+	}
 }
 
 func (p *usageCallbackProcessor) loop() {
@@ -51,12 +87,18 @@ func (p *usageCallbackProcessor) loop() {
 			return
 		}
 		task := p.queue[0]
-		p.queue[0] = nil
+		p.queue[0] = usageCallbackTask{}
 		p.queue = p.queue[1:]
+		p.queuedBytes -= task.retained
+		if len(p.queue) == 0 {
+			p.queue = nil
+			p.queuedBytes = 0
+		}
 		p.active = true
+		p.cond.Broadcast()
 		p.mu.Unlock()
 
-		task()
+		task.fn()
 
 		p.mu.Lock()
 		p.active = false
@@ -92,11 +134,11 @@ func (p *usageCallbackProcessor) shutdown() {
 	<-done
 }
 
-func deferUsageCallback(s *RequestStatistics, task func()) bool {
+func deferUsageCallback(s *RequestStatistics, task func(), payloadBytes int) bool {
 	if s == nil || !s.hasEventStore() {
 		return false
 	}
-	return usageCallbacks.enqueue(task)
+	return usageCallbacks.enqueue(task, payloadBytes)
 }
 
 func waitForUsageCallbacks() {

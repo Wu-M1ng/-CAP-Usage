@@ -1843,6 +1843,55 @@ func TestResponseInterceptEnrichesCommittedFallbackFromLateNative(t *testing.T) 
 	}
 }
 
+func TestResponseInterceptMatchesNativeTimestampAfterFallbackRequest(t *testing.T) {
+	previousStats := stats
+	previousDelay := usageFallbackRecordDelay
+	stats = NewRequestStatistics()
+	usageFallbackRecordDelay = 10 * time.Millisecond
+	t.Cleanup(func() {
+		usageFallbackRecordDelay = previousDelay
+		stats = previousStats
+	})
+
+	coordinator := newUsageFallbackCoordinator()
+	requestAt := time.Now()
+	fallback := UsageRecord{
+		Provider:    "gemini",
+		Model:       "gemini-3.6-flash-high",
+		Alias:       "gemini-3.6-flash-high",
+		RequestedAt: requestAt,
+		Detail:      UsageDetail{InputTokens: 3, OutputTokens: 9, ReasoningTokens: 58, TotalTokens: 70},
+	}
+	coordinator.Schedule(fallback)
+	waitForTestCondition(t, func() bool {
+		return stats.Snapshot().TotalRequests == 1
+	})
+
+	native := UsageRecord{
+		Provider:    "antigravity",
+		Model:       fallback.Model,
+		Alias:       fallback.Alias,
+		AuthID:      "antigravity-user@example.com.json",
+		RequestedAt: requestAt.Add(2 * time.Second),
+		Endpoint:    "/v1beta/models/gemini-3.6-flash-high:generateContent",
+		Detail:      fallback.Detail,
+	}
+	if _, accepted := coordinator.HandleNative(native); accepted {
+		t.Fatal("HandleNative() = true, want late native timestamp to suppress fallback duplicate")
+	}
+
+	if got := stats.Snapshot().TotalRequests; got != 1 {
+		t.Fatalf("total requests = %d, want one record after late native reconciliation", got)
+	}
+	events := stats.QueryEventsAt(EventsQuery{Range: "24h", Limit: 10}, time.Now())
+	if len(events.Events) != 1 {
+		t.Fatalf("events = %#v, want one reconciled event", events.Events)
+	}
+	if events.Events[0].Endpoint != native.Endpoint {
+		t.Fatalf("event endpoint = %q, want native endpoint %q", events.Events[0].Endpoint, native.Endpoint)
+	}
+}
+
 func TestUsageFallbackKeepsDifferentClientAPIKeysSeparate(t *testing.T) {
 	left := UsageRecord{
 		Provider: "antigravity",
@@ -5978,5 +6027,47 @@ func BenchmarkConfigurePrune200k(b *testing.B) {
 		b.StartTimer()
 		stats.Configure(runtimeConfig{MaxDetailsPerModel: 100000, RetentionDays: 30, DedupWindowMinutes: 0})
 		b.StopTimer()
+	}
+}
+
+func TestUsageFallbackCoordinatorBatchesPendingDeadlines(t *testing.T) {
+	previousDelay := usageFallbackRecordDelay
+	usageFallbackRecordDelay = time.Hour
+	coordinator := newUsageFallbackCoordinator()
+	statistics := NewRequestStatistics()
+	t.Cleanup(func() {
+		coordinator.Flush()
+		statistics.Close()
+		usageFallbackRecordDelay = previousDelay
+	})
+
+	const count = 2000
+	base := time.Now()
+	for i := 0; i < count; i++ {
+		coordinator.ScheduleForStats(statistics, UsageRecord{
+			Provider:    "openai-compatible",
+			Model:       "gpt-5.5",
+			RequestedAt: base.Add(time.Duration(i) * time.Microsecond),
+			Detail: UsageDetail{
+				InputTokens:  int64(i + 1),
+				OutputTokens: 1,
+			},
+		})
+	}
+
+	coordinator.mu.Lock()
+	deadlineCount := len(coordinator.deadlines)
+	pendingCount := 0
+	for _, pending := range coordinator.pending {
+		pendingCount += len(pending)
+	}
+	coordinator.mu.Unlock()
+	if deadlineCount != count || pendingCount != count {
+		t.Fatalf("fallback scheduler state = deadlines %d pending %d, want %d/%d", deadlineCount, pendingCount, count, count)
+	}
+
+	coordinator.Flush()
+	if got := statistics.Snapshot().TotalRequests; got != count {
+		t.Fatalf("flushed fallback records = %d, want %d", got, count)
 	}
 }

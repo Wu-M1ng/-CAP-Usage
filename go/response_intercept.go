@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -178,7 +179,7 @@ func handleResponseIntercept(requestBody []byte) ([]byte, error) {
 	fallbacks := usageFallbacks
 	if deferUsageCallback(statistics, func() {
 		processResponseIntercept(statistics, fallbacks, requestBody)
-	}) {
+	}, len(requestBody)) {
 		return okEnvelopeJSON("{}")
 	}
 
@@ -195,9 +196,12 @@ func handleResponseIntercept(requestBody []byte) ([]byte, error) {
 func handleResponseStreamChunk(requestBody []byte) ([]byte, error) {
 	statistics := stats
 	fallbacks := usageFallbacks
+	if !responseStreamChunkMayContainUsage(requestBody) {
+		return okEnvelopeJSON("{}")
+	}
 	if deferUsageCallback(statistics, func() {
 		processResponseStreamChunk(statistics, fallbacks, requestBody)
-	}) {
+	}, len(requestBody)) {
 		return okEnvelopeJSON("{}")
 	}
 
@@ -210,6 +214,97 @@ func handleResponseStreamChunk(requestBody []byte) ([]byte, error) {
 		fallbacks.ScheduleForStats(statistics, record)
 	}
 	return okEnvelopeJSON("{}")
+}
+
+func pluginCallNeedsRequestCopy(method string, requestBody []byte) bool {
+	if method != "response.intercept_stream_chunk" {
+		return true
+	}
+	return responseStreamChunkMayContainUsage(requestBody)
+}
+
+func responseStreamChunkMayContainUsage(requestBody []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(requestBody))
+	token, err := decoder.Token()
+	if err != nil {
+		return true
+	}
+	objectStart, ok := token.(json.Delim)
+	if !ok || objectStart != '{' {
+		return true
+	}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return true
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return true
+		}
+		if strings.EqualFold(key, "body") {
+			var body []byte
+			if err := decoder.Decode(&body); err != nil {
+				return true
+			}
+			if len(bytes.TrimSpace(body)) == 0 {
+				continue
+			}
+			return responseBodyMayContainUsage(body)
+		}
+		if err := skipJSONDecoderValue(decoder); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func responseBodyMayContainUsage(body []byte) bool {
+	for _, marker := range responseUsageMarkers {
+		if bytes.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+var responseUsageMarkers = [...][]byte{
+	[]byte(`"usage"`),
+	[]byte(`"total_usage"`),
+	[]byte(`"usageMetadata"`),
+	[]byte(`"usage_metadata"`),
+}
+
+func skipJSONDecoderValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+			if err := skipJSONDecoderValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := skipJSONDecoderValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 func processResponseIntercept(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, requestBody []byte) {
@@ -581,6 +676,11 @@ type usageFallbackCoordinator struct {
 	pending        map[string][]*pendingUsageFallback
 	nativeRecent   map[string][]usageFallbackOccurrence
 	fallbackRecent map[string][]usageFallbackOccurrence
+	deadlines      usageFallbackDeadlineHeap
+	wake           chan struct{}
+	stop           chan struct{}
+	done           chan struct{}
+	sequence       uint64
 	closed         bool
 }
 
@@ -588,9 +688,46 @@ type pendingUsageFallback struct {
 	key       string
 	record    UsageRecord
 	requestAt time.Time
-	timer     *time.Timer
+	deadline  time.Time
+	sequence  uint64
+	heapIndex int
 	cancelled bool
 	stats     *RequestStatistics
+}
+
+type usageFallbackDeadlineHeap []*pendingUsageFallback
+
+func (h usageFallbackDeadlineHeap) Len() int {
+	return len(h)
+}
+
+func (h usageFallbackDeadlineHeap) Less(i, j int) bool {
+	if h[i].deadline.Equal(h[j].deadline) {
+		return h[i].sequence < h[j].sequence
+	}
+	return h[i].deadline.Before(h[j].deadline)
+}
+
+func (h usageFallbackDeadlineHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+
+func (h *usageFallbackDeadlineHeap) Push(value any) {
+	item := value.(*pendingUsageFallback)
+	item.heapIndex = len(*h)
+	*h = append(*h, item)
+}
+
+func (h *usageFallbackDeadlineHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	item := old[last]
+	old[last] = nil
+	item.heapIndex = -1
+	*h = old[:last]
+	return item
 }
 
 type usageFallbackOccurrence struct {
@@ -601,10 +738,99 @@ type usageFallbackOccurrence struct {
 }
 
 func newUsageFallbackCoordinator() *usageFallbackCoordinator {
-	return &usageFallbackCoordinator{
+	coordinator := &usageFallbackCoordinator{
 		pending:        make(map[string][]*pendingUsageFallback),
 		nativeRecent:   make(map[string][]usageFallbackOccurrence),
 		fallbackRecent: make(map[string][]usageFallbackOccurrence),
+		wake:           make(chan struct{}, 1),
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
+	}
+	heap.Init(&coordinator.deadlines)
+	go coordinator.runScheduler()
+	return coordinator
+}
+
+func (c *usageFallbackCoordinator) signalScheduler() {
+	if c == nil || c.wake == nil {
+		return
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *usageFallbackCoordinator) runScheduler() {
+	if c == nil {
+		return
+	}
+	defer close(c.done)
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return
+		}
+		now := time.Now()
+		c.cleanupLocked(now)
+		if len(c.deadlines) == 0 {
+			c.mu.Unlock()
+			select {
+			case <-c.wake:
+				continue
+			case <-c.stop:
+				return
+			}
+		}
+		wait := time.Until(c.deadlines[0].deadline)
+		c.mu.Unlock()
+		if wait <= 0 {
+			c.commitDue()
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+			c.commitDue()
+		case <-c.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-c.stop:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
+func (c *usageFallbackCoordinator) commitDue() {
+	if c == nil {
+		return
+	}
+	due := make([]*pendingUsageFallback, 0)
+	c.mu.Lock()
+	if !c.closed {
+		now := time.Now()
+		for len(c.deadlines) > 0 {
+			item := c.deadlines[0]
+			if item == nil || item.deadline.After(now) {
+				break
+			}
+			due = append(due, heap.Pop(&c.deadlines).(*pendingUsageFallback))
+		}
+	}
+	c.mu.Unlock()
+	for _, item := range due {
+		c.commit(item)
 	}
 }
 
@@ -633,10 +859,13 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 	if delay < 0 {
 		delay = 0
 	}
+	now := time.Now()
 	pending := &pendingUsageFallback{
 		key:       key,
 		record:    record,
 		requestAt: requestAt,
+		deadline:  now.Add(delay),
+		heapIndex: -1,
 		stats:     usageFallbackStats(statistics),
 	}
 	c.mu.Lock()
@@ -644,7 +873,6 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 		c.mu.Unlock()
 		return
 	}
-	now := time.Now()
 	c.cleanupLocked(now)
 	if nativeRecord, nativeStats, ok := c.consumeNativeRecentLocked(key, record, requestAt, now); ok {
 		c.mu.Unlock()
@@ -657,10 +885,14 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 		return
 	}
 	c.pending[key] = append(c.pending[key], pending)
-	pending.timer = time.AfterFunc(delay, func() {
-		c.commit(pending)
-	})
+	c.sequence++
+	pending.sequence = c.sequence
+	wasHead := len(c.deadlines) == 0 || pending.deadline.Before(c.deadlines[0].deadline)
+	heap.Push(&c.deadlines, pending)
 	c.mu.Unlock()
+	if wasHead {
+		c.signalScheduler()
+	}
 }
 
 func (c *usageFallbackCoordinator) HandleNative(record UsageRecord) (UsageRecord, bool) {
@@ -685,10 +917,8 @@ func (c *usageFallbackCoordinator) HandleNativeForStats(statistics *RequestStati
 	c.cleanupLocked(now)
 	if pending := c.popPendingLocked(key, record); pending != nil {
 		pending.cancelled = true
-		if pending.timer != nil {
-			pending.timer.Stop()
-		}
 		c.mu.Unlock()
+		c.signalScheduler()
 		return enrichUsageRecord(record, pending.record), true
 	}
 	if fallbackRecord, fallbackStats, ok := c.matchesFallbackRecentLocked(key, record, requestAt, now); ok {
@@ -745,8 +975,8 @@ func (c *usageFallbackCoordinator) Supersede(keys []string) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return
 	}
 	for _, key := range keys {
@@ -755,11 +985,10 @@ func (c *usageFallbackCoordinator) Supersede(keys []string) {
 		}
 		if pending := c.popPendingLocked(key, UsageRecord{}); pending != nil {
 			pending.cancelled = true
-			if pending.timer != nil {
-				pending.timer.Stop()
-			}
 		}
 	}
+	c.mu.Unlock()
+	c.signalScheduler()
 }
 
 func (c *usageFallbackCoordinator) Flush() {
@@ -768,21 +997,25 @@ func (c *usageFallbackCoordinator) Flush() {
 	}
 	var records []*pendingUsageFallback
 	c.mu.Lock()
-	c.closed = true
+	if !c.closed {
+		c.closed = true
+		close(c.stop)
+	}
 	for key, pending := range c.pending {
 		for _, item := range pending {
 			if item == nil || item.cancelled {
 				continue
 			}
 			item.cancelled = true
-			if item.timer != nil {
-				item.timer.Stop()
-			}
+			c.removePendingHeapLocked(item)
 			records = append(records, item)
 		}
 		delete(c.pending, key)
 	}
 	c.mu.Unlock()
+	if c.done != nil {
+		<-c.done
+	}
 	for _, pending := range records {
 		if pending == nil {
 			continue
@@ -831,17 +1064,14 @@ func (c *usageFallbackCoordinator) commit(pending *pendingUsageFallback) {
 
 func (c *usageFallbackCoordinator) popPendingLocked(key string, record UsageRecord) *pendingUsageFallback {
 	items := c.pending[key]
-	for i, item := range items {
+	for _, item := range items {
 		if item == nil || item.cancelled {
 			continue
 		}
 		if !usageFallbackRecordsCompatible(item.record, record) {
 			continue
 		}
-		c.pending[key] = append(items[:i], items[i+1:]...)
-		if len(c.pending[key]) == 0 {
-			delete(c.pending, key)
-		}
+		c.removePendingLocked(item)
 		return item
 	}
 	if len(items) == 0 {
@@ -854,6 +1084,7 @@ func (c *usageFallbackCoordinator) removePendingLocked(pending *pendingUsageFall
 	if pending == nil {
 		return
 	}
+	c.removePendingHeapLocked(pending)
 	items := c.pending[pending.key]
 	for i, item := range items {
 		if item == pending {
@@ -864,6 +1095,17 @@ func (c *usageFallbackCoordinator) removePendingLocked(pending *pendingUsageFall
 			return
 		}
 	}
+}
+
+func (c *usageFallbackCoordinator) removePendingHeapLocked(pending *pendingUsageFallback) {
+	if c == nil || pending == nil || pending.heapIndex < 0 || pending.heapIndex >= len(c.deadlines) {
+		return
+	}
+	if c.deadlines[pending.heapIndex] != pending {
+		pending.heapIndex = -1
+		return
+	}
+	heap.Remove(&c.deadlines, pending.heapIndex)
 }
 
 func (c *usageFallbackCoordinator) consumeNativeRecentLocked(key string, record UsageRecord, requestAt time.Time, now time.Time) (UsageRecord, *RequestStatistics, bool) {
@@ -892,7 +1134,7 @@ func (c *usageFallbackCoordinator) matchesFallbackRecentLocked(key string, recor
 			continue
 		}
 		if usageFallbackRecordsCompatible(item.record, record) &&
-			usageFallbackNativeRequestTimeCompatible(requestAt, item.requestAt) {
+			usageFallbackLateNativeRequestTimeCompatible(requestAt, item) {
 			c.fallbackRecent[key] = append(items[:i], items[i+1:]...)
 			if len(c.fallbackRecent[key]) == 0 {
 				delete(c.fallbackRecent, key)
@@ -910,6 +1152,20 @@ func usageFallbackNativeRequestTimeCompatible(nativeAt, fallbackAt time.Time) bo
 	// Native RequestedAt can represent the start of a long request, while the
 	// fallback timestamp is captured when the response callback is delivered.
 	return !nativeAt.After(fallbackAt.Add(time.Second))
+}
+
+func usageFallbackLateNativeRequestTimeCompatible(nativeAt time.Time, fallback usageFallbackOccurrence) bool {
+	if usageFallbackNativeRequestTimeCompatible(nativeAt, fallback.requestAt) {
+		return true
+	}
+	if nativeAt.IsZero() || fallback.observedAt.IsZero() {
+		return true
+	}
+	// A fallback is timestamped when the response interceptor callback runs,
+	// but it is committed after the fallback delay. Native usage can therefore
+	// carry the handoff/completion time, which is later than the fallback's
+	// RequestedAt even though both callbacks belong to the same request.
+	return !nativeAt.After(fallback.observedAt.Add(usageFallbackNativeRecentWindow))
 }
 
 func usageFallbackClientAPIKey(record UsageRecord) string {
@@ -969,6 +1225,8 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 		for _, item := range items {
 			if item != nil && !item.cancelled {
 				kept = append(kept, item)
+			} else if item != nil {
+				c.removePendingHeapLocked(item)
 			}
 		}
 		if len(kept) == 0 {

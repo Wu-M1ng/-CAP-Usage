@@ -84,13 +84,24 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
+	methodName := C.GoString(method)
 
 	var requestBody []byte
 	if request != nil && requestLen > 0 {
+		// Stream callbacks can carry the complete HistoryChunks payload on every
+		// chunk. Inspect the host-owned buffer while it is valid and return before
+		// C.GoBytes copies that history into the Go heap when the current chunk has
+		// no usage settlement data.
+		requestView := unsafe.Slice((*byte)(unsafe.Pointer(request)), int(requestLen))
+		if !pluginCallNeedsRequestCopy(methodName, requestView) {
+			raw, _ := okEnvelopeJSON("{}")
+			writeResponse(response, raw)
+			return 0
+		}
 		requestBody = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
 
-	raw, errHandle := handleMethod(C.GoString(method), requestBody)
+	raw, errHandle := handleMethod(methodName, requestBody)
 	if errHandle != nil {
 		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
 		return 1

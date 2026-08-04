@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"math"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -195,6 +197,355 @@ func TestSQLiteHistoricalOpenAIResponsesEventsInferEndpoint(t *testing.T) {
 	detailResult := stats.QueryAPIDetail("openai-responses", "24h", 10, 10)
 	if len(detailResult.RecentEvents) != 1 || detailResult.RecentEvents[0].Endpoint != "/v1/responses" {
 		t.Fatalf("historical api detail = %#v, want /v1/responses", detailResult.RecentEvents)
+	}
+}
+
+func TestEventStoreBatchInsertPreservesExactDeduplication(t *testing.T) {
+	store, err := openEventStore(filepath.Join(t.TempDir(), "usage-statistics.db"), false)
+	if err != nil {
+		t.Fatalf("open event store: %v", err)
+	}
+	defer store.close()
+
+	base := time.Now().Add(-time.Minute).UTC()
+	makeRequest := func(model string, at time.Time) eventInsertRequest {
+		detail := RequestDetail{
+			Model:     model,
+			Timestamp: at,
+			Source:    "test",
+			Provider:  "openai",
+			Tokens:    TokenStats{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+		}
+		return eventInsertRequest{
+			Row:         eventRowFromDetail("openai", model, detail),
+			Fingerprint: eventFingerprint("openai", model, detail),
+			Exact:       true,
+		}
+	}
+	requests := []eventInsertRequest{
+		makeRequest("gpt-4", base),
+		makeRequest("gpt-4o", base.Add(time.Second)),
+		makeRequest("gpt-4", base),
+	}
+
+	db, err := store.database()
+	if err != nil {
+		t.Fatalf("get event store database: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin event batch transaction: %v", err)
+	}
+	results, err := store.insertEventsTx(context.Background(), tx, requests)
+	if err != nil {
+		t.Fatalf("insert event batch: %v", err)
+	}
+	if len(results) != 3 || !results[0].Added || !results[1].Added || results[2].Added {
+		t.Fatalf("batch results = %#v, want added/added/skipped", results)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit event batch: %v", err)
+	}
+	if count, err := store.count(context.Background()); err != nil || count != 2 {
+		t.Fatalf("event count = %d/%v, want 2", count, err)
+	}
+}
+
+func TestSQLiteAggregateWatermarkReplaysCommittedEventTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage-statistics.db")
+	first := NewRequestStatistics()
+	first.Configure(runtimeConfig{
+		StorageEnabled:     true,
+		StoragePath:        path,
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+	})
+	first.Record(UsageRecord{
+		Provider:    "openai",
+		Model:       "gpt-4",
+		RequestedAt: time.Now().Add(-2 * time.Minute),
+		Detail:      UsageDetail{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+	})
+
+	first.mu.RLock()
+	store := first.eventStore
+	first.mu.RUnlock()
+	if store == nil {
+		t.Fatal("first event store is nil")
+	}
+	secondDetail := RequestDetail{
+		Model:     "gpt-4",
+		Timestamp: time.Now().Add(-time.Minute),
+		Source:    "openai",
+		Provider:  "openai",
+		Tokens:    TokenStats{InputTokens: 20, OutputTokens: 4, TotalTokens: 24},
+	}
+	if _, _, err := store.insertEvent(context.Background(), eventRowFromDetail("openai", "gpt-4", secondDetail), "", false, time.Time{}); err != nil {
+		first.Close()
+		t.Fatalf("insert uncheckpointed event: %v", err)
+	}
+	first.Close()
+
+	second := NewRequestStatistics()
+	second.Configure(runtimeConfig{
+		StorageEnabled:     true,
+		StoragePath:        path,
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+	})
+	defer second.Close()
+	snapshot := second.Snapshot()
+	if snapshot.TotalRequests != 2 || snapshot.TotalTokens != 36 {
+		t.Fatalf("replayed aggregate = requests %d tokens %d, want 2/36", snapshot.TotalRequests, snapshot.TotalTokens)
+	}
+	second.mu.RLock()
+	store = second.eventStore
+	second.mu.RUnlock()
+	state, found, err := store.loadAggregateState(context.Background())
+	if err != nil || !found {
+		t.Fatalf("load recovered aggregate state = found %v err %v", found, err)
+	}
+	if state.LastEventID < 2 {
+		t.Fatalf("recovered aggregate watermark = %d, want at least 2", state.LastEventID)
+	}
+}
+
+func TestSQLitePruneScopeKeepsOtherModelsIntact(t *testing.T) {
+	store, err := openEventStore(filepath.Join(t.TempDir(), "usage-statistics.db"), false)
+	if err != nil {
+		t.Fatalf("open event store: %v", err)
+	}
+	defer store.close()
+
+	base := time.Now().Add(-time.Hour).UTC()
+	insert := func(api, model string, offset int) {
+		detail := RequestDetail{
+			Model:     model,
+			Timestamp: base.Add(time.Duration(offset) * time.Minute),
+			Source:    api,
+			Provider:  api,
+			Tokens:    TokenStats{TotalTokens: int64(offset + 1)},
+		}
+		if _, _, err := store.insertEvent(context.Background(), eventRowFromDetail(api, model, detail), "", false, time.Time{}); err != nil {
+			t.Fatalf("insert %s/%s event: %v", api, model, err)
+		}
+	}
+	insert("api-a", "model-a", 1)
+	insert("api-a", "model-a", 2)
+	insert("api-a", "model-a", 3)
+	insert("api-b", "model-b", 1)
+	insert("api-b", "model-b", 2)
+
+	db, err := store.database()
+	if err != nil {
+		t.Fatalf("get event store database: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin scoped prune: %v", err)
+	}
+	result, err := store.pruneTxScoped(context.Background(), tx, 2, 0, time.Now(), eventPruneScope{API: "api-a", Model: "model-a"})
+	if err != nil {
+		t.Fatalf("scoped prune: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Fatalf("scoped prune removed = %d, want 1", result.Removed)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit scoped prune: %v", err)
+	}
+	a, err := store.queryEvents(context.Background(), EventsQuery{API: "api-a", Model: "model-a", Limit: 10}, time.Now())
+	if err != nil {
+		t.Fatalf("query pruned model: %v", err)
+	}
+	b, err := store.queryEvents(context.Background(), EventsQuery{API: "api-b", Model: "model-b", Limit: 10}, time.Now())
+	if err != nil {
+		t.Fatalf("query untouched model: %v", err)
+	}
+	if a.Total != 2 || b.Total != 2 {
+		t.Fatalf("scoped prune totals = %d/%d, want 2/2", a.Total, b.Total)
+	}
+}
+
+func TestSQLiteRangeSummaryMatchesMemoryAggregation(t *testing.T) {
+	now := time.Date(2026, 8, 4, 16, 0, 0, 0, time.FixedZone("fixture", 8*60*60))
+	config := func(storageEnabled bool, path string) runtimeConfig {
+		return runtimeConfig{
+			MaxDetailsPerModel: 100,
+			RetentionDays:      30,
+			DedupWindowMinutes: 0,
+			StorageEnabled:     storageEnabled,
+			StoragePath:        path,
+		}
+	}
+	memoryStats := NewRequestStatistics()
+	sqlStats := NewRequestStatistics()
+	memoryStats.Configure(config(false, ""))
+	sqlStats.Configure(config(true, filepath.Join(t.TempDir(), "usage-statistics.db")))
+	defer memoryStats.Close()
+	defer sqlStats.Close()
+
+	records := []UsageRecord{
+		{
+			Provider:    "openai",
+			Source:      "openai-responses",
+			Model:       "gpt-4.1",
+			APIKey:      "sk-range-alpha",
+			RequestedAt: now.Add(-1 * time.Hour),
+			Endpoint:    "",
+			Detail: UsageDetail{
+				InputTokens: 100, OutputTokens: 20, CachedTokens: 30, TotalTokens: 120,
+			},
+		},
+		{
+			Provider:    "anthropic",
+			Source:      "anthropic-prod",
+			Model:       "claude-3-7-sonnet",
+			APIKey:      "sk-range-beta",
+			RequestedAt: now.Add(-3 * time.Hour),
+			Endpoint:    "/v1/messages",
+			Failed:      true,
+			Failure:     UsageFailure{StatusCode: 429, Body: "rate limited"},
+			Latency:     250 * time.Millisecond,
+			Detail: UsageDetail{
+				InputTokens: 200, OutputTokens: 40, CacheReadTokens: 50,
+				CacheCreationTokens: 10,
+			},
+		},
+		{
+			Provider:    "deepseek",
+			Source:      "deepseek-prod",
+			Model:       "deepseek-chat",
+			APIKey:      "sk-range-beta",
+			RequestedAt: now.Add(-20 * time.Minute),
+			Endpoint:    "/v1/chat/completions",
+			Detail:      UsageDetail{InputTokens: 80, OutputTokens: 15, TotalTokens: 95},
+		},
+		{
+			Provider:    "gemini",
+			Source:      "vertex-prod",
+			Model:       "gemini-2.5-pro",
+			APIKey:      "sk-range-alpha",
+			RequestedAt: now.Add(-48 * time.Hour),
+			Endpoint:    "/v1/generateContent",
+			Detail:      UsageDetail{InputTokens: 60, OutputTokens: 12, TotalTokens: 72},
+		},
+		{
+			Provider:    "openai",
+			Source:      "openai-prod",
+			Model:       "gpt-4o-mini",
+			APIKey:      "sk-range-alpha",
+			RequestedAt: now.Add(-8 * 24 * time.Hour),
+			Endpoint:    "/v1/chat/completions",
+			Detail:      UsageDetail{InputTokens: 40, OutputTokens: 8, TotalTokens: 48},
+		},
+	}
+	for _, record := range records {
+		memoryStats.Record(record)
+		sqlStats.Record(record)
+	}
+
+	canonical := func(summary DashboardSummary) string {
+		summary.GeneratedAt = ""
+		summary.Meta = DashboardMeta{}
+		sort.SliceStable(summary.ModelStats, func(i, j int) bool {
+			if summary.ModelStats[i].TotalRequests != summary.ModelStats[j].TotalRequests {
+				return summary.ModelStats[i].TotalRequests > summary.ModelStats[j].TotalRequests
+			}
+			return summary.ModelStats[i].Model < summary.ModelStats[j].Model
+		})
+		sort.SliceStable(summary.SourceStats, func(i, j int) bool {
+			if summary.SourceStats[i].TotalRequests != summary.SourceStats[j].TotalRequests {
+				return summary.SourceStats[i].TotalRequests > summary.SourceStats[j].TotalRequests
+			}
+			return summary.SourceStats[i].Source < summary.SourceStats[j].Source
+		})
+		sort.SliceStable(summary.EndpointStats, func(i, j int) bool {
+			return summary.EndpointStats[i].Endpoint < summary.EndpointStats[j].Endpoint
+		})
+		sort.SliceStable(summary.CredentialStats, func(i, j int) bool {
+			return summary.CredentialStats[i].AuthIndex < summary.CredentialStats[j].AuthIndex
+		})
+		sort.SliceStable(summary.ClientAPIStats, func(i, j int) bool {
+			return summary.ClientAPIStats[i].APIKeyHash < summary.ClientAPIStats[j].APIKeyHash
+		})
+		for i := range summary.ClientAPIStats {
+			sort.SliceStable(summary.ClientAPIStats[i].Models, func(left, right int) bool {
+				return summary.ClientAPIStats[i].Models[left].Model < summary.ClientAPIStats[i].Models[right].Model
+			})
+		}
+		for i := range summary.EndpointStats {
+			sort.SliceStable(summary.EndpointStats[i].Models, func(left, right int) bool {
+				return summary.EndpointStats[i].Models[left].Model < summary.EndpointStats[i].Models[right].Model
+			})
+		}
+		encoded, err := json.Marshal(summary)
+		if err != nil {
+			t.Fatalf("marshal canonical summary: %v", err)
+		}
+		return string(encoded)
+	}
+
+	for _, rangeKey := range []string{"all", "24h", "7d"} {
+		memorySummary := memoryStats.SummaryWithoutDetailsForRangeAt(rangeKey, now)
+		sqlSummary := sqlStats.SummaryWithoutDetailsForRangeAt(rangeKey, now)
+		if got, want := canonical(sqlSummary), canonical(memorySummary); got != want {
+			t.Fatalf("SQLite range %s differs from memory path (usage=%v health=%v source=%v endpoint=%v credential=%v client=%v model=%v)",
+				rangeKey,
+				reflect.DeepEqual(sqlSummary.Usage, memorySummary.Usage),
+				reflect.DeepEqual(sqlSummary.HealthGrid, memorySummary.HealthGrid),
+				reflect.DeepEqual(sqlSummary.SourceStats, memorySummary.SourceStats),
+				reflect.DeepEqual(sqlSummary.EndpointStats, memorySummary.EndpointStats),
+				reflect.DeepEqual(sqlSummary.CredentialStats, memorySummary.CredentialStats),
+				reflect.DeepEqual(sqlSummary.ClientAPIStats, memorySummary.ClientAPIStats),
+				reflect.DeepEqual(sqlSummary.ModelStats, memorySummary.ModelStats),
+			)
+		}
+	}
+
+	zeroKey := "sk-range-zero"
+	zeroDetail := RequestDetail{
+		Model:      "zero-timestamp-model",
+		Provider:   "openai",
+		Source:     "openai-prod",
+		APIKey:     maskAPIKey(zeroKey),
+		APIKeyHash: hashAPIKey(zeroKey),
+		Timestamp:  time.Time{},
+		Endpoint:   "/v1/chat/completions",
+		Tokens:     TokenStats{InputTokens: 7, OutputTokens: 3, TotalTokens: 10},
+	}
+	zeroAPI := usageGroupKey(UsageRecord{Provider: "openai", Source: "openai-prod"})
+	memoryStats.mu.Lock()
+	memoryStats.recordDetailLocked(zeroAPI, zeroDetail.Model, zeroDetail, requestDedupKey{}, now, false, true)
+	memoryStats.mu.Unlock()
+	sqlStats.mu.RLock()
+	store := sqlStats.eventStore
+	sqlStats.mu.RUnlock()
+	if store == nil {
+		t.Fatal("SQLite event store is nil")
+	}
+	if _, _, err := store.insertEvent(context.Background(), eventRowFromDetail(zeroAPI, zeroDetail.Model, zeroDetail), "", false, time.Time{}); err != nil {
+		t.Fatalf("insert zero timestamp event: %v", err)
+	}
+	selector := clientAPISelectorForStat(ClientAPIStat{APIKey: zeroDetail.APIKey, APIKeyHash: zeroDetail.APIKeyHash})
+	memorySummary := memoryStats.SummaryWithoutDetailsForRangeAndClientAPIAt("all", selector, now)
+	sqlSummary := sqlStats.SummaryWithoutDetailsForRangeAndClientAPIAt("all", selector, now)
+	if got, want := canonical(sqlSummary), canonical(memorySummary); got != want {
+		t.Fatalf("SQLite zero-timestamp client range differs from memory path (usage=%v health=%v source=%v endpoint=%v credential=%v client=%v model=%v)",
+			reflect.DeepEqual(sqlSummary.Usage, memorySummary.Usage),
+			reflect.DeepEqual(sqlSummary.HealthGrid, memorySummary.HealthGrid),
+			reflect.DeepEqual(sqlSummary.SourceStats, memorySummary.SourceStats),
+			reflect.DeepEqual(sqlSummary.EndpointStats, memorySummary.EndpointStats),
+			reflect.DeepEqual(sqlSummary.CredentialStats, memorySummary.CredentialStats),
+			reflect.DeepEqual(sqlSummary.ClientAPIStats, memorySummary.ClientAPIStats),
+			reflect.DeepEqual(sqlSummary.ModelStats, memorySummary.ModelStats),
+		)
+	}
+	finite := sqlStats.SummaryWithoutDetailsForRangeAndClientAPIAt("24h", selector, now)
+	if finite.Usage.TotalRequests != 0 || len(finite.Usage.APIs) != 0 {
+		t.Fatalf("zero-timestamp event leaked into finite client range: %#v", finite.Usage)
 	}
 }
 
@@ -1438,6 +1789,52 @@ func TestRuntimeStatusReportsDashboardMetrics(t *testing.T) {
 	}
 	if status.LastSummaryDurationMs <= 0 || status.LastEventsQueryDurationMs <= 0 || status.LastAPIDetailDurationMs <= 0 {
 		t.Fatalf("query durations should be reported: %#v", status)
+	}
+}
+
+func TestDashboardSummaryAndStorageStatusDoNotWaitForSQLiteCount(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Configure(runtimeConfig{
+		StorageEnabled:     true,
+		StoragePath:        filepath.Join(t.TempDir(), "usage-statistics.db"),
+		MaxDetailsPerModel: 100,
+		RetentionDays:      0,
+		DedupWindowMinutes: 0,
+	})
+	defer stats.Close()
+
+	stats.mu.RLock()
+	store := stats.eventStore
+	stats.mu.RUnlock()
+	if store == nil {
+		t.Fatal("event store is nil")
+	}
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatalf("begin SQLite blocker: %v", err)
+	}
+	defer tx.Rollback()
+
+	completed := make(chan struct{})
+	go func() {
+		_ = stats.SummaryWithoutDetails()
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("dashboard summary waited for SQLite count while holding statistics lock")
+	}
+
+	statusCompleted := make(chan struct{})
+	go func() {
+		_ = stats.StorageStatus()
+		close(statusCompleted)
+	}()
+	select {
+	case <-statusCompleted:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("storage status waited for SQLite count while holding statistics lock")
 	}
 }
 
