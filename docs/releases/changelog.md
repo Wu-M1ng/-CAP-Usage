@@ -4,6 +4,15 @@
 
 `v1.0.0` 到 `v1.2.18` 为规范化发布流程建立前的 legacy 历史版本，不在本文件中回填；对应说明见 [v1-history.md](v1-history.md)。
 
+## v2.5.11 - 2026-08-05
+
+### 流式结算与存储可靠性修复
+- 修复从 `HistoryChunks` 解析流式 usage 的路径，增加 native、Body、History 来源和解析失败指标。
+- 使用响应/请求 ID加强 stream 去重与 supersede，避免并发请求 token 指纹相同时互相合并或取消。
+- 修复 storage 切换和 SQLite 写失败时 spool 回退的锁竞争，统一 spool 行大小限制并完善永久丢失计数。
+- 增加 SQLite 查询、导出、重载、retention 和后台 writer 的边界保护，降低内存峰值与请求记录丢失风险。
+- 增加响应 ID隔离、spool 锁竞争等回归测试。
+
 ## v2.5.10 - 2026-08-04
 
 ### 存储可靠性与请求链路优化

@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/csv"
@@ -61,6 +62,7 @@ type dashboardExportJob struct {
 	ContentType string
 	ETag        string
 	FilePath    string
+	cancel      context.CancelFunc
 }
 
 type dashboardExportFileResult struct {
@@ -286,6 +288,7 @@ func (m *dashboardExportJobManager) create(params EventsQuery, opts dashboardEve
 
 	id := newDashboardExportJobID()
 	filePath := filepath.Join(os.TempDir(), "cpa-usage-events-export-"+id)
+	ctx, cancel := context.WithCancel(context.Background())
 	job := &dashboardExportJob{
 		ID:         id,
 		Status:     dashboardExportJobQueued,
@@ -295,16 +298,17 @@ func (m *dashboardExportJobManager) create(params EventsQuery, opts dashboardEve
 		SnapshotAt: now,
 		ExpiresAt:  now.Add(dashboardExportJobTTL),
 		FilePath:   filePath,
+		cancel:     cancel,
 	}
 	m.jobs[id] = job
 	snapshot := *job
 	m.mu.Unlock()
 
-	go m.run(id, params, opts, filePath, now)
+	go m.run(ctx, id, params, opts, filePath, now)
 	return snapshot, http.StatusAccepted, ""
 }
 
-func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dashboardEventsExportOptions, filePath string, snapshotAt time.Time) {
+func (m *dashboardExportJobManager) run(ctx context.Context, id string, params EventsQuery, opts dashboardEventsExportOptions, filePath string, snapshotAt time.Time) {
 	startedAt := time.Now()
 	if snapshotAt.IsZero() {
 		snapshotAt = startedAt
@@ -314,19 +318,22 @@ func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dash
 		job.StartedAt = startedAt
 	})
 
-	if m.isClosed() {
+	if m.isClosed() || ctx.Err() != nil {
 		_ = os.Remove(filePath + ".tmp")
 		_ = os.Remove(filePath)
 		return
 	}
 	tmpPath := filePath + ".tmp"
-	encoded, err := encodeDashboardEventsExportFile(params, opts, tmpPath, snapshotAt)
+	encoded, err := encodeDashboardEventsExportFile(ctx, params, opts, tmpPath, snapshotAt)
 	if err != nil {
 		_ = os.Remove(tmpPath)
+		if ctx.Err() != nil || m.isClosed() {
+			return
+		}
 		m.fail(id, err)
 		return
 	}
-	if m.isClosed() {
+	if m.isClosed() || ctx.Err() != nil {
 		_ = os.Remove(tmpPath)
 		_ = os.Remove(filePath)
 		return
@@ -335,11 +342,17 @@ func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dash
 	sum, err := fileSHA256(tmpPath)
 	if err != nil {
 		_ = os.Remove(tmpPath)
+		if ctx.Err() != nil || m.isClosed() {
+			return
+		}
 		m.fail(id, err)
 		return
 	}
 	if err := os.Rename(tmpPath, filePath); err != nil {
 		_ = os.Remove(tmpPath)
+		if ctx.Err() != nil || m.isClosed() {
+			return
+		}
 		m.fail(id, err)
 		return
 	}
@@ -359,7 +372,10 @@ func (m *dashboardExportJobManager) run(id string, params EventsQuery, opts dash
 	})
 }
 
-func encodeDashboardEventsExportFile(params EventsQuery, opts dashboardEventsExportOptions, filePath string, snapshotAt time.Time) (dashboardExportFileResult, error) {
+func encodeDashboardEventsExportFile(ctx context.Context, params EventsQuery, opts dashboardEventsExportOptions, filePath string, snapshotAt time.Time) (dashboardExportFileResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return dashboardExportFileResult{}, err
@@ -373,7 +389,7 @@ func encodeDashboardEventsExportFile(params EventsQuery, opts dashboardEventsExp
 	}
 	rawCounter := &countingWriter{w: rawWriter}
 
-	result, encodeErr := encodeDashboardEventsExportPaged(rawCounter, params, opts, snapshotAt)
+	result, encodeErr := encodeDashboardEventsExportPaged(ctx, rawCounter, params, opts, snapshotAt)
 	if gzipWriter != nil {
 		if closeErr := gzipWriter.Close(); encodeErr == nil {
 			encodeErr = closeErr
@@ -390,9 +406,15 @@ func encodeDashboardEventsExportFile(params EventsQuery, opts dashboardEventsExp
 	return result, nil
 }
 
-func encodeDashboardEventsExportPaged(writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time) (dashboardExportFileResult, error) {
+func encodeDashboardEventsExportPaged(ctx context.Context, writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time) (dashboardExportFileResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	contentType := dashboardExportContentType(opts.Format)
-	firstPage := stats.QueryExportEventsPage(params, 0, dashboardExportJobPageSize, opts.Limit, snapshotAt)
+	firstPage := stats.QueryExportEventsCursorPageContext(ctx, params, dashboardExportJobPageSize, opts.Limit, snapshotAt, eventQueryCursor{})
+	if firstPage.queryError != nil {
+		return dashboardExportFileResult{}, firstPage.queryError
+	}
 	localizeEventsResultForResource(&firstPage)
 	result := dashboardExportFileResult{
 		Total:       firstPage.Total,
@@ -402,26 +424,26 @@ func encodeDashboardEventsExportPaged(writer io.Writer, params EventsQuery, opts
 	}
 	switch opts.Format {
 	case dashboardExportJSONL:
-		exported, err := encodeDashboardEventsJSONLPaged(writer, params, opts, snapshotAt, firstPage)
+		exported, err := encodeDashboardEventsJSONLPaged(ctx, writer, params, opts, snapshotAt, firstPage)
 		result.Exported = exported
 		return result, err
 	case dashboardExportCSV:
-		exported, err := encodeDashboardEventsCSVPaged(writer, params, opts, snapshotAt, firstPage)
+		exported, err := encodeDashboardEventsCSVPaged(ctx, writer, params, opts, snapshotAt, firstPage)
 		result.Exported = exported
 		return result, err
 	default:
-		exported, err := encodeDashboardEventsJSONPaged(writer, params, opts, snapshotAt, firstPage)
+		exported, err := encodeDashboardEventsJSONPaged(ctx, writer, params, opts, snapshotAt, firstPage)
 		result.Exported = exported
 		return result, err
 	}
 }
 
-func encodeDashboardEventsJSONPaged(writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult) (int, error) {
+func encodeDashboardEventsJSONPaged(ctx context.Context, writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult) (int, error) {
 	if _, err := io.WriteString(writer, `{"events":[`); err != nil {
 		return 0, err
 	}
 	first := true
-	exported, err := encodeDashboardEventsPaged(params, opts, snapshotAt, firstPage, func(event RequestDetail) error {
+	exported, err := encodeDashboardEventsPaged(ctx, params, opts, snapshotAt, firstPage, func(event RequestDetail) error {
 		if !first {
 			if _, err := io.WriteString(writer, ","); err != nil {
 				return err
@@ -456,19 +478,19 @@ func encodeDashboardEventsJSONPaged(writer io.Writer, params EventsQuery, opts d
 	return exported, nil
 }
 
-func encodeDashboardEventsJSONLPaged(writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult) (int, error) {
+func encodeDashboardEventsJSONLPaged(ctx context.Context, writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult) (int, error) {
 	encoder := json.NewEncoder(writer)
-	return encodeDashboardEventsPaged(params, opts, snapshotAt, firstPage, func(event RequestDetail) error {
+	return encodeDashboardEventsPaged(ctx, params, opts, snapshotAt, firstPage, func(event RequestDetail) error {
 		return encoder.Encode(event)
 	})
 }
 
-func encodeDashboardEventsCSVPaged(writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult) (int, error) {
+func encodeDashboardEventsCSVPaged(ctx context.Context, writer io.Writer, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult) (int, error) {
 	csvWriter := csv.NewWriter(writer)
 	if err := csvWriter.Write(dashboardEventsCSVHeader()); err != nil {
 		return 0, err
 	}
-	exported, err := encodeDashboardEventsPaged(params, opts, snapshotAt, firstPage, func(event RequestDetail) error {
+	exported, err := encodeDashboardEventsPaged(ctx, params, opts, snapshotAt, firstPage, func(event RequestDetail) error {
 		return csvWriter.Write(dashboardEventCSVRecord(event))
 	})
 	csvWriter.Flush()
@@ -478,10 +500,19 @@ func encodeDashboardEventsCSVPaged(writer io.Writer, params EventsQuery, opts da
 	return exported, err
 }
 
-func encodeDashboardEventsPaged(params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult, consume func(RequestDetail) error) (int, error) {
+func encodeDashboardEventsPaged(ctx context.Context, params EventsQuery, opts dashboardEventsExportOptions, snapshotAt time.Time, firstPage EventsResult, consume func(RequestDetail) error) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	page := firstPage
 	exported := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return exported, err
+		}
+		if page.queryError != nil {
+			return exported, page.queryError
+		}
 		for _, event := range page.Events {
 			event = sanitizeRequestDetailAPIKeyForOutput(event)
 			if err := consume(event); err != nil {
@@ -489,10 +520,13 @@ func encodeDashboardEventsPaged(params EventsQuery, opts dashboardEventsExportOp
 			}
 			exported++
 		}
-		if exported >= page.Limit || len(page.Events) == 0 {
+		if (opts.Limit > 0 && exported >= opts.Limit) || len(page.Events) == 0 || !page.nextCursor.Valid {
 			return exported, nil
 		}
-		page = stats.QueryExportEventsPage(params, exported, dashboardExportJobPageSize, opts.Limit, snapshotAt)
+		page = stats.QueryExportEventsCursorPageContext(ctx, params, dashboardExportJobPageSize, opts.Limit, snapshotAt, page.nextCursor)
+		if page.queryError != nil {
+			return exported, page.queryError
+		}
 		localizeEventsResultForResource(&page)
 	}
 }
@@ -502,6 +536,9 @@ func (m *dashboardExportJobManager) close() {
 	defer m.mu.Unlock()
 	m.closed = true
 	for id, job := range m.jobs {
+		if job.cancel != nil {
+			job.cancel()
+		}
 		delete(m.jobs, id)
 		_ = os.Remove(job.FilePath + ".tmp")
 		_ = os.Remove(job.FilePath)
@@ -559,6 +596,9 @@ func (m *dashboardExportJobManager) delete(id string) bool {
 		return false
 	}
 	delete(m.jobs, id)
+	if job.cancel != nil {
+		job.cancel()
+	}
 	_ = os.Remove(job.FilePath + ".tmp")
 	_ = os.Remove(job.FilePath)
 	return true
@@ -604,6 +644,9 @@ func (m *dashboardExportJobManager) cleanupLocked(now time.Time) {
 			continue
 		}
 		delete(m.jobs, id)
+		if job.cancel != nil {
+			job.cancel()
+		}
 		_ = os.Remove(job.FilePath + ".tmp")
 		_ = os.Remove(job.FilePath)
 	}

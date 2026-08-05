@@ -335,6 +335,172 @@ func TestHandleUsageDoesNotWaitForSQLiteWrite(t *testing.T) {
 	})
 }
 
+func TestSpoolEventWriteBypassesHeldStorageControlLock(t *testing.T) {
+	statistics := NewRequestStatistics()
+	store := &eventStore{path: filepath.Join(t.TempDir(), "usage-statistics.db")}
+	task := eventWriteTask{
+		store:     store,
+		apiName:   "openai",
+		modelName: "gpt-test",
+		detail: RequestDetail{
+			Model:     "gpt-test",
+			Timestamp: time.Now(),
+			Tokens: TokenStats{
+				InputTokens:  10,
+				OutputTokens: 2,
+				TotalTokens:  12,
+			},
+		},
+	}
+
+	statistics.storageControlMu.Lock()
+	statistics.eventWriterStopping = true
+	done := make(chan struct{})
+	go func() {
+		statistics.spoolEventWrite(task)
+		close(done)
+	}()
+	select {
+	case <-done:
+		statistics.storageControlMu.Unlock()
+	case <-time.After(time.Second):
+		statistics.storageControlMu.Unlock()
+		t.Fatal("spoolEventWrite() waited for storageControlMu")
+	}
+
+	if _, err := os.Stat(eventSpoolPath(store.path)); err != nil {
+		t.Fatalf("spool file stat = %v, want a durable spool record", err)
+	}
+}
+
+func TestCallbackEventSpoolOverflowDoesNotWriteSynchronously(t *testing.T) {
+	statistics := NewRequestStatistics()
+	store := &eventStore{path: filepath.Join(t.TempDir(), "usage-statistics.db")}
+	queue := make(chan eventWriteTask, 1)
+	queue <- eventWriteTask{}
+	statistics.eventSpoolQueue = queue
+	statistics.eventSpoolStop = make(chan struct{})
+	task := eventWriteTask{
+		store:     store,
+		apiName:   "openai",
+		modelName: "gpt-test",
+		detail: RequestDetail{
+			Model:     "gpt-test",
+			Timestamp: time.Now(),
+			Tokens:    TokenStats{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		},
+	}
+	if statistics.tryEnqueueEventSpool(task) {
+		t.Fatal("full callback spool queue unexpectedly accepted task")
+	}
+	if _, err := os.Stat(eventSpoolPath(store.path)); !os.IsNotExist(err) {
+		t.Fatalf("callback overflow touched spool file, stat error = %v", err)
+	}
+	statistics.mu.RLock()
+	pending := statistics.eventWriterSpoolPending
+	statistics.mu.RUnlock()
+	if pending != 0 {
+		t.Fatalf("spool pending = %d after rejected callback handoff, want 0", pending)
+	}
+}
+
+func TestEventSpoolReplayStreamsFailedRecordsToTemporaryFile(t *testing.T) {
+	dir := t.TempDir()
+	replayPath := filepath.Join(dir, "usage-statistics.db.spool.jsonl.replay")
+	if err := os.WriteFile(replayPath, []byte("placeholder\n"), 0o600); err != nil {
+		t.Fatalf("write replay fixture: %v", err)
+	}
+
+	statistics := NewRequestStatistics()
+	defer statistics.Close()
+	replay := &eventSpoolReplay{
+		path:      replayPath,
+		store:     &eventStore{path: filepath.Join(dir, "usage-statistics.db")},
+		remaining: 2,
+	}
+	failedTask := eventWriteTask{
+		apiName:   "openai",
+		modelName: "gpt-test",
+		detail: RequestDetail{
+			Model:     "gpt-test",
+			Timestamp: time.Now().UTC(),
+			Tokens:    TokenStats{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+		},
+	}
+	successTask := failedTask
+	successTask.modelName = "gpt-success"
+	replay.complete(statistics, failedTask, false)
+	replay.complete(statistics, successTask, true)
+	replay.markReadComplete(statistics)
+
+	contents, err := os.ReadFile(replayPath)
+	if err != nil {
+		t.Fatalf("read rewritten replay: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(contents)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("rewritten replay lines = %d, want one failed record", len(lines))
+	}
+	var persisted persistedDetail
+	if err := json.Unmarshal([]byte(lines[0]), &persisted); err != nil {
+		t.Fatalf("decode rewritten replay: %v", err)
+	}
+	if persisted.Model != "gpt-test" {
+		t.Fatalf("rewritten replay model = %q, want failed task", persisted.Model)
+	}
+	failedTemps, err := filepath.Glob(filepath.Join(dir, "usage-statistics.db.spool.jsonl.replay.failed-*"))
+	if err != nil {
+		t.Fatalf("find replay temporary files: %v", err)
+	}
+	if len(failedTemps) != 0 {
+		t.Fatalf("replay temporary files remain: %v", failedTemps)
+	}
+}
+
+func TestMergeEventSpoolFilesKeepsActiveOnAppendError(t *testing.T) {
+	dir := t.TempDir()
+	activePath := filepath.Join(dir, "active.spool")
+	replayPath := filepath.Join(dir, "replay.spool")
+	if err := os.WriteFile(activePath, []byte("active\n"), 0o600); err != nil {
+		t.Fatalf("write active spool: %v", err)
+	}
+	if err := os.Mkdir(replayPath, 0o700); err != nil {
+		t.Fatalf("create invalid replay target: %v", err)
+	}
+	if err := mergeEventSpoolFiles(activePath, replayPath); err == nil {
+		t.Fatal("mergeEventSpoolFiles() unexpectedly succeeded with directory target")
+	}
+	if _, err := os.Stat(activePath); err != nil {
+		t.Fatalf("active spool stat after append error = %v, want original retained", err)
+	}
+}
+
+func TestCompactEventSpoolFileRemovesInvalidLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage-statistics.db.spool.jsonl.replay")
+	valid := mustMarshal(persistedDetail{API: "openai", Model: "gpt-test"})
+	contents := append(append(valid, '\n'), []byte(`{"api":"broken","model":`)...)
+	contents = append(contents, '\n')
+	contents = append(contents, valid...)
+	contents = append(contents, '\n')
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatalf("write invalid spool fixture: %v", err)
+	}
+	count, err := compactEventSpoolFile(path)
+	if err != nil {
+		t.Fatalf("compactEventSpoolFile() error = %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("compacted valid records = %d, want 2", count)
+	}
+	validRecords, invalidRecords, err := scanEventSpoolFile(path, nil)
+	if err != nil {
+		t.Fatalf("scan compacted spool: %v", err)
+	}
+	if validRecords != 2 || invalidRecords != 0 {
+		t.Fatalf("compacted spool records = valid %d invalid %d, want 2/0", validRecords, invalidRecords)
+	}
+}
+
 func TestRegisterAdvertisesResponseInterceptor(t *testing.T) {
 	raw, err := handleRegister(nil)
 	if err != nil {
@@ -678,7 +844,7 @@ func TestResponseStreamChunkDoesNotDoubleCountNativeOpenAICompatibleUsage(t *tes
 	}
 }
 
-func TestResponseStreamChunkIgnoresUsageOnlyInHistory(t *testing.T) {
+func TestResponseStreamChunkUsesUsageOnlyInHistory(t *testing.T) {
 	previousStats := stats
 	previousFallbacks := usageFallbacks
 	previousDelay := usageFallbackRecordDelay
@@ -722,8 +888,114 @@ func TestResponseStreamChunkIgnoresUsageOnlyInHistory(t *testing.T) {
 		t.Fatalf("handleResponseStreamChunk() error = %v", err)
 	}
 	time.Sleep(3 * usageFallbackRecordDelay)
-	if got := stats.Snapshot().TotalRequests; got != 0 {
-		t.Fatalf("total requests = %d, want no duplicate record from history-only usage", got)
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 13 || snapshot.InputTokens != 10 || snapshot.OutputTokens != 3 {
+		t.Fatalf("snapshot = %#v, want one history-only usage record", snapshot)
+	}
+}
+
+func TestResponseStreamChunkUsesLatestHistoryUsageAndPrefersBody(t *testing.T) {
+	base := ResponseInterceptRequest{
+		SourceFormat:    "openai",
+		Model:           "gpt-5.5",
+		RequestedModel:  "gpt-5.5",
+		OriginalRequest: []byte(`{"model":"gpt-5.5","stream":true}`),
+	}
+	latestHistory := ResponseStreamChunkRequest{
+		ResponseInterceptRequest: base,
+		HistoryChunks: [][]byte{
+			[]byte(`data: {"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`),
+			[]byte(`data: {"usage":{"prompt_tokens":20,"completion_tokens":7,"total_tokens":27}}`),
+		},
+	}
+	latestHistory.Body = []byte(`data: {"choices":[{"delta":{"content":"done"}}]}`)
+	record, ok := usageRecordFromResponseStreamChunk(latestHistory)
+	if !ok {
+		t.Fatal("history-only usage was not decoded")
+	}
+	if record.Detail.TotalTokens != 27 || record.Detail.InputTokens != 20 || record.Detail.OutputTokens != 7 {
+		t.Fatalf("history record detail = %#v, want latest history usage", record.Detail)
+	}
+
+	bodyPreferred := latestHistory
+	bodyPreferred.Body = []byte(`data: {"usage":{"prompt_tokens":30,"completion_tokens":9,"total_tokens":39}}`)
+	record, ok = usageRecordFromResponseStreamChunk(bodyPreferred)
+	if !ok {
+		t.Fatal("body usage was not decoded")
+	}
+	if record.Detail.TotalTokens != 39 || record.Detail.InputTokens != 30 || record.Detail.OutputTokens != 9 {
+		t.Fatalf("body-preferred detail = %#v, want current body usage", record.Detail)
+	}
+}
+
+func TestUsageFallbackResponseIDSupersedesOnlyTheSamePendingStream(t *testing.T) {
+	statistics := NewRequestStatistics()
+	coordinator := newUsageFallbackCoordinator()
+	base := UsageRecord{
+		Provider:    "openai-compatible-test",
+		Model:       "gpt-5.5",
+		Alias:       "gpt-5.5",
+		RequestedAt: time.Now(),
+		Detail: UsageDetail{
+			InputTokens:  10,
+			OutputTokens: 2,
+			TotalTokens:  12,
+		},
+	}
+	first := base
+	first.correlationID = "response-a"
+	latest := base
+	latest.Detail.OutputTokens = 9
+	latest.Detail.TotalTokens = 19
+	latest.correlationID = "response-a"
+	other := base
+	other.Detail.OutputTokens = 4
+	other.Detail.TotalTokens = 14
+	other.correlationID = "response-b"
+
+	coordinator.ScheduleForStats(statistics, first)
+	coordinator.ScheduleForStats(statistics, latest)
+	coordinator.ScheduleForStats(statistics, other)
+	coordinator.Flush()
+
+	snapshot := statistics.Snapshot()
+	if snapshot.TotalRequests != 2 {
+		t.Fatalf("total requests = %d, want one record per response id", snapshot.TotalRequests)
+	}
+	if snapshot.TotalTokens != 33 || snapshot.OutputTokens != 13 {
+		t.Fatalf("tokens = total %d output %d, want latest same-stream snapshot plus other stream", snapshot.TotalTokens, snapshot.OutputTokens)
+	}
+}
+
+func TestUsageFallbackResponseIDPreventsCrossMatching(t *testing.T) {
+	statistics := NewRequestStatistics()
+	coordinator := newUsageFallbackCoordinator()
+
+	fallback := UsageRecord{
+		Provider:      "openai-compatible-test",
+		Model:         "gpt-5.5",
+		Alias:         "gpt-5.5",
+		RequestedAt:   time.Now(),
+		correlationID: "response-a",
+		Detail: UsageDetail{
+			InputTokens:  20,
+			OutputTokens: 5,
+			TotalTokens:  25,
+		},
+	}
+	native := fallback
+	native.correlationID = "response-b"
+
+	coordinator.ScheduleForStats(statistics, fallback)
+	matched, shouldRecord := coordinator.HandleNativeForStats(statistics, native)
+	if !shouldRecord {
+		t.Fatal("native usage with a different response ID was treated as a fallback duplicate")
+	}
+	statistics.Record(matched)
+	coordinator.Flush()
+
+	if got := statistics.Snapshot().TotalRequests; got != 2 {
+		t.Fatalf("total requests = %d, want one record per response ID", got)
 	}
 }
 
@@ -1953,6 +2225,47 @@ func TestUsageFallbackCoordinatorBoundsRecentState(t *testing.T) {
 	coordinator.mu.Unlock()
 	if nativeRecentCount > maxUsageFallbackRecent {
 		t.Fatalf("native recent count = %d, want <= %d", nativeRecentCount, maxUsageFallbackRecent)
+	}
+}
+
+func TestFallbackCoordinatorBoundsRetainedBytes(t *testing.T) {
+	previousDelay := usageFallbackRecordDelay
+	usageFallbackRecordDelay = time.Hour
+	t.Cleanup(func() { usageFallbackRecordDelay = previousDelay })
+	statistics := NewRequestStatistics()
+	coordinator := newUsageFallbackCoordinator()
+	defer coordinator.Flush()
+
+	for i := 0; i < 32; i++ {
+		coordinator.ScheduleForStats(statistics, UsageRecord{
+			Provider: "openai-compatible",
+			Model:    fmt.Sprintf("bytes-%d", i),
+			ResponseHeaders: map[string][]string{
+				"x-observe": {string(make([]byte, 300<<10))},
+			},
+			Detail: UsageDetail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		})
+	}
+	coordinator.mu.Lock()
+	retained := coordinator.retainedBytesLocked()
+	coordinator.mu.Unlock()
+	if retained > maxUsageFallbackRetainedBytes {
+		t.Fatalf("fallback retained bytes = %d, want <= %d", retained, maxUsageFallbackRetainedBytes)
+	}
+}
+
+func TestFallbackCoordinatorDropsUnselectedHeadersBeforeRetention(t *testing.T) {
+	statistics := NewRequestStatistics()
+	statistics.mu.Lock()
+	statistics.logResponseHeaders = parseHeaderWhitelist("x-observe")
+	statistics.mu.Unlock()
+	record := UsageRecord{ResponseHeaders: map[string][]string{
+		"Authorization": {"Bearer should-not-be-retained"},
+		"X-Observe":     {"kept"},
+	}}
+	sanitizeUsageRecordForStats(statistics, &record)
+	if len(record.ResponseHeaders) != 1 || len(record.ResponseHeaders["X-Observe"]) != 1 {
+		t.Fatalf("sanitized fallback headers = %#v, want only X-Observe", record.ResponseHeaders)
 	}
 }
 
@@ -4122,6 +4435,12 @@ func TestEventStoreAppliesPragmasToReaderConnections(t *testing.T) {
 		t.Fatalf("open event store: %v", err)
 	}
 	defer store.close()
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("writer max open connections = %d, want 1", got)
+	}
+	if got := store.readDB.Stats().MaxOpenConnections; got != 2 {
+		t.Fatalf("reader max open connections = %d, want 2", got)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -4138,6 +4457,15 @@ func TestEventStoreAppliesPragmasToReaderConnections(t *testing.T) {
 		if busyTimeout != 5000 {
 			conn.Close()
 			t.Fatalf("reader busy timeout = %d, want 5000", busyTimeout)
+		}
+		var cacheSize int
+		if err := conn.QueryRowContext(ctx, "PRAGMA cache_size").Scan(&cacheSize); err != nil {
+			conn.Close()
+			t.Fatalf("read cache size %d: %v", i, err)
+		}
+		if cacheSize != -2048 {
+			conn.Close()
+			t.Fatalf("reader cache size = %d, want -2048", cacheSize)
 		}
 		_ = conn.Close()
 	}

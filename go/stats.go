@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,30 +76,57 @@ type RequestStatistics struct {
 	credentialStats   map[string]*CredentialStat
 	clientAPIStats    map[string]*clientAPIStatAccumulator
 
-	logResponseHeaders            headerWhitelist
-	eventStore                    *eventStore
-	eventStorePath                string
-	eventStoreLastError           string
-	eventStoreLastWrite           time.Time
-	eventStoreEventCount          int64
-	eventStoreSizeBytes           int64
-	eventStoreLastEventID         int64
-	eventStoreLastRetentionCutoff int64
-	droppedEvents                 int64
-	eventStoreTemporary           bool
-	eventWriterQueue              chan eventWriteTask
-	eventWriterStop               chan struct{}
-	eventWriterDone               chan struct{}
-	eventWriterStopping           bool
-	eventWriterRunning            bool
-	eventWriterQueueCapacity      int
-	eventWriterQueueLength        int
-	eventWriterSnapshotRecords    int64
-	eventWriterLastSnapshot       time.Time
-	eventWriterSpoolPending       int64
-	eventSpoolMu                  sync.Mutex
-	eventSpoolRetryMu             sync.Mutex
-	eventSpoolRetryRunning        bool
+	logResponseHeaders             headerWhitelist
+	eventStore                     *eventStore
+	eventStorePath                 string
+	eventStoreLastError            string
+	eventStoreLastWrite            time.Time
+	eventStoreEventCount           int64
+	eventStoreSizeBytes            int64
+	eventStoreLastEventID          int64
+	eventStoreLastRetentionCutoff  int64
+	droppedEvents                  int64
+	storageWriteFailures           int64
+	storageSpooledEvents           int64
+	callbackQueueDrops             int64
+	spoolLimitDrops                int64
+	permanentDrops                 int64
+	usageNativeRecords             int64
+	usageBodyRecords               int64
+	usageHistoryRecords            int64
+	usageParseFailures             int64
+	usageStreamCorrelations        int64
+	streamCallbacks                atomic.Int64
+	streamFastPathCallbacks        atomic.Int64
+	streamSettlementCallbacks      atomic.Int64
+	streamTerminalHistoryScans     atomic.Int64
+	streamInputBytes               atomic.Int64
+	streamBodyBytesDecoded         atomic.Int64
+	streamHistoryBytesDecoded      atomic.Int64
+	streamCallbackDurationSumNanos atomic.Int64
+	streamCallbackDurationCount    atomic.Int64
+	streamCallbackDurationMaxNanos atomic.Int64
+	eventStoreTemporary            bool
+	eventWriterQueue               chan eventWriteTask
+	eventWriterStop                chan struct{}
+	eventWriterDone                chan struct{}
+	eventWriterStopping            bool
+	eventWriterRunning             bool
+	eventWriterQueueCapacity       int
+	eventWriterQueueLength         int
+	eventWriterQueueBytes          atomic.Int64
+	eventWriterSnapshotRecords     int64
+	eventWriterLastSnapshot        time.Time
+	eventWriterSpoolPending        int64
+	eventSpoolQueue                chan eventWriteTask
+	eventSpoolStop                 chan struct{}
+	eventSpoolDone                 chan struct{}
+	eventSpoolQueueLength          int
+	eventSpoolQueueCapacity        int
+	eventSpoolQueueBytes           atomic.Int64
+	eventSpoolMu                   sync.Mutex
+	eventSpoolRetryMu              sync.Mutex
+	eventSpoolRetryRunning         bool
 
 	// Historical file-storage state is kept for source compatibility with the
 	// old implementation. Runtime records and configuration use eventStore;
@@ -690,8 +718,8 @@ var hourKeys = [24]string{
 const (
 	dashboardHealthSlotCount       = 5 * 24 * 4
 	dashboardHealthStep            = 15 * time.Minute
-	dashboardEventCacheMax         = 16
-	dashboardSummaryRangeCacheMax  = 16
+	dashboardEventCacheMax         = 8
+	dashboardSummaryRangeCacheMax  = 4
 	dashboardSummaryRangeCacheStep = time.Minute
 	storageWriteSampleMax          = 256
 )
@@ -836,12 +864,12 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 	var candidateLastEventID int64
 	var candidateMaxEventID int64
 	var candidateMaxEventIDErr error
-	var candidateTail []RequestDetail
-	var candidateTailErr error
-	var candidateDerivedDetails []RequestDetail
+	var candidateTailCount int64
+	var candidateDerivedState *RequestStatistics
 	var candidateDerivedErr error
 	var candidateNeedsDerivedRebuild bool
 	var candidateRebuildAll bool
+	var candidateNeedsAggregateTail bool
 	var candidateNeedsAggregateSave bool
 	var candidateRecoveredSnapshot StatisticsSnapshot
 	var candidateSizeBytes int64
@@ -885,6 +913,11 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 			if enabled && storageError == nil {
 				candidate, storageError = openEventStore(path, false)
 				if storageError == nil && currentStore != nil && !sameEventStorePath(currentStore.path, candidate.path) {
+					// The destination may be initialized from the old database. Hold
+					// the control lock while draining accepted writer tasks so no
+					// late event can be omitted from the copy or written to the
+					// database that is about to be closed.
+					s.storageWriteWG.Wait()
 					var empty bool
 					empty, storageError = candidate.isEmpty(context.Background())
 					if storageError == nil && empty {
@@ -941,16 +974,12 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 							candidateMaxEventID, candidateMaxEventIDErr = candidate.maxEventID(context.Background())
 							if candidateMaxEventIDErr != nil {
 								storageError = candidateMaxEventIDErr
-							} else if candidateLastEventID > 0 && candidateLastEventID < candidateMaxEventID {
-								candidateTail, candidateTailErr = candidate.eventsAfterID(context.Background(), candidateLastEventID)
-								if candidateTailErr != nil {
-									storageError = candidateTailErr
-								}
 							}
 							if storageError == nil {
 								switch {
 								case candidateHasSnapshot && candidateLastEventID > 0 && (len(candidateSnapshot.APIs) > 0 || candidateEventCount == 0):
 									candidateNeedsDerivedRebuild = true
+									candidateNeedsAggregateTail = candidateLastEventID < candidateMaxEventID
 								case candidateHasSnapshot && candidateLastEventID == 0 && candidateEventCount > 0:
 									candidateNeedsDerivedRebuild = true
 									candidateRebuildAll = true
@@ -961,9 +990,16 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 									candidateNeedsDerivedRebuild = true
 								}
 								if candidateNeedsDerivedRebuild {
-									candidateDerivedDetails, candidateDerivedErr = loadSQLiteEventDetails(candidate, time.Now())
+									candidateDerivedState, candidateDerivedErr = loadSQLiteDerivedState(s, candidate, candidateSnapshot, candidateRebuildAll, time.Now())
 									if candidateDerivedErr != nil {
 										storageError = candidateDerivedErr
+									}
+								}
+								if storageError == nil && candidateNeedsAggregateTail {
+									tailCount, tailErr := applySQLiteAggregateTail(candidateDerivedState, candidate, candidateLastEventID)
+									candidateTailCount = tailCount
+									if tailErr != nil {
+										storageError = tailErr
 									}
 								}
 							}
@@ -1072,15 +1108,11 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					} else if candidateHasSnapshot && candidateLastEventID > 0 && (len(candidateSnapshot.APIs) > 0 || eventCount == 0) {
 						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
 						if candidateNeedsDerivedRebuild {
-							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+							s.replaceSQLiteDerivedStateLocked(candidateDerivedState)
 						}
 						{
-							for _, detail := range candidateTail {
-								apiName := strings.TrimSpace(detail.UpstreamAPI)
-								s.recordAggregateTailLocked(apiName, normalizeModelName(detail.Model), detail)
-							}
 							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, s.eventStoreLastEventID)
-							candidateNeedsAggregateSave = len(candidateTail) > 0
+							candidateNeedsAggregateSave = candidateTailCount > 0
 							if candidateNeedsAggregateSave {
 								candidateRecoveredSnapshot = s.aggregateSnapshotLocked()
 							}
@@ -1088,7 +1120,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					} else if candidateHasSnapshot && candidateLastEventID == 0 && eventCount > 0 {
 						s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
 						if candidateNeedsDerivedRebuild {
-							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+							s.replaceSQLiteDerivedStateLocked(candidateDerivedState)
 						}
 						{
 							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, 0)
@@ -1098,7 +1130,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					} else if eventCount > 0 {
 						s.restoreStorageSnapshotLocked(StatisticsSnapshot{}, restoreNow)
 						if candidateNeedsDerivedRebuild {
-							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+							s.replaceSQLiteDerivedStateLocked(candidateDerivedState)
 						}
 						{
 							s.eventStoreLastEventID = maxInt64(candidateMaxEventID, 0)
@@ -1108,7 +1140,7 @@ func (s *RequestStatistics) ConfigurePatch(cfg runtimeConfigPatch) {
 					} else if candidateHasSnapshot {
 						s.restoreStorageSnapshotLocked(candidateSnapshot, restoreNow)
 						if candidateNeedsDerivedRebuild {
-							s.applySQLiteDerivedAggregatesLocked(candidateDerivedDetails, restoreNow, candidateRebuildAll)
+							s.replaceSQLiteDerivedStateLocked(candidateDerivedState)
 						}
 					}
 				} else {
@@ -1332,6 +1364,7 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	if s == nil {
 		return
 	}
+	s.recordUsageIngest(record)
 
 	timestamp := record.RequestedAt
 	if timestamp.IsZero() {
@@ -1348,8 +1381,8 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 	// critical section. The writer uses the same sequencing lock before taking
 	// an aggregate snapshot, so a snapshot never includes a record whose event
 	// row has not yet been accepted by the writer.
-	s.eventRecordMu.Lock()
 	s.storageControlMu.Lock()
+	s.eventRecordMu.Lock()
 	s.mu.RLock()
 	store := s.eventStore
 	s.mu.RUnlock()
@@ -1360,7 +1393,7 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 		maxDetails := s.maxDetailsPerModel
 		retention := s.retention
 		s.mu.Unlock()
-		queued := s.enqueueEventWriteLocked(eventWriteTask{
+		task := eventWriteTask{
 			store:      store,
 			apiName:    apiName,
 			modelName:  modelName,
@@ -1368,16 +1401,23 @@ func (s *RequestStatistics) Record(record UsageRecord) {
 			enqueuedAt: time.Now(),
 			maxDetails: maxDetails,
 			retention:  retention,
-		})
-		s.storageControlMu.Unlock()
+		}
+		queued := s.enqueueEventWriteLocked(task)
 		s.eventRecordMu.Unlock()
+		s.storageControlMu.Unlock()
 		if !queued {
-			s.spoolEventWrite(eventWriteTask{store: store, apiName: apiName, modelName: modelName, detail: detail, maxDetails: maxDetails, retention: retention})
+			// The callback path must never fall back to opening, writing, or
+			// syncing the spool file. A healthy writer has enough capacity for
+			// normal traffic; only an explicit bounded overflow reaches this
+			// non-blocking handoff.
+			if !s.tryEnqueueEventSpool(task) {
+				s.recordPermanentDrop(errors.New("event writer queue overflow"))
+			}
 		}
 		return
 	}
-	s.storageControlMu.Unlock()
 	s.eventRecordMu.Unlock()
+	s.storageControlMu.Unlock()
 
 	// The in-memory path is also used when persistence is disabled. Live usage
 	// records are unique observations; the compatibility deduplication window
@@ -1399,20 +1439,20 @@ func (s *RequestStatistics) persistRecordedEvent(store *eventStore, releaseStore
 	}
 	db, err := store.database()
 	if err != nil {
-		s.recordEventStoreFailure(err, true)
+		s.recordEventStoreFailure(err, false)
 		return
 	}
 	storageCtx, cancelStorage := eventStoreContext(context.Background(), eventStoreWriteTimeout)
 	defer cancelStorage()
 	tx, err := db.BeginTx(storageCtx, nil)
 	if err != nil {
-		s.recordEventStoreFailure(fmt.Errorf("begin event record: %w", err), true)
+		s.recordEventStoreFailure(fmt.Errorf("begin event record: %w", err), false)
 		return
 	}
 	defer tx.Rollback()
 	insertedEventID, _, err := store.insertEventTx(storageCtx, tx, eventRowFromDetail(apiName, modelName, detail), "", false, time.Time{})
 	if err != nil {
-		s.recordEventStoreFailure(err, true)
+		s.recordEventStoreFailure(err, false)
 		return
 	}
 	pruneResult, err := store.pruneTxScoped(storageCtx, tx, maxDetails, retention, pruneNow, eventPruneScope{
@@ -1547,7 +1587,7 @@ func (s *RequestStatistics) EnrichRecordedUsage(record UsageRecord, enrichment U
 	}
 	changed, err := store.enrichEvent(context.Background(), eventFingerprint(apiName, modelName, base), record.RequestedAt, update)
 	if err != nil {
-		s.recordEventStoreFailure(err, true)
+		s.recordEventStoreFailure(err, false)
 		return false
 	}
 	if changed {
@@ -1566,11 +1606,12 @@ func (s *RequestStatistics) recordEventStoreFailure(err error, dropped bool) {
 	if s == nil || err == nil {
 		return
 	}
+	if dropped {
+		s.recordPermanentDrop(err)
+		return
+	}
 	s.mu.Lock()
 	s.eventStoreLastError = err.Error()
-	if dropped {
-		s.droppedEvents++
-	}
 	s.mu.Unlock()
 }
 
@@ -1578,8 +1619,92 @@ func (s *RequestStatistics) recordUsageCallbackDrop() {
 	if s == nil {
 		return
 	}
+	s.recordPermanentDrop(errors.New("usage callback exceeded the fallback capacity"))
+}
+
+func (s *RequestStatistics) recordUsageCallbackOverflow() {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
-	s.droppedEvents++
+	s.callbackQueueDrops++
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) recordStorageWriteFailure(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.eventStoreLastError = err.Error()
+	s.storageWriteFailures++
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) recordStorageSpooled() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.storageSpooledEvents++
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) recordSpoolLimitDrop(err error) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.spoolLimitDrops++
+	s.mu.Unlock()
+	s.recordPermanentDrop(err)
+}
+
+func (s *RequestStatistics) recordPermanentDrop(err error) {
+	s.recordPermanentDrops(1, err)
+}
+
+func (s *RequestStatistics) recordPermanentDrops(count int64, err error) {
+	if s == nil {
+		return
+	}
+	if count <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if err != nil {
+		s.eventStoreLastError = err.Error()
+	}
+	s.permanentDrops += count
+	s.droppedEvents += count
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) recordUsageIngest(record UsageRecord) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	switch record.usageOrigin {
+	case usageOriginInterceptBody:
+		s.usageBodyRecords++
+	case usageOriginInterceptHistory:
+		s.usageHistoryRecords++
+	default:
+		s.usageNativeRecords++
+	}
+	if strings.TrimSpace(record.correlationID) != "" {
+		s.usageStreamCorrelations++
+	}
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) recordUsageParseFailure() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.usageParseFailures++
 	s.mu.Unlock()
 }
 
@@ -1711,6 +1836,9 @@ type storageWorkerState struct {
 }
 
 func (s *RequestStatistics) startStorageWorkerLocked() {
+	// The caller holds s.mu. Do not acquire storageControlMu here: the
+	// SQLite lifecycle uses storageControlMu -> s.mu, and taking the reverse
+	// order in this legacy worker path can deadlock configuration reload.
 	if s == nil || !s.storageEnabled || strings.TrimSpace(s.storageDir) == "" {
 		return
 	}
@@ -1724,12 +1852,10 @@ func (s *RequestStatistics) startStorageWorkerLocked() {
 	done := make(chan struct{})
 	s.storageWriteQueueLength = 0
 	s.storageWorkerRunning = true
-	s.storageControlMu.Lock()
 	s.storageQueue = queue
 	s.storageStop = stop
 	s.storageDone = done
 	s.storageStopping = false
-	s.storageControlMu.Unlock()
 
 	cfg := storageWorkerConfig{
 		dir:                    s.storageDir,
@@ -2184,7 +2310,9 @@ func (s *RequestStatistics) recordDetailLocked(apiName, modelName string, detail
 	if dedup == (requestDedupKey{}) {
 		dedup = dedupKey(apiName, modelName, detail)
 	}
-	s.pruneSeenLocked(now)
+	if useDedupWindow {
+		s.pruneSeenLocked(now)
+	}
 	if useDedupWindow && s.dedupWindow > 0 {
 		if _, exists := s.seen[dedup]; exists {
 			return false
@@ -2500,29 +2628,100 @@ func (s *RequestStatistics) restoreStorageSnapshotLocked(snapshot StatisticsSnap
 	}
 }
 
-// loadSQLiteEventDetails reads the event rows needed to rebuild in-memory
-// dimensions before the statistics lock is acquired.
-func loadSQLiteEventDetails(store *eventStore, now time.Time) ([]RequestDetail, error) {
+const sqliteDerivedRebuildBatchSize = 256
+
+// applySQLiteAggregateTail replays events after an aggregate checkpoint in
+// bounded batches. The full event table is already scanned separately for
+// derived dimensions; this pass updates only the aggregate counters that the
+// checkpoint did not yet include.
+func applySQLiteAggregateTail(state *RequestStatistics, store *eventStore, afterID int64) (int64, error) {
+	if state == nil || store == nil {
+		return 0, nil
+	}
+	batch := make([]RequestDetail, 0, sqliteDerivedRebuildBatchSize)
+	var count int64
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		state.mu.Lock()
+		for _, detail := range batch {
+			apiName := strings.TrimSpace(detail.UpstreamAPI)
+			state.recordAggregateTailLocked(apiName, normalizeModelName(detail.Model), detail)
+		}
+		state.mu.Unlock()
+		batch = batch[:0]
+	}
+	err := store.forEachEventAfterID(context.Background(), afterID, func(detail RequestDetail) error {
+		batch = append(batch, detail)
+		count++
+		if len(batch) >= sqliteDerivedRebuildBatchSize {
+			flush()
+		}
+		return nil
+	})
+	if err != nil {
+		return count, err
+	}
+	flush()
+	return count, nil
+}
+
+// loadSQLiteDerivedState rebuilds the in-memory dimensions in bounded batches.
+// The temporary state lets a failed scan leave the currently active statistics
+// untouched while avoiding a slice containing every row in the database.
+func loadSQLiteDerivedState(base *RequestStatistics, store *eventStore, snapshot StatisticsSnapshot, rebuildAll bool, now time.Time) (*RequestStatistics, error) {
 	if store == nil {
 		return nil, nil
 	}
-	details := make([]RequestDetail, 0)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	derived := NewRequestStatistics()
+	if base != nil {
+		base.mu.RLock()
+		derived.maxDetailsPerModel = base.maxDetailsPerModel
+		derived.retention = base.retention
+		derived.dedupWindow = base.dedupWindow
+		derived.modelPrices = copyModelPrices(base.modelPrices)
+		derived.modelsDevPrices = copyModelPrices(base.modelsDevPrices)
+		derived.modelsDevPricesEnabled = base.modelsDevPricesEnabled
+		base.mu.RUnlock()
+	}
+	derived.mu.Lock()
+	if !rebuildAll {
+		derived.restoreStorageSnapshotLocked(snapshot, now)
+	}
+	derived.resetSQLiteDerivedAggregatesLocked(rebuildAll)
+	derived.mu.Unlock()
+
+	batch := make([]RequestDetail, 0, sqliteDerivedRebuildBatchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		derived.mu.Lock()
+		derived.applySQLiteDerivedAggregateBatchLocked(batch, now, rebuildAll)
+		derived.mu.Unlock()
+		batch = batch[:0]
+	}
 	err := store.forEachEvent(context.Background(), EventsQuery{}, now, func(detail RequestDetail) error {
-		details = append(details, detail)
+		batch = append(batch, detail)
+		if len(batch) >= sqliteDerivedRebuildBatchSize {
+			flush()
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return details, nil
+	flush()
+	return derived, nil
 }
 
-func (s *RequestStatistics) applySQLiteDerivedAggregatesLocked(details []RequestDetail, now time.Time, rebuildAll bool) {
+func (s *RequestStatistics) resetSQLiteDerivedAggregatesLocked(rebuildAll bool) {
 	if s == nil {
 		return
-	}
-	if now.IsZero() {
-		now = time.Now()
 	}
 	s.sourceStats = make(map[string]*sourceStatAccumulator)
 	s.endpointStats = make(map[string]*endpointStatAccumulator)
@@ -2536,7 +2735,15 @@ func (s *RequestStatistics) applySQLiteDerivedAggregatesLocked(details []Request
 			}
 		}
 	}
+}
 
+func (s *RequestStatistics) applySQLiteDerivedAggregateBatchLocked(details []RequestDetail, now time.Time, rebuildAll bool) {
+	if s == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
 	for _, detail := range details {
 		apiName := strings.TrimSpace(detail.UpstreamAPI)
 		if apiName == "" {
@@ -2558,6 +2765,47 @@ func (s *RequestStatistics) applySQLiteDerivedAggregatesLocked(details []Request
 			s.lastRecordedAt = detail.Timestamp
 		}
 	}
+}
+
+func (s *RequestStatistics) applySQLiteDerivedAggregatesLocked(details []RequestDetail, now time.Time, rebuildAll bool) {
+	if s == nil {
+		return
+	}
+	s.resetSQLiteDerivedAggregatesLocked(rebuildAll)
+	s.applySQLiteDerivedAggregateBatchLocked(details, now, rebuildAll)
+}
+
+func (s *RequestStatistics) replaceSQLiteDerivedStateLocked(derived *RequestStatistics) {
+	if s == nil || derived == nil {
+		return
+	}
+	s.totalRequests = derived.totalRequests
+	s.successCount = derived.successCount
+	s.failureCount = derived.failureCount
+	s.totalTokens = derived.totalTokens
+	s.inputTokens = derived.inputTokens
+	s.outputTokens = derived.outputTokens
+	s.cachedTokens = derived.cachedTokens
+	s.cacheWriteTokens = derived.cacheWriteTokens
+	s.reasoningTokens = derived.reasoningTokens
+	s.latencySum = derived.latencySum
+	s.latencyN = derived.latencyN
+	s.apis = derived.apis
+	s.requestsByDay = derived.requestsByDay
+	s.requestsByHour = derived.requestsByHour
+	s.tokensByDay = derived.tokensByDay
+	s.tokensByHour = derived.tokensByHour
+	s.costByDay = derived.costByDay
+	s.costByHour = derived.costByHour
+	s.costTokensByDay = derived.costTokensByDay
+	s.costTokensByHour = derived.costTokensByHour
+	s.lastRecordedAt = derived.lastRecordedAt
+	s.healthBuckets = derived.healthBuckets
+	s.modelSummaryStats = derived.modelSummaryStats
+	s.sourceStats = derived.sourceStats
+	s.endpointStats = derived.endpointStats
+	s.credentialStats = derived.credentialStats
+	s.clientAPIStats = derived.clientAPIStats
 }
 
 // recordAggregateTailLocked applies a post-checkpoint event to counters that
@@ -5707,6 +5955,9 @@ func (s *RequestStatistics) timeSeriesTokenCostLocked(stat TimeSeriesTokenStat) 
 func (s *RequestStatistics) priceForDetailLocked(modelName, provider string) (ModelPrice, bool) {
 	provider = strings.TrimSpace(provider)
 	modelName = strings.TrimSpace(modelName)
+	if len(s.modelPrices) == 0 && len(s.modelsDevPrices) == 0 {
+		return ModelPrice{}, false
+	}
 	if price, ok := priceForDetailFromMap(s.modelPrices, modelName, provider); ok {
 		return price, true
 	}
@@ -5714,6 +5965,9 @@ func (s *RequestStatistics) priceForDetailLocked(modelName, provider string) (Mo
 }
 
 func priceForDetailFromMap(prices map[string]ModelPrice, modelName, provider string) (ModelPrice, bool) {
+	if len(prices) == 0 {
+		return ModelPrice{}, false
+	}
 	for _, key := range modelPriceLookupKeys(modelName, provider) {
 		if price, ok := modelPriceCaseInsensitive(prices, key); ok {
 			return price, true
@@ -6141,12 +6395,14 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 	defer releaseStore()
 
 	var rangeResult *dashboardRangeQueryResult
+	var queryErr error
 	if store != nil {
-		queried, queryErr := store.queryDashboardRange(context.Background(), EventsQuery{Range: rangeKey, ClientAPI: clientAPI}, now)
+		queried, err := store.queryDashboardRange(context.Background(), EventsQuery{Range: rangeKey, ClientAPI: clientAPI}, now)
 		rangeResult = &queried
-		if queryErr != nil {
+		queryErr = err
+		if err != nil {
 			s.mu.Lock()
-			s.eventStoreLastError = queryErr.Error()
+			s.eventStoreLastError = err.Error()
 			s.mu.Unlock()
 			rangeResult = &dashboardRangeQueryResult{}
 		} else {
@@ -6161,6 +6417,11 @@ func (s *RequestStatistics) SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	summary := s.buildSummaryWithoutDetailsForRangeLocked(now, healthWindow, cutoff, rangeKey, clientAPI, rangeResult)
+	if queryErr != nil {
+		summary.queryError = queryErr
+		s.lastSummaryDuration = time.Since(startedAt)
+		return summary
+	}
 	s.summaryRangeCache[cacheKey] = cloneDashboardSummary(summary)
 	s.summaryRangeCacheWindow[cacheKey] = healthWindow
 	s.pruneSummaryRangeCacheLocked(cacheKey)
@@ -6750,6 +7011,7 @@ func (s *RequestStatistics) buildSummaryWithoutDetailsForRangeLocked(now time.Ti
 				},
 				Failed: row.FailureCount > 0,
 			}
+			detail = normalizeStoredClientAPIIdentity(detail)
 			modelName := normalizeModelName(row.Model)
 			totals := detailTotals{
 				totalTokens:      row.TotalTokens,
@@ -7085,7 +7347,9 @@ func clientAPIGroupKey(detail RequestDetail) string {
 }
 
 func hasClientAPIIdentity(detail RequestDetail) bool {
-	return !isUnknownClientAPIValue(detail.APIKey) || strings.TrimSpace(detail.APIKeyHash) != ""
+	// A hash without a usable label is not an identifiable client key. Keeping
+	// it would create a misleading standalone "unknown" selector group.
+	return !isUnknownClientAPIValue(detail.APIKey)
 }
 
 func incrementClientAPIStat(accumulators map[string]*clientAPIStatAccumulator, modelName string, detail RequestDetail, totals detailTotals) {
@@ -7286,9 +7550,9 @@ func clientAPISelectorMatchesDetail(value string, detail RequestDetail) bool {
 	case 'u':
 		return label == "" && hash == ""
 	case 'm':
-		return hashAPIKey(label) == selector.labelHash
+		return !isUnknownClientAPIValue(label) && hashAPIKey(label) == selector.labelHash
 	case 'h':
-		return hash == selector.hash || selector.labelHash != "" && hash == "" && hashAPIKey(label) == selector.labelHash
+		return !isUnknownClientAPIValue(label) && (hash == selector.hash || selector.labelHash != "" && hash == "" && hashAPIKey(label) == selector.labelHash)
 	default:
 		return false
 	}
@@ -7527,7 +7791,7 @@ func normalizeStoredClientAPIIdentity(detail RequestDetail) RequestDetail {
 	}
 	if label == "" {
 		detail.APIKey = ""
-		detail.APIKeyHash = strings.TrimSpace(detail.APIKeyHash)
+		detail.APIKeyHash = ""
 		return detail
 	}
 	if strings.Contains(label, redactedMarker) {
@@ -8046,7 +8310,7 @@ func (s *RequestStatistics) QueryEventsAt(params EventsQuery, now time.Time) Eve
 			result, err := store.queryEvents(context.Background(), params, now)
 			if err != nil {
 				s.recordEventStoreFailure(err, false)
-				return EventsResult{}
+				return EventsResult{queryError: err}
 			}
 			s.mu.Lock()
 			result.dashboardVersion = s.summaryVersion
@@ -8081,7 +8345,7 @@ func (s *RequestStatistics) QueryExportEventsAt(params EventsQuery, maxRecords i
 			result, err := store.queryEventsPage(context.Background(), params, now, maxRecords, 0)
 			if err != nil {
 				s.recordEventStoreFailure(err, false)
-				return EventsResult{}
+				return EventsResult{queryError: err}
 			}
 			result.Limit = exportResultLimit(result.Total, maxRecords)
 			result.Truncated = maxRecords > 0 && result.Total > maxRecords
@@ -8095,6 +8359,24 @@ func (s *RequestStatistics) QueryExportEventsAt(params EventsQuery, maxRecords i
 		}
 	}
 	return s.queryEventsAt(params, false, maxRecords, now)
+}
+
+func (s *RequestStatistics) CountExportEventsAt(params EventsQuery, now time.Time) (int, error) {
+	if s == nil {
+		return 0, nil
+	}
+	params = normalizeEventsQuery(params, false)
+	store, releaseStore := s.acquireEventStore()
+	if store != nil {
+		defer releaseStore()
+		total, err := store.countEvents(context.Background(), params, now)
+		if err != nil {
+			s.recordEventStoreFailure(err, false)
+			return 0, err
+		}
+		return total, nil
+	}
+	return s.queryEventsAt(params, false, 0, now).Total, nil
 }
 
 // QueryExportEventsPage returns one page of exportable events while still
@@ -8124,7 +8406,7 @@ func (s *RequestStatistics) QueryExportEventsPage(params EventsQuery, offset int
 		result, err := store.queryEventsPage(context.Background(), params, snapshotAt, pageCapacity, offset)
 		if err != nil {
 			s.recordEventStoreFailure(err, false)
-			return EventsResult{}
+			return EventsResult{Offset: offset, queryError: err}
 		}
 		result.Offset = offset
 		result.Limit = exportResultLimit(result.Total, maxRecords)
@@ -8175,6 +8457,98 @@ func (s *RequestStatistics) QueryExportEventsPage(params EventsQuery, offset int
 		GeneratedAt: snapshotAt.UTC().Format(time.RFC3339),
 
 		dashboardVersion: s.summaryVersion,
+	}
+	s.lastEventsQueryDuration = time.Since(startedAt)
+	s.lastEventsQueryTotal = total
+	return result
+}
+
+// QueryExportEventsCursorPage returns one export page using the last emitted
+// SQLite row as the cursor. Unlike OFFSET, rows deleted by retention between
+// pages cannot cause the next page to skip an event.
+func (s *RequestStatistics) QueryExportEventsCursorPage(params EventsQuery, pageLimit int, maxRecords int, snapshotAt time.Time, cursor eventQueryCursor) EventsResult {
+	return s.QueryExportEventsCursorPageContext(context.Background(), params, pageLimit, maxRecords, snapshotAt, cursor)
+}
+
+func (s *RequestStatistics) QueryExportEventsCursorPageContext(ctx context.Context, params EventsQuery, pageLimit int, maxRecords int, snapshotAt time.Time, cursor eventQueryCursor) EventsResult {
+	if s == nil {
+		return EventsResult{}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pageLimit <= 0 {
+		pageLimit = 1000
+	}
+	startedAt := time.Now()
+	params = normalizeEventsQuery(params, false)
+	if snapshotAt.IsZero() {
+		snapshotAt = startedAt
+	}
+	store, releaseStore := s.acquireEventStore()
+	if store != nil {
+		defer releaseStore()
+		params.Before = snapshotAt
+		pageCapacity := exportPageEventCapacity(pageLimit, 0, maxRecords)
+		result, err := store.queryEventsCursorPage(ctx, params, snapshotAt, pageCapacity, cursor)
+		if err != nil {
+			s.recordEventStoreFailure(err, false)
+			return EventsResult{queryError: err}
+		}
+		result.Limit = exportResultLimit(result.Total, maxRecords)
+		result.Truncated = maxRecords > 0 && result.Total > maxRecords
+		s.mu.Lock()
+		result.dashboardVersion = s.summaryVersion
+		s.lastEventsQueryDuration = time.Since(startedAt)
+		s.lastEventsQueryTotal = result.Total
+		s.eventStoreLastError = ""
+		s.mu.Unlock()
+		return result
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := dashboardRangeCutoff(params.Range, snapshotAt)
+	index := s.dashboardEventQueryIndexLocked(params)
+	events := make([]RequestDetail, 0, exportPageEventCapacity(pageLimit, 0, maxRecords))
+	total := 0
+	startOffset := 0
+	if cursor.Valid && cursor.ID == 0 {
+		startOffset = cursor.MemoryOffset
+		if startOffset < 0 {
+			startOffset = 0
+		}
+	}
+	for _, dm := range index {
+		if err := ctx.Err(); err != nil {
+			return EventsResult{queryError: err}
+		}
+		d := dm.requestDetail()
+		if !snapshotAt.IsZero() && !d.Timestamp.IsZero() && d.Timestamp.After(snapshotAt) {
+			continue
+		}
+		if dashboardEventPastCutoff(d, cutoff) {
+			break
+		}
+		if !dashboardEventMatches(d, params, cutoff) {
+			continue
+		}
+		if total >= startOffset && (maxRecords <= 0 || total < maxRecords) && len(events) < pageLimit {
+			events = append(events, d)
+		}
+		total++
+	}
+	result := EventsResult{
+		Events:           events,
+		Total:            total,
+		Limit:            exportResultLimit(total, maxRecords),
+		Offset:           0,
+		Truncated:        maxRecords > 0 && total > maxRecords,
+		GeneratedAt:      snapshotAt.UTC().Format(time.RFC3339),
+		dashboardVersion: s.summaryVersion,
+	}
+	if len(events) > 0 {
+		result.nextCursor = eventQueryCursor{MemoryOffset: startOffset + len(events), Valid: true}
 	}
 	s.lastEventsQueryDuration = time.Since(startedAt)
 	s.lastEventsQueryTotal = total
@@ -8408,7 +8782,7 @@ func (s *RequestStatistics) QueryAPIDetailPageAt(api, rangeKey, clientAPI string
 	result, err := store.queryAPIDetail(context.Background(), api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now)
 	if err != nil {
 		s.recordEventStoreFailure(err, false)
-		return APIDetailResponse{API: api, RecentLimit: recentLimit, RecentOffset: recentOffset, GeneratedAt: now.UTC().Format(time.RFC3339)}
+		return APIDetailResponse{API: api, RecentLimit: recentLimit, RecentOffset: recentOffset, GeneratedAt: now.UTC().Format(time.RFC3339), queryError: err}
 	}
 	s.mu.Lock()
 	result.dashboardVersion = s.summaryVersion
@@ -8823,15 +9197,24 @@ func (s *RequestStatistics) StorageStatus() StorageStatus {
 
 func (s *RequestStatistics) storageStatusLocked() StorageStatus {
 	status := StorageStatus{
-		Backend:            "sqlite",
-		Enabled:            s.storageEnabled,
-		Path:               s.storagePath,
-		LastError:          s.eventStoreLastError,
-		DroppedEvents:      s.droppedEvents,
-		WriteQueueLength:   s.eventWriterQueueLength,
-		WriteQueueCapacity: s.eventWriterQueueCapacity,
-		WriterRunning:      s.eventWriterRunning,
-		SpoolPending:       s.eventWriterSpoolPending,
+		Backend:                "sqlite",
+		Enabled:                s.storageEnabled,
+		Path:                   s.storagePath,
+		LastError:              s.eventStoreLastError,
+		DroppedEvents:          s.droppedEvents,
+		WriteQueueLength:       s.eventWriterQueueLength,
+		WriteQueueCapacity:     s.eventWriterQueueCapacity,
+		WriteQueueBytes:        s.eventWriterQueueBytes.Load(),
+		WriteQueueByteCapacity: eventWriterQueueMaxBytes,
+		WriterRunning:          s.eventWriterRunning,
+		SpoolPending:           s.eventWriterSpoolPending,
+		SpoolQueueBytes:        s.eventSpoolQueueBytes.Load(),
+		SpoolQueueByteCapacity: eventSpoolQueueMaxBytes,
+		WriteFailures:          s.storageWriteFailures,
+		SpooledEvents:          s.storageSpooledEvents,
+		CallbackQueueDrops:     s.callbackQueueDrops,
+		SpoolLimitDrops:        s.spoolLimitDrops,
+		PermanentDrops:         s.permanentDrops,
 	}
 	if s.eventStore != nil {
 		status.DatabasePath = s.eventStore.path
@@ -9007,6 +9390,14 @@ func (s *RequestStatistics) RuntimeStatus() RuntimeStatus {
 		LastEventsExportRawBytes:   s.lastEventsExportRawBytes,
 		LastEventsExportBodyBytes:  s.lastEventsExportBodyBytes,
 		ConditionalRequests:        conditionalRequestStatusMap(s.conditionalRequests),
+		UsageIngest: UsageIngestStatus{
+			NativeRecords:      s.usageNativeRecords,
+			BodyRecords:        s.usageBodyRecords,
+			HistoryRecords:     s.usageHistoryRecords,
+			ParseFailures:      s.usageParseFailures,
+			StreamCorrelations: s.usageStreamCorrelations,
+		},
+		Stream: s.streamRuntimeMetrics(),
 	}
 	if !s.startedAt.IsZero() {
 		status.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
@@ -9022,6 +9413,76 @@ func (s *RequestStatistics) RuntimeStatus() RuntimeStatus {
 		}
 	}
 	return status
+}
+
+type streamCallbackObservation struct {
+	inputBytes          int
+	bodyBytesDecoded    int
+	historyBytesDecoded int
+	fastPath            bool
+	settlement          bool
+	terminalHistoryScan bool
+	duration            time.Duration
+}
+
+func (s *RequestStatistics) RecordStreamCallbackObservation(o streamCallbackObservation) {
+	if s == nil {
+		return
+	}
+	s.streamCallbacks.Add(1)
+	if o.fastPath {
+		s.streamFastPathCallbacks.Add(1)
+	}
+	if o.settlement {
+		s.streamSettlementCallbacks.Add(1)
+	}
+	if o.terminalHistoryScan {
+		s.streamTerminalHistoryScans.Add(1)
+	}
+	if o.inputBytes > 0 {
+		s.streamInputBytes.Add(int64(o.inputBytes))
+	}
+	if o.bodyBytesDecoded > 0 {
+		s.streamBodyBytesDecoded.Add(int64(o.bodyBytesDecoded))
+	}
+	if o.historyBytesDecoded > 0 {
+		s.streamHistoryBytesDecoded.Add(int64(o.historyBytesDecoded))
+	}
+	if o.duration <= 0 {
+		return
+	}
+	nanos := o.duration.Nanoseconds()
+	s.streamCallbackDurationSumNanos.Add(nanos)
+	s.streamCallbackDurationCount.Add(1)
+	for {
+		previous := s.streamCallbackDurationMaxNanos.Load()
+		if nanos <= previous || s.streamCallbackDurationMaxNanos.CompareAndSwap(previous, nanos) {
+			break
+		}
+	}
+}
+
+func (s *RequestStatistics) streamRuntimeMetrics() StreamRuntimeMetrics {
+	if s == nil {
+		return StreamRuntimeMetrics{}
+	}
+	count := s.streamCallbackDurationCount.Load()
+	sum := s.streamCallbackDurationSumNanos.Load()
+	avg := float64(0)
+	if count > 0 {
+		avg = float64(sum) / float64(count) / float64(time.Millisecond)
+	}
+	return StreamRuntimeMetrics{
+		Callbacks:             s.streamCallbacks.Load(),
+		FastPathCallbacks:     s.streamFastPathCallbacks.Load(),
+		SettlementCallbacks:   s.streamSettlementCallbacks.Load(),
+		TerminalHistoryScans:  s.streamTerminalHistoryScans.Load(),
+		InputBytes:            s.streamInputBytes.Load(),
+		BodyBytesDecoded:      s.streamBodyBytesDecoded.Load(),
+		HistoryBytesDecoded:   s.streamHistoryBytesDecoded.Load(),
+		CallbackDurationMsAvg: avg,
+		CallbackDurationMsMax: float64(s.streamCallbackDurationMaxNanos.Load()) / float64(time.Millisecond),
+	}
 }
 
 func conditionalRequestStatusMap(counters map[string]conditionalRequestCounter) map[string]ConditionalRequestStatus {

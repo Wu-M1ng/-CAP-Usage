@@ -120,7 +120,19 @@ type UsageRecord struct {
 	Failure         UsageFailure        `json:"failure"`
 	Detail          UsageDetail         `json:"detail"`
 	ResponseHeaders map[string][]string `json:"response_headers"`
+	// correlationID is an optional upstream response/request identity used only
+	// while reconciling streaming callbacks. It is deliberately not persisted.
+	correlationID string
+	usageOrigin   usageRecordOrigin
 }
+
+type usageRecordOrigin uint8
+
+const (
+	usageOriginNative usageRecordOrigin = iota
+	usageOriginInterceptBody
+	usageOriginInterceptHistory
+)
 
 func (r *UsageRecord) UnmarshalJSON(data []byte) error {
 	var current struct {
@@ -148,6 +160,10 @@ func (r *UsageRecord) UnmarshalJSON(data []byte) error {
 		Failure         UsageFailure        `json:"failure"`
 		Detail          UsageDetail         `json:"detail"`
 		ResponseHeaders map[string][]string `json:"response_headers"`
+		ResponseID      string              `json:"response_id"`
+		ResponseIDCamel string              `json:"responseId"`
+		RequestID       string              `json:"request_id"`
+		RequestIDCamel  string              `json:"requestId"`
 	}
 	if err := json.Unmarshal(data, &current); err != nil {
 		return err
@@ -178,6 +194,10 @@ func (r *UsageRecord) UnmarshalJSON(data []byte) error {
 		Failure         UsageFailure        `json:"Failure"`
 		Detail          UsageDetail         `json:"Detail"`
 		ResponseHeaders map[string][]string `json:"ResponseHeaders"`
+		ResponseID      string              `json:"ResponseID"`
+		ResponseIDCamel string              `json:"ResponseId"`
+		RequestID       string              `json:"RequestID"`
+		RequestIDCamel  string              `json:"RequestId"`
 	}
 	if err := json.Unmarshal(data, &legacy); err != nil {
 		return err
@@ -214,6 +234,16 @@ func (r *UsageRecord) UnmarshalJSON(data []byte) error {
 		Failure:         current.Failure,
 		Detail:          current.Detail,
 		ResponseHeaders: current.ResponseHeaders,
+		correlationID: firstNonEmpty(
+			current.ResponseID,
+			current.ResponseIDCamel,
+			current.RequestID,
+			current.RequestIDCamel,
+			legacy.ResponseID,
+			legacy.ResponseIDCamel,
+			legacy.RequestID,
+			legacy.RequestIDCamel,
+		),
 	}
 	if record.Failure == (UsageFailure{}) {
 		record.Failure = legacy.Failure
@@ -553,20 +583,29 @@ type ExportConfig struct {
 }
 
 type StorageStatus struct {
-	Backend            string `json:"backend"`
-	Enabled            bool   `json:"enabled"`
-	Path               string `json:"path,omitempty"`
-	DatabasePath       string `json:"database_path,omitempty"`
-	EventCount         int64  `json:"event_count"`
-	DatabaseSizeBytes  int64  `json:"database_size_bytes"`
-	LastError          string `json:"last_error,omitempty"`
-	LastWriteAt        string `json:"last_write_at,omitempty"`
-	DroppedEvents      int64  `json:"dropped_events,omitempty"`
-	WriteQueueLength   int    `json:"write_queue_length,omitempty"`
-	WriteQueueCapacity int    `json:"write_queue_capacity,omitempty"`
-	WriterRunning      bool   `json:"writer_running,omitempty"`
-	SpoolPath          string `json:"spool_path,omitempty"`
-	SpoolPending       int64  `json:"spool_pending,omitempty"`
+	Backend                string `json:"backend"`
+	Enabled                bool   `json:"enabled"`
+	Path                   string `json:"path,omitempty"`
+	DatabasePath           string `json:"database_path,omitempty"`
+	EventCount             int64  `json:"event_count"`
+	DatabaseSizeBytes      int64  `json:"database_size_bytes"`
+	LastError              string `json:"last_error,omitempty"`
+	LastWriteAt            string `json:"last_write_at,omitempty"`
+	DroppedEvents          int64  `json:"dropped_events,omitempty"`
+	WriteQueueLength       int    `json:"write_queue_length,omitempty"`
+	WriteQueueCapacity     int    `json:"write_queue_capacity,omitempty"`
+	WriteQueueBytes        int64  `json:"write_queue_bytes,omitempty"`
+	WriteQueueByteCapacity int64  `json:"write_queue_byte_capacity,omitempty"`
+	WriterRunning          bool   `json:"writer_running,omitempty"`
+	SpoolPath              string `json:"spool_path,omitempty"`
+	SpoolPending           int64  `json:"spool_pending,omitempty"`
+	SpoolQueueBytes        int64  `json:"spool_queue_bytes,omitempty"`
+	SpoolQueueByteCapacity int64  `json:"spool_queue_byte_capacity,omitempty"`
+	WriteFailures          int64  `json:"write_failures,omitempty"`
+	SpooledEvents          int64  `json:"spooled_events,omitempty"`
+	CallbackQueueDrops     int64  `json:"callback_queue_drops,omitempty"`
+	SpoolLimitDrops        int64  `json:"spool_limit_drops,omitempty"`
+	PermanentDrops         int64  `json:"permanent_drops,omitempty"`
 }
 
 type ModelPrice struct {
@@ -656,6 +695,28 @@ type RuntimeStatus struct {
 	LastEventsExportBodyBytes  int                                 `json:"last_events_export_body_bytes,omitempty"`
 	ConditionalRequests        map[string]ConditionalRequestStatus `json:"conditional_requests,omitempty"`
 	LastImport                 *ImportSummary                      `json:"last_import,omitempty"`
+	UsageIngest                UsageIngestStatus                   `json:"usage_ingest"`
+	Stream                     StreamRuntimeMetrics                `json:"stream"`
+}
+
+type StreamRuntimeMetrics struct {
+	Callbacks             int64   `json:"callbacks"`
+	FastPathCallbacks     int64   `json:"fast_path_callbacks"`
+	SettlementCallbacks   int64   `json:"settlement_callbacks"`
+	TerminalHistoryScans  int64   `json:"terminal_history_scans"`
+	InputBytes            int64   `json:"input_bytes"`
+	BodyBytesDecoded      int64   `json:"body_bytes_decoded"`
+	HistoryBytesDecoded   int64   `json:"history_bytes_decoded"`
+	CallbackDurationMsAvg float64 `json:"callback_duration_ms_avg"`
+	CallbackDurationMsMax float64 `json:"callback_duration_ms_max"`
+}
+
+type UsageIngestStatus struct {
+	NativeRecords      int64 `json:"native_records"`
+	BodyRecords        int64 `json:"body_records"`
+	HistoryRecords     int64 `json:"history_records"`
+	ParseFailures      int64 `json:"parse_failures"`
+	StreamCorrelations int64 `json:"stream_correlations"`
 }
 
 type ConditionalRequestStatus struct {
@@ -705,6 +766,8 @@ type RequestDetail struct {
 	StatusCode  int                 `json:"status_code,omitempty"`
 	Failure     string              `json:"failure,omitempty"`
 	Headers     map[string][]string `json:"headers,omitempty"`
+
+	eventID int64 `json:"-"`
 }
 
 type TokenStats struct {
@@ -987,6 +1050,8 @@ type DashboardSummary struct {
 	ModelStats  []ModelStat   `json:"model_stats"`
 	GeneratedAt string        `json:"generated_at"`
 	Meta        DashboardMeta `json:"_meta"`
+
+	queryError error `json:"-"`
 }
 
 // DashboardMeta carries observability metadata.
@@ -1032,6 +1097,8 @@ type EventsResult struct {
 	GeneratedAt string          `json:"generated_at"`
 
 	dashboardVersion uint64
+	queryError       error
+	nextCursor       eventQueryCursor
 }
 
 // APIDetailSummary is the range-scoped summary for one upstream API.
@@ -1070,4 +1137,5 @@ type APIDetailResponse struct {
 	GeneratedAt  string               `json:"generated_at"`
 
 	dashboardVersion uint64
+	queryError       error
 }

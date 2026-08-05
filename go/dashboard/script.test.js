@@ -1613,12 +1613,12 @@ test('dashboard uses a slower polling interval while hidden', async () => {
 
   await waitFor(() => fetchCalls.some((url) => url.includes('dashboard-summary')));
   await waitFor(() => timeoutDelays.includes(300000));
-  assert.notStrictEqual(timeoutDelays[timeoutDelays.length - 1], 30000);
+  assert.notStrictEqual(timeoutDelays[timeoutDelays.length - 1], 60000);
 
   const beforeVisibleFetches = fetchCalls.length;
   setVisibility('visible');
   await waitFor(() => fetchCalls.length > beforeVisibleFetches);
-  await waitFor(() => timeoutDelays.includes(30000));
+  await waitFor(() => timeoutDelays.includes(60000));
 });
 
 test('dashboard reuses model prices during the price cache TTL', async () => {

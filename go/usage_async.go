@@ -6,8 +6,8 @@ const (
 	// Response interceptor payloads can include the complete stream history.
 	// Bound both task count and retained payload bytes so a slow SQLite writer
 	// cannot turn callback traffic into unbounded heap growth.
-	usageCallbackQueueMaxTasks = 256
-	usageCallbackQueueMaxBytes = 16 << 20
+	usageCallbackQueueMaxTasks = 4096
+	usageCallbackQueueMaxBytes = 8 << 20
 	usageCallbackTaskOverhead  = 1024
 )
 
@@ -58,8 +58,8 @@ func (p *usageCallbackProcessor) enqueue(task func(), payloadBytes int) bool {
 	fits := len(p.queue) < usageCallbackQueueMaxTasks &&
 		(retainedBytes <= usageCallbackQueueMaxBytes-p.queuedBytes)
 	if !fits {
-		// Host callbacks must never wait for SQLite or an earlier callback. The
-		// caller records an overflow metric and returns the empty success envelope.
+		// A full queue is reported to the caller. It must not execute callback work
+		// inline because that work can include parsing and storage handoff.
 		return false
 	}
 	p.queue = append(p.queue, usageCallbackTask{fn: task, retained: retainedBytes})
@@ -142,6 +142,10 @@ func deferUsageCallback(s *RequestStatistics, task func(), payloadBytes int) usa
 	if usageCallbacks.enqueue(task, payloadBytes) {
 		return usageCallbackQueued
 	}
+	// A full queue must not turn a successful host callback into synchronous
+	// parsing or disk I/O. Normal workloads are sized well below this bound;
+	// overload is exposed explicitly through the drop counters.
+	s.recordUsageCallbackOverflow()
 	s.recordUsageCallbackDrop()
 	return usageCallbackDropped
 }

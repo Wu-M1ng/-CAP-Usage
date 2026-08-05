@@ -56,6 +56,7 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
+	"time"
 	"unsafe"
 )
 
@@ -94,20 +95,54 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		// no usage settlement data.
 		requestView := unsafe.Slice((*byte)(unsafe.Pointer(request)), int(requestLen))
 		if methodName == "response.intercept_stream_chunk" {
-			if compact, hasUsage, compactErr := decodeResponseStreamChunkForUsage(requestView); compactErr == nil {
-				if !hasUsage {
+			startedAt := time.Now()
+			if envelope, inspectErr := inspectStreamCallbackEnvelope(requestView); inspectErr == nil {
+				if !envelope.bodyHasUsage && !envelope.terminal {
+					stats.RecordStreamCallbackObservation(streamCallbackObservation{
+						inputBytes: len(requestView),
+						fastPath:   true,
+						duration:   time.Since(startedAt),
+					})
 					raw, _ := okEnvelopeJSON("{}")
 					writeResponse(response, raw)
 					return 0
 				}
-				raw, errHandle := handleResponseStreamChunkRequest(stats, usageFallbacks, compact)
-				if errHandle != nil {
-					writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
-					return 1
+				compact, hasUsage, historyBytes, decodeErr := decodeStreamSettlement(envelope)
+				if decodeErr == nil {
+					stats.RecordStreamCallbackObservation(streamCallbackObservation{
+						inputBytes:          len(requestView),
+						bodyBytesDecoded:    len(envelope.body),
+						historyBytesDecoded: historyBytes,
+						settlement:          hasUsage,
+						terminalHistoryScan: envelope.terminal && len(envelope.historyRaw) > 0,
+						duration:            time.Since(startedAt),
+					})
+					if !hasUsage && !envelope.terminal {
+						raw, _ := okEnvelopeJSON("{}")
+						writeResponse(response, raw)
+						return 0
+					}
+					raw, errHandle := handleResponseStreamChunkRequestWithTerminal(stats, usageFallbacks, compact, envelope.terminal)
+					if errHandle != nil {
+						writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+						return 1
+					}
+					writeResponse(response, raw)
+					return 0
 				}
-				writeResponse(response, raw)
-				return 0
 			}
+		}
+		if methodName == "response.intercept_after" {
+			// Ordinary response interception compacts the host-owned buffer before
+			// returning. Do not make a second full C.GoBytes copy that would only
+			// be retained until the asynchronous compact task is accepted.
+			raw, errHandle := handleResponseIntercept(requestView)
+			if errHandle != nil {
+				writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+				return 1
+			}
+			writeResponse(response, raw)
+			return 0
 		}
 		if !pluginCallNeedsRequestCopy(methodName, requestView) {
 			raw, _ := okEnvelopeJSON("{}")
@@ -142,6 +177,9 @@ func cliproxyPluginShutdown() {
 	// Host callbacks return before SQLite writes and response parsing finish.
 	// Drain that queue before flushing fallback timers or closing the store.
 	shutdownUsageCallbacks()
+	if streamUsages != nil {
+		streamUsages.close()
+	}
 	if usageFallbacks != nil {
 		usageFallbacks.Flush()
 	}

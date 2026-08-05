@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"container/heap"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,9 +14,10 @@ import (
 )
 
 const (
-	defaultUsageFallbackDelay = 2 * time.Second
-	maxUsageFallbackPending   = 4096
-	maxUsageFallbackRecent    = 4096
+	defaultUsageFallbackDelay     = 2 * time.Second
+	maxUsageFallbackPending       = 4096
+	maxUsageFallbackRecent        = 4096
+	maxUsageFallbackRetainedBytes = 8 << 20
 	// Native usage and response interception are delivered by independent host
 	// callbacks. Keep the native observation long enough to cover a slow handoff
 	// without making the fallback wait longer before it becomes usable.
@@ -27,6 +29,7 @@ var (
 	usageFallbackRecordDelay = defaultUsageFallbackDelay
 	usageFallbacks           = newUsageFallbackCoordinator()
 	authIndexes              = newAuthIndexLearner()
+	streamUsages             = newStreamUsageTracker()
 )
 
 // authIndexLearner remembers the CPA-computed auth index for each auth ID.
@@ -80,6 +83,7 @@ type ResponseInterceptRequest struct {
 	SourceFormat    string
 	Model           string
 	RequestedModel  string
+	correlationID   string
 	Stream          bool
 	RequestHeaders  map[string][]string
 	ResponseHeaders map[string][]string
@@ -98,6 +102,17 @@ type ResponseStreamChunkRequest struct {
 	ResponseInterceptRequest
 	HistoryChunks [][]byte
 	ChunkIndex    int
+}
+
+// responseInterceptEnvelope is the owned payload that crosses from the host
+// callback into the asynchronous usage processor. The response body and the
+// original request are intentionally absent: only the decoded usage fields
+// and the metadata needed to build a UsageRecord are retained.
+type responseInterceptEnvelope struct {
+	req          ResponseInterceptRequest
+	decoded      decodedUsage
+	usageFound   bool
+	bodyHadUsage bool
 }
 
 func (r *ResponseStreamChunkRequest) UnmarshalJSON(data []byte) error {
@@ -136,6 +151,15 @@ func unmarshalResponseInterceptRequest(data []byte, r *ResponseInterceptRequest)
 		ModelSnake           string              `json:"model"`
 		RequestedModel       string              `json:"RequestedModel"`
 		RequestedModelSnake  string              `json:"requested_model"`
+		ResponseID           string              `json:"ResponseID"`
+		ResponseIDSnake      string              `json:"response_id"`
+		ResponseIDCamel      string              `json:"responseId"`
+		RequestID            string              `json:"RequestID"`
+		RequestIDSnake       string              `json:"request_id"`
+		RequestIDCamel       string              `json:"requestId"`
+		StreamID             string              `json:"StreamID"`
+		StreamIDSnake        string              `json:"stream_id"`
+		StreamIDCamel        string              `json:"streamId"`
 		Stream               bool                `json:"Stream"`
 		StreamSnake          bool                `json:"stream"`
 		RequestHeaders       map[string][]string `json:"RequestHeaders"`
@@ -159,6 +183,11 @@ func unmarshalResponseInterceptRequest(data []byte, r *ResponseInterceptRequest)
 	r.SourceFormat = firstNonEmpty(wire.SourceFormat, wire.SourceFormatSnake)
 	r.Model = firstNonEmpty(wire.Model, wire.ModelSnake)
 	r.RequestedModel = firstNonEmpty(wire.RequestedModel, wire.RequestedModelSnake)
+	r.correlationID = firstNonEmpty(
+		wire.ResponseID, wire.ResponseIDSnake, wire.ResponseIDCamel,
+		wire.RequestID, wire.RequestIDSnake, wire.RequestIDCamel,
+		wire.StreamID, wire.StreamIDSnake, wire.StreamIDCamel,
+	)
 	r.Stream = wire.Stream || wire.StreamSnake
 	r.RequestHeaders = firstHeaderMap(wire.RequestHeaders, wire.RequestHeadersSnake)
 	r.ResponseHeaders = firstHeaderMap(wire.ResponseHeaders, wire.ResponseHeadersSnake)
@@ -179,21 +208,350 @@ func unmarshalResponseInterceptRequest(data []byte, r *ResponseInterceptRequest)
 func handleResponseIntercept(requestBody []byte) ([]byte, error) {
 	statistics := stats
 	fallbacks := usageFallbacks
+	envelope, err := inspectResponseInterceptEnvelope(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse response intercept request: %w", err)
+	}
+	compactBytes := responseInterceptEnvelopeBytes(envelope)
 	switch deferUsageCallback(statistics, func() {
-		processResponseIntercept(statistics, fallbacks, requestBody)
-	}, len(requestBody)) {
+		processResponseInterceptEnvelope(statistics, fallbacks, envelope)
+	}, compactBytes) {
 	case usageCallbackQueued, usageCallbackDropped:
 		return okEnvelopeJSON("{}")
 	}
-
-	var req ResponseInterceptRequest
-	if err := json.Unmarshal(requestBody, &req); err != nil {
-		return nil, fmt.Errorf("failed to parse response intercept request: %w", err)
-	}
-	if record, ok := usageRecordFromResponseIntercept(req); ok && fallbacks != nil {
-		fallbacks.ScheduleForStats(statistics, record)
-	}
+	processResponseInterceptEnvelope(statistics, fallbacks, envelope)
 	return okEnvelopeJSON("{}")
+}
+
+// inspectResponseInterceptEnvelope performs the bounded part of ordinary
+// response parsing while the host buffer is still valid. json.Decoder skips
+// unrelated large fields, and the response body is decoded only when it has a
+// usage marker. The resulting envelope contains no request/response body.
+func inspectResponseInterceptEnvelope(data []byte) (responseInterceptEnvelope, error) {
+	var envelope responseInterceptEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return envelope, err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return envelope, fmt.Errorf("response intercept request is not a JSON object")
+	}
+	var requestFields responseRequestMetadata
+	var originalFields responseRequestMetadata
+	bodySeen := false
+	requestSeen := false
+	originalSeen := false
+	metadataSeen := false
+	requestHeadersSeen := false
+	responseHeadersSeen := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return envelope, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return envelope, fmt.Errorf("response intercept field name is not a string")
+		}
+		normalized := normalizeResponseStreamFieldName(key)
+		switch normalized {
+		case "sourceformat":
+			if err := decoder.Decode(&envelope.req.SourceFormat); err != nil {
+				return envelope, err
+			}
+		case "model":
+			if err := decoder.Decode(&envelope.req.Model); err != nil {
+				return envelope, err
+			}
+		case "requestedmodel":
+			if err := decoder.Decode(&envelope.req.RequestedModel); err != nil {
+				return envelope, err
+			}
+		case "responseid", "requestid", "streamid":
+			if envelope.req.correlationID == "" {
+				if envelope.req.correlationID, err = decodeJSONScalarString(decoder); err != nil {
+					return envelope, err
+				}
+			} else if err := skipJSONDecoderValue(decoder); err != nil {
+				return envelope, err
+			}
+		case "stream":
+			if err := decoder.Decode(&envelope.req.Stream); err != nil {
+				return envelope, err
+			}
+		case "requestheaders":
+			if requestHeadersSeen {
+				if err := skipJSONDecoderValue(decoder); err != nil {
+					return envelope, err
+				}
+				continue
+			}
+			if err := decoder.Decode(&envelope.req.RequestHeaders); err != nil {
+				return envelope, err
+			}
+			requestHeadersSeen = true
+		case "responseheaders":
+			if responseHeadersSeen {
+				if err := skipJSONDecoderValue(decoder); err != nil {
+					return envelope, err
+				}
+				continue
+			}
+			if err := decoder.Decode(&envelope.req.ResponseHeaders); err != nil {
+				return envelope, err
+			}
+			responseHeadersSeen = true
+		case "requestbody":
+			if requestSeen {
+				if err := skipJSONDecoderValue(decoder); err != nil {
+					return envelope, err
+				}
+				continue
+			}
+			var raw []byte
+			if err := decoder.Decode(&raw); err != nil {
+				return envelope, err
+			}
+			requestFields = responseRequestStringFields(raw)
+			requestSeen = true
+		case "originalrequest":
+			if originalSeen {
+				if err := skipJSONDecoderValue(decoder); err != nil {
+					return envelope, err
+				}
+				continue
+			}
+			var raw []byte
+			if err := decoder.Decode(&raw); err != nil {
+				return envelope, err
+			}
+			originalFields = responseRequestStringFields(raw)
+			originalSeen = true
+		case "body":
+			if bodySeen {
+				if err := skipJSONDecoderValue(decoder); err != nil {
+					return envelope, err
+				}
+				continue
+			}
+			bodySeen = true
+			body, hasMarker, err := decodeResponseInterceptBody(decoder)
+			if err != nil {
+				return envelope, err
+			}
+			envelope.bodyHadUsage = hasMarker
+			if hasMarker && !envelope.req.Stream {
+				envelope.decoded, envelope.usageFound = decodeUsagePayload(body, usageDecodeComplete)
+			}
+		case "statuscode":
+			if err := decoder.Decode(&envelope.req.StatusCode); err != nil {
+				return envelope, err
+			}
+		case "metadata":
+			if metadataSeen {
+				if err := skipJSONDecoderValue(decoder); err != nil {
+					return envelope, err
+				}
+				continue
+			}
+			envelope.req.Metadata, err = decodeCompactResponseMetadata(decoder)
+			if err != nil {
+				return envelope, err
+			}
+			metadataSeen = true
+		default:
+			if err := skipJSONDecoderValue(decoder); err != nil {
+				return envelope, err
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return envelope, err
+	}
+	if envelope.req.Model == "" {
+		envelope.req.Model = firstNonEmpty(requestFields.model, originalFields.model)
+	}
+	if envelope.req.RequestedModel == "" {
+		envelope.req.RequestedModel = firstNonEmpty(
+			requestFields.requestedModel,
+			originalFields.requestedModel,
+			envelope.req.Model,
+		)
+	}
+	if metadataString(envelope.req.Metadata, "service_tier") == "" {
+		serviceTier := firstNonEmpty(requestFields.serviceTier, originalFields.serviceTier)
+		if serviceTier != "" {
+			if envelope.req.Metadata == nil {
+				envelope.req.Metadata = make(map[string]any, 1)
+			}
+			envelope.req.Metadata["service_tier"] = serviceTier
+		}
+	}
+	return envelope, nil
+}
+
+func decodeResponseInterceptBody(decoder *json.Decoder) ([]byte, bool, error) {
+	var encoded string
+	if err := decoder.Decode(&encoded); err != nil {
+		return nil, false, err
+	}
+	if encoded == "" {
+		return nil, false, nil
+	}
+	scratch := make([]byte, base64.StdEncoding.DecodedLen(32<<10))
+	hasMarker, err := base64ChunkContainsUsage(encoded, scratch)
+	if err != nil || !hasMarker {
+		return nil, hasMarker, err
+	}
+	body, err := base64.StdEncoding.DecodeString(encoded)
+	return body, true, err
+}
+
+func decodeCompactResponseMetadata(decoder *json.Decoder) (map[string]any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		if delim == 0 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("response metadata is not a JSON object")
+	}
+	metadata := make(map[string]any)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("response metadata field name is not a string")
+		}
+		canonical, keep := compactResponseMetadataKey(key)
+		if !keep {
+			if err := skipJSONDecoderValue(decoder); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if _, exists := metadata[canonical]; !exists {
+			metadata[canonical] = value
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	if len(metadata) == 0 {
+		return nil, nil
+	}
+	return metadata, nil
+}
+
+func compactResponseMetadataKey(key string) (string, bool) {
+	normalized := normalizeUsageFieldName(key)
+	switch normalized {
+	case "selectedauthid":
+		return "selected_auth_id", true
+	case "pinnedauthid":
+		return "pinned_auth_id", true
+	case "upstreamprovider":
+		return "upstream_provider", true
+	case "provider":
+		return "provider", true
+	case "selectedprovider":
+		return "selected_provider", true
+	case "requestedmodel":
+		return "requested_model", true
+	case "servicetier":
+		return "service_tier", true
+	case "reasoningeffort":
+		return "reasoning_effort", true
+	case "upstreambaseurl":
+		return "upstream_base_url", true
+	case "providerbaseurl":
+		return "provider_base_url", true
+	case "baseurl":
+		return "base_url", true
+	case "upstreamsource":
+		return "upstream_source", true
+	case "providersource":
+		return "provider_source", true
+	case "selectedsource":
+		return "selected_source", true
+	case "requestpath":
+		return "request_path", true
+	case "endpoint":
+		return "endpoint", true
+	case "requestendpoint":
+		return "request_endpoint", true
+	case "path":
+		return "path", true
+	case "uri":
+		return "uri", true
+	case "url":
+		return "url", true
+	case "route":
+		return "route", true
+	case "authindex":
+		return "auth_index", true
+	case "selectedauthindex":
+		return "selected_auth_index", true
+	case "pinnedauthindex":
+		return "pinned_auth_index", true
+	case "authtype":
+		return "auth_type", true
+	case "selectedauthtype":
+		return "selected_auth_type", true
+	case "pinnedauthtype":
+		return "pinned_auth_type", true
+	case "responseid":
+		return "response_id", true
+	case "requestid":
+		return "request_id", true
+	case "streamid":
+		return "stream_id", true
+	default:
+		return "", false
+	}
+}
+
+func responseInterceptEnvelopeBytes(envelope responseInterceptEnvelope) int {
+	bytes := 256 + len(envelope.req.SourceFormat) + len(envelope.req.Model) +
+		len(envelope.req.RequestedModel) + len(envelope.req.correlationID)
+	bytes += usageDetailRetainedBytes(envelope.decoded.detail)
+	bytes += responseHeadersRetainedBytes(envelope.req.RequestHeaders)
+	bytes += responseHeadersRetainedBytes(envelope.req.ResponseHeaders)
+	for key, value := range envelope.req.Metadata {
+		bytes += len(key) + len(metadataValueString(value)) + 32
+	}
+	if bytes < 256 {
+		return 256
+	}
+	return bytes
+}
+
+func usageDetailRetainedBytes(detail UsageDetail) int {
+	return 8 * 7
+}
+
+func responseHeadersRetainedBytes(headers map[string][]string) int {
+	retained := 0
+	for key, values := range headers {
+		retained += len(key) + 32
+		for _, value := range values {
+			retained += len(value)
+		}
+	}
+	return retained
 }
 
 func handleResponseStreamChunk(requestBody []byte) ([]byte, error) {
@@ -202,35 +560,56 @@ func handleResponseStreamChunk(requestBody []byte) ([]byte, error) {
 	if !responseStreamChunkMayContainUsage(requestBody) {
 		return okEnvelopeJSON("{}")
 	}
-	switch deferUsageCallback(statistics, func() {
-		processResponseStreamChunk(statistics, fallbacks, requestBody)
-	}, len(requestBody)) {
-	case usageCallbackQueued, usageCallbackDropped:
+	// Parse while the callback buffer is available, then hand only the compact
+	// usage record to the asynchronous processor. Capturing requestBody here
+	// would retain the complete cumulative HistoryChunks payload until the
+	// queue task runs.
+	req, hasUsage, err := decodeResponseStreamChunkForUsage(requestBody)
+	if err != nil || !hasUsage {
 		return okEnvelopeJSON("{}")
-	}
-
-	var req ResponseStreamChunkRequest
-	if err := json.Unmarshal(requestBody, &req); err != nil {
-		return nil, fmt.Errorf("failed to parse response stream chunk request: %w", err)
 	}
 	return handleResponseStreamChunkRequest(statistics, fallbacks, req)
 }
 
 func handleResponseStreamChunkRequest(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest) ([]byte, error) {
-	payloadBytes := len(req.Body)
-	for _, chunk := range req.HistoryChunks {
-		payloadBytes += len(chunk)
+	return handleResponseStreamChunkRequestAndTrack(statistics, fallbacks, req, false, false)
+}
+
+func handleResponseStreamChunkRequestWithTerminal(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest, terminal bool) ([]byte, error) {
+	return handleResponseStreamChunkRequestAndTrack(statistics, fallbacks, req, terminal, true)
+}
+
+func handleResponseStreamChunkRequestAndTrack(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest, terminal bool, track bool) ([]byte, error) {
+	record, ok := usageRecordFromResponseStreamChunk(req)
+	if !ok {
+		if track && terminal && streamUsages != nil {
+			record = UsageRecord{correlationID: firstNonEmpty(
+				req.correlationID,
+				metadataString(req.Metadata, "response_id", "responseId", "stream_id", "streamId", "request_id", "requestId"),
+			)}
+		} else {
+			if responseStatusIsSuccessful(req.StatusCode) && responseStreamRequestMayContainUsage(req) && statistics != nil {
+				statistics.recordUsageParseFailure()
+			}
+			return okEnvelopeJSON("{}")
+		}
+	} else {
+		sanitizeUsageRecordForStats(statistics, &record)
 	}
-	switch deferUsageCallback(statistics, func() {
-		processResponseStreamChunkRequest(statistics, fallbacks, req)
-	}, payloadBytes) {
+	var superseded []usageFallbackSupersession
+	if usageDetailHasTokens(record.Detail) && (!track || strings.TrimSpace(record.correlationID) == "") {
+		superseded = supersededStreamUsageFingerprints(req)
+	}
+	compactBytes := usageFallbackRecordBytes(record) + len(superseded)*64
+	chunkIndex := req.ChunkIndex
+	task := func() {
+		processResponseStreamUsageRecord(statistics, fallbacks, record, chunkIndex, terminal, track, superseded)
+	}
+	switch deferUsageCallback(statistics, task, compactBytes) {
 	case usageCallbackQueued, usageCallbackDropped:
 		return okEnvelopeJSON("{}")
 	}
-	if record, ok := usageRecordFromResponseStreamChunk(req); ok && fallbacks != nil {
-		fallbacks.Supersede(supersededStreamUsageFingerprints(req))
-		fallbacks.ScheduleForStats(statistics, record)
-	}
+	processResponseStreamUsageRecord(statistics, fallbacks, record, chunkIndex, terminal, track, superseded)
 	return okEnvelopeJSON("{}")
 }
 
@@ -268,7 +647,20 @@ func responseStreamChunkMayContainUsage(requestBody []byte) bool {
 			if len(bytes.TrimSpace(body)) == 0 {
 				continue
 			}
-			return responseBodyMayContainUsage(body)
+			if responseBodyMayContainUsage(body) {
+				return true
+			}
+			continue
+		}
+		if strings.EqualFold(key, "historychunks") {
+			hasUsage, err := decodeStreamHistoryUsageChunks(decoder, nil)
+			if err != nil {
+				return true
+			}
+			if hasUsage {
+				return true
+			}
+			continue
 		}
 		if err := skipJSONDecoderValue(decoder); err != nil {
 			return true
@@ -314,6 +706,7 @@ func decodeResponseStreamChunkForUsage(data []byte) (ResponseStreamChunkRequest,
 	}
 	bodySet := false
 	currentHasUsage := false
+	requestServiceTier := ""
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
@@ -323,7 +716,7 @@ func decodeResponseStreamChunkForUsage(data []byte) (ResponseStreamChunkRequest,
 		if !ok {
 			return req, false, fmt.Errorf("response stream chunk field name is not a string")
 		}
-		normalized := strings.ToLower(strings.ReplaceAll(key, "_", ""))
+		normalized := normalizeResponseStreamFieldName(key)
 		switch normalized {
 		case "sourceformat":
 			if err := decoder.Decode(&req.SourceFormat); err != nil {
@@ -353,14 +746,30 @@ func decodeResponseStreamChunkForUsage(data []byte) (ResponseStreamChunkRequest,
 			if err := decoder.Decode(&req.ResponseHeaders); err != nil {
 				return req, false, err
 			}
-		case "originalrequest":
-			if err := decoder.Decode(&req.OriginalRequest); err != nil {
+		case "responseid", "requestid", "streamid":
+			var correlationID string
+			if err := decoder.Decode(&correlationID); err != nil {
 				return req, false, err
 			}
-		case "requestbody":
-			if err := decoder.Decode(&req.RequestBody); err != nil {
+			if req.correlationID == "" {
+				req.correlationID = correlationID
+			}
+		case "originalrequest", "requestbody":
+			// The request payload is only a source for three small metadata
+			// fields. Decode it into a local temporary and do not retain the
+			// potentially multi-megabyte body in the queued request.
+			var raw []byte
+			if err := decoder.Decode(&raw); err != nil {
 				return req, false, err
 			}
+			fields := responseRequestStringFields(raw)
+			if req.Model == "" {
+				req.Model = fields.model
+			}
+			if req.RequestedModel == "" {
+				req.RequestedModel = fields.requestedModel
+			}
+			requestServiceTier = firstNonEmpty(requestServiceTier, fields.serviceTier)
 		case "body":
 			var body []byte
 			if err := decoder.Decode(&body); err != nil {
@@ -380,9 +789,11 @@ func decodeResponseStreamChunkForUsage(data []byte) (ResponseStreamChunkRequest,
 				return req, false, err
 			}
 		case "historychunks":
-			if err := decodeStreamHistoryUsageChunks(decoder, &req.HistoryChunks); err != nil {
+			historyHasUsage, err := decodeStreamHistoryUsageChunks(decoder, &req.HistoryChunks)
+			if err != nil {
 				return req, false, err
 			}
+			currentHasUsage = currentHasUsage || historyHasUsage
 		case "chunkindex":
 			if err := decoder.Decode(&req.ChunkIndex); err != nil {
 				return req, false, err
@@ -396,26 +807,89 @@ func decodeResponseStreamChunkForUsage(data []byte) (ResponseStreamChunkRequest,
 	if _, err := decoder.Token(); err != nil {
 		return req, false, err
 	}
+	if requestServiceTier != "" && metadataString(req.Metadata, "service_tier") == "" {
+		if req.Metadata == nil {
+			req.Metadata = make(map[string]any)
+		}
+		req.Metadata["service_tier"] = requestServiceTier
+	}
 	return req, currentHasUsage, nil
 }
 
-func decodeStreamHistoryUsageChunks(decoder *json.Decoder, target *[][]byte) error {
+func normalizeResponseStreamFieldName(key string) string {
+	switch key {
+	case "SourceFormat", "source_format", "sourceFormat":
+		return "sourceformat"
+	case "Model", "model":
+		return "model"
+	case "RequestedModel", "requested_model", "requestedModel":
+		return "requestedmodel"
+	case "ResponseID", "response_id", "responseId":
+		return "responseid"
+	case "RequestID", "request_id", "requestId":
+		return "requestid"
+	case "StreamID", "stream_id", "streamId":
+		return "streamid"
+	case "Stream", "stream":
+		return "stream"
+	case "RequestHeaders", "request_headers", "requestHeaders":
+		return "requestheaders"
+	case "ResponseHeaders", "response_headers", "responseHeaders":
+		return "responseheaders"
+	case "OriginalRequest", "original_request", "originalRequest":
+		return "originalrequest"
+	case "RequestBody", "request_body", "requestBody":
+		return "requestbody"
+	case "Body", "body":
+		return "body"
+	case "StatusCode", "status_code", "statusCode":
+		return "statuscode"
+	case "Metadata", "metadata":
+		return "metadata"
+	case "HistoryChunks", "history_chunks", "historyChunks":
+		return "historychunks"
+	case "ChunkIndex", "chunk_index", "chunkIndex":
+		return "chunkindex"
+	default:
+		return strings.ToLower(strings.ReplaceAll(key, "_", ""))
+	}
+}
+
+func decodeStreamHistoryUsageChunks(decoder *json.Decoder, target *[][]byte) (bool, error) {
 	token, err := decoder.Token()
 	if err != nil {
-		return err
+		return false, err
+	}
+	if token == nil {
+		return false, nil
 	}
 	delim, ok := token.(json.Delim)
 	if !ok || delim != '[' {
-		return fmt.Errorf("HistoryChunks is not an array")
+		return false, fmt.Errorf("HistoryChunks is not an array")
 	}
+	hasUsage := false
 	var retainedBytes int
+	const encodedBlockBytes = 32 << 10
+	scratch := make([]byte, base64.StdEncoding.DecodedLen(encodedBlockBytes))
 	for decoder.More() {
-		var chunk []byte
-		if err := decoder.Decode(&chunk); err != nil {
-			return err
+		var encoded string
+		if err := decoder.Decode(&encoded); err != nil {
+			return false, err
 		}
-		if !responseBodyMayContainUsage(chunk) {
+		chunkHasUsage, err := base64ChunkContainsUsage(encoded, scratch)
+		if err != nil {
+			return false, err
+		}
+		if !chunkHasUsage {
 			continue
+		}
+		hasUsage = true
+		if target == nil {
+			continue
+		}
+		chunk, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return false, err
 		}
 		*target = append(*target, chunk)
 		retainedBytes += len(chunk)
@@ -428,7 +902,74 @@ func decodeStreamHistoryUsageChunks(decoder *json.Decoder, target *[][]byte) err
 		}
 	}
 	_, err = decoder.Token()
-	return err
+	return hasUsage, err
+}
+
+// base64ChunkContainsUsage avoids materializing every HistoryChunks payload
+// when a stream callback carries the full history. The JSON representation of
+// []byte is Base64, so decoding into a small scratch buffer lets the common
+// non-usage path avoid both a large allocation and a second full scan. A full
+// decode is only performed for chunks that actually contain a usage marker.
+func base64ChunkContainsUsage(encoded string, scratch []byte) (bool, error) {
+	if encoded == "" {
+		return false, nil
+	}
+	const encodedBlockBytes = 32 << 10
+	const carryBytes = 32
+	if len(scratch) < base64.StdEncoding.DecodedLen(encodedBlockBytes) {
+		scratch = make([]byte, base64.StdEncoding.DecodedLen(encodedBlockBytes))
+	}
+	var carry [carryBytes]byte
+	carryLen := 0
+	for offset := 0; offset < len(encoded); {
+		end := offset + encodedBlockBytes
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		block := []byte(encoded[offset:end])
+		n, err := base64.StdEncoding.Decode(scratch, block)
+		if err != nil {
+			return false, err
+		}
+		if usageBytesContainMarker(carry[:carryLen], scratch[:n]) {
+			return true, nil
+		}
+		if n >= carryBytes {
+			copy(carry[:], scratch[n-carryBytes:n])
+			carryLen = carryBytes
+		} else {
+			keep := carryLen + n
+			if keep > carryBytes {
+				shift := keep - carryBytes
+				copy(carry[:], carry[shift:carryLen])
+				carryLen = carryBytes - n
+			}
+			copy(carry[carryLen:], scratch[:n])
+			carryLen += n
+		}
+		offset = end
+	}
+	return false, nil
+}
+
+func usageBytesContainMarker(carry, block []byte) bool {
+	if len(carry) == 0 {
+		for _, marker := range responseUsageMarkers {
+			if bytes.Contains(block, marker) {
+				return true
+			}
+		}
+		return false
+	}
+	var combined [64]byte
+	length := copy(combined[:], carry)
+	length += copy(combined[length:], block)
+	for _, marker := range responseUsageMarkers {
+		if bytes.Contains(block, marker) || bytes.Contains(combined[:length], marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func skipJSONDecoderValue(decoder *json.Decoder) error {
@@ -464,28 +1005,125 @@ func skipJSONDecoderValue(decoder *json.Decoder) error {
 }
 
 func processResponseIntercept(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, requestBody []byte) {
-	var req ResponseInterceptRequest
-	if err := json.Unmarshal(requestBody, &req); err != nil {
+	envelope, err := inspectResponseInterceptEnvelope(requestBody)
+	if err != nil {
 		return
 	}
-	if record, ok := usageRecordFromResponseIntercept(req); ok && fallbacks != nil {
-		fallbacks.ScheduleForStats(statistics, record)
+	processResponseInterceptEnvelope(statistics, fallbacks, envelope)
+}
+
+func processResponseInterceptEnvelope(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, envelope responseInterceptEnvelope) {
+	if envelope.req.Stream || !responseStatusIsSuccessful(envelope.req.StatusCode) {
+		return
+	}
+	if envelope.usageFound {
+		record, ok := usageRecordFromDecodedUsage(envelope.req, envelope.decoded)
+		if !ok {
+			if envelope.bodyHadUsage && statistics != nil {
+				statistics.recordUsageParseFailure()
+			}
+			return
+		}
+		record.usageOrigin = usageOriginInterceptBody
+		sanitizeUsageRecordForStats(statistics, &record)
+		if fallbacks != nil {
+			fallbacks.ScheduleForStats(statistics, record)
+		}
+		return
+	}
+	if envelope.bodyHadUsage && statistics != nil {
+		statistics.recordUsageParseFailure()
 	}
 }
 
 func processResponseStreamChunk(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, requestBody []byte) {
-	var req ResponseStreamChunkRequest
-	if err := json.Unmarshal(requestBody, &req); err != nil {
+	req, hasUsage, err := decodeResponseStreamChunkForUsage(requestBody)
+	if err != nil || !hasUsage {
 		return
 	}
 	processResponseStreamChunkRequest(statistics, fallbacks, req)
 }
 
 func processResponseStreamChunkRequest(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest) {
-	if record, ok := usageRecordFromResponseStreamChunk(req); ok && fallbacks != nil {
-		fallbacks.Supersede(supersededStreamUsageFingerprints(req))
-		fallbacks.ScheduleForStats(statistics, record)
+	processResponseStreamChunkRequestWithTerminalAndTrack(statistics, fallbacks, req, false, false)
+}
+
+func processResponseStreamChunkRequestWithTerminal(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest, terminal bool) {
+	processResponseStreamChunkRequestWithTerminalAndTrack(statistics, fallbacks, req, terminal, true)
+}
+
+func processResponseStreamChunkRequestWithTerminalAndTrack(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, req ResponseStreamChunkRequest, terminal bool, track bool) {
+	if record, ok := usageRecordFromResponseStreamChunk(req); ok {
+		sanitizeUsageRecordForStats(statistics, &record)
+		if track && terminal && streamUsages != nil {
+			streamUsages.Observe(statistics, fallbacks, record, req.ChunkIndex, true)
+			return
+		}
+		if track && !terminal && strings.TrimSpace(record.correlationID) != "" && streamUsages != nil {
+			streamUsages.Observe(statistics, fallbacks, record, req.ChunkIndex, false)
+			return
+		}
+		if fallbacks != nil {
+			fallbacks.Supersede(supersededStreamUsageFingerprints(req))
+			fallbacks.ScheduleForStats(statistics, record)
+		}
+		return
+	} else if track && terminal && streamUsages != nil {
+		streamUsages.Observe(statistics, fallbacks, UsageRecord{correlationID: firstNonEmpty(req.correlationID, metadataString(req.Metadata, "response_id", "responseId", "stream_id", "streamId", "request_id", "requestId"))}, req.ChunkIndex, true)
+		return
 	}
+	if responseStatusIsSuccessful(req.StatusCode) && responseStreamRequestMayContainUsage(req) {
+		statistics.recordUsageParseFailure()
+	}
+}
+
+func processResponseStreamUsageRecord(statistics *RequestStatistics, fallbacks *usageFallbackCoordinator, record UsageRecord, chunkIndex int, terminal bool, track bool, superseded []usageFallbackSupersession) {
+	if track && terminal && streamUsages != nil {
+		streamUsages.Observe(statistics, fallbacks, record, chunkIndex, true)
+		return
+	}
+	if track && !terminal && strings.TrimSpace(record.correlationID) != "" && streamUsages != nil {
+		streamUsages.Observe(statistics, fallbacks, record, chunkIndex, false)
+		return
+	}
+	if fallbacks != nil {
+		fallbacks.Supersede(superseded)
+		if usageDetailHasTokens(record.Detail) {
+			fallbacks.ScheduleForStats(statistics, record)
+		}
+	}
+}
+
+func sanitizeUsageRecordForStats(statistics *RequestStatistics, record *UsageRecord) {
+	if statistics == nil || record == nil || len(record.ResponseHeaders) == 0 {
+		return
+	}
+	statistics.mu.RLock()
+	whitelist := statistics.logResponseHeaders
+	statistics.mu.RUnlock()
+	record.ResponseHeaders = filterHeaders(record.ResponseHeaders, whitelist)
+}
+
+func responseStatusIsSuccessful(statusCode int) bool {
+	return statusCode == 0 || statusCode >= 200 && statusCode < 300
+}
+
+func responseStreamRequestMayContainUsage(req ResponseStreamChunkRequest) bool {
+	if responseBodyMayContainUsage(req.Body) && !responseStreamPayloadIsIgnored(req.Body) {
+		return true
+	}
+	for _, chunk := range req.HistoryChunks {
+		if responseBodyMayContainUsage(chunk) && !responseStreamPayloadIsIgnored(chunk) {
+			return true
+		}
+	}
+	return false
+}
+
+func responseStreamPayloadIsIgnored(payload []byte) bool {
+	lower := bytes.ToLower(payload)
+	return bytes.Contains(lower, []byte(`"message_start"`)) ||
+		bytes.Contains(lower, []byte(`"message-start"`))
 }
 
 // supersededStreamUsageFingerprints returns dedup fingerprints for usage
@@ -493,17 +1131,22 @@ func processResponseStreamChunkRequest(statistics *RequestStatistics, fallbacks 
 // (e.g. providers that attach running totals to every chunk, or Codex emitting
 // usage on multiple response events) supersedes those pending fallbacks so
 // only the most recent usage snapshot of the stream is committed.
-func supersededStreamUsageFingerprints(req ResponseStreamChunkRequest) []string {
+type usageFallbackSupersession struct {
+	key           string
+	correlationID string
+}
+
+func supersededStreamUsageFingerprints(req ResponseStreamChunkRequest) []usageFallbackSupersession {
 	if len(req.HistoryChunks) == 0 {
 		return nil
 	}
 	seen := make(map[string]struct{}, 2)
-	keys := make([]string, 0, 2)
+	keys := make([]usageFallbackSupersession, 0, 2)
 	for _, chunk := range req.HistoryChunks {
 		if len(bytes.TrimSpace(chunk)) == 0 {
 			continue
 		}
-		record, ok := usageRecordFromStreamValues(req.ResponseInterceptRequest, responseJSONValues(chunk))
+		record, ok := usageRecordFromStreamPayload(req.ResponseInterceptRequest, chunk)
 		if !ok {
 			continue
 		}
@@ -511,11 +1154,12 @@ func supersededStreamUsageFingerprints(req ResponseStreamChunkRequest) []string 
 		if key == "" {
 			continue
 		}
-		if _, dup := seen[key]; dup {
+		identity := key + "\x00" + strings.TrimSpace(record.correlationID)
+		if _, dup := seen[identity]; dup {
 			continue
 		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
+		seen[identity] = struct{}{}
+		keys = append(keys, usageFallbackSupersession{key: key, correlationID: strings.TrimSpace(record.correlationID)})
 	}
 	return keys
 }
@@ -532,10 +1176,23 @@ func usageRecordFromResponseStreamChunk(req ResponseStreamChunkRequest) (UsageRe
 	if req.StatusCode != 0 && (req.StatusCode < 200 || req.StatusCode >= 300) {
 		return UsageRecord{}, false
 	}
-	if len(bytes.TrimSpace(req.Body)) == 0 {
-		return UsageRecord{}, false
+	if len(bytes.TrimSpace(req.Body)) > 0 {
+		if record, ok := usageRecordFromStreamPayload(req.ResponseInterceptRequest, req.Body); ok {
+			record.usageOrigin = usageOriginInterceptBody
+			return record, true
+		}
 	}
-	return usageRecordFromStreamValues(req.ResponseInterceptRequest, responseJSONValues(req.Body))
+	for index := len(req.HistoryChunks) - 1; index >= 0; index-- {
+		chunk := req.HistoryChunks[index]
+		if len(bytes.TrimSpace(chunk)) == 0 {
+			continue
+		}
+		if record, ok := usageRecordFromStreamPayload(req.ResponseInterceptRequest, chunk); ok {
+			record.usageOrigin = usageOriginInterceptHistory
+			return record, true
+		}
+	}
+	return UsageRecord{}, false
 }
 
 func usageRecordFromResponseValues(req ResponseInterceptRequest, responseValues []any) (UsageRecord, bool) {
@@ -548,12 +1205,31 @@ func usageRecordFromStreamValues(req ResponseInterceptRequest, responseValues []
 	return usageRecordFromValues(req, responseValues, usageDetailStreamPaths)
 }
 
+func usageRecordFromStreamPayload(req ResponseInterceptRequest, payload []byte) (UsageRecord, bool) {
+	decoded, ok := decodeUsagePayload(payload, usageDecodeStream)
+	if !ok {
+		return UsageRecord{}, false
+	}
+	return usageRecordFromDecodedUsage(req, decoded)
+}
+
 func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, detailPaths []string) (UsageRecord, bool) {
 	detail, ok := usageDetailFromResponseValues(responseValues, detailPaths)
 	if !ok {
 		return UsageRecord{}, false
 	}
-	requestRoot, _ := decodeJSONValue(firstBytes(req.RequestBody, req.OriginalRequest))
+	model := firstNonEmpty(
+		jsonStringPathFromValues(responseValues, "model", "response.model", "message.model"),
+	)
+	correlationID := responseCorrelationID(req, responseValues)
+	return usageRecordFromDecodedUsage(req, decodedUsage{model: model, correlationID: correlationID, detail: detail})
+}
+
+func usageRecordFromDecodedUsage(req ResponseInterceptRequest, decoded decodedUsage) (UsageRecord, bool) {
+	detail := decoded.detail
+	if !usageDetailHasTokens(detail) {
+		return UsageRecord{}, false
+	}
 	authID := firstNonEmpty(metadataString(req.Metadata, "selected_auth_id"), metadataString(req.Metadata, "pinned_auth_id"))
 	// selected_auth_id is what CPA's conductor actually publishes and encodes
 	// the upstream kind unambiguously; the plain provider metadata keys are
@@ -567,18 +1243,18 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 	if responseUsesAnthropicUsageAccounting(req) {
 		detail = normalizeAnthropicUsageDetail(detail, usageProviderFamily(provider))
 	}
-	model := firstNonEmpty(
-		jsonStringPathFromValues(responseValues, "model", "response.model", "message.model"),
-		req.Model,
-		req.RequestedModel,
-		jsonStringPath(requestRoot, "model"),
-		"unknown",
-	)
-	requestedModel := firstNonEmpty(
-		req.RequestedModel,
-		metadataString(req.Metadata, "requested_model"),
-		jsonStringPath(requestRoot, "model"),
+	model := firstNonEmpty(decoded.model, req.Model, req.RequestedModel)
+	requestedModel := firstNonEmpty(req.RequestedModel, metadataString(req.Metadata, "requested_model"), model)
+	serviceTier := metadataString(req.Metadata, "service_tier")
+	if model == "" || requestedModel == "" || serviceTier == "" {
+		fields := responseRequestStringFields(firstBytes(req.RequestBody, req.OriginalRequest))
+		model = firstNonEmpty(model, fields.model)
+		requestedModel = firstNonEmpty(requestedModel, fields.requestedModel, model)
+		serviceTier = firstNonEmpty(serviceTier, fields.serviceTier)
+	}
+	model = firstNonEmpty(
 		model,
+		"unknown",
 	)
 	return UsageRecord{
 		Provider:        provider,
@@ -591,14 +1267,94 @@ func usageRecordFromValues(req ResponseInterceptRequest, responseValues []any, d
 		AuthType:        fallbackAuthType(req.Metadata, authID),
 		Endpoint:        responseInterceptEndpoint(req),
 		ReasoningEffort: metadataString(req.Metadata, "reasoning_effort"),
-		ServiceTier:     firstNonEmpty(metadataString(req.Metadata, "service_tier"), jsonStringPath(requestRoot, "service_tier")),
+		ServiceTier:     serviceTier,
 		Stream:          req.Stream,
 		RequestedAt:     time.Now(),
 		Detail:          detail,
 		BaseURL:         metadataString(req.Metadata, "upstream_base_url", "provider_base_url", "base_url", "baseURL"),
 		Source:          metadataString(req.Metadata, "upstream_source", "provider_source", "selected_source"),
 		ResponseHeaders: req.ResponseHeaders,
+		correlationID:   firstNonEmpty(decoded.correlationID, responseCorrelationID(req, nil)),
 	}, true
+}
+
+type responseRequestMetadata struct {
+	model          string
+	requestedModel string
+	serviceTier    string
+}
+
+// responseRequestStringFields extracts the few request strings needed by the
+// usage record without decoding a potentially large request body into
+// map[string]any. It is used only when the callback envelope did not already
+// provide the values.
+func responseRequestStringFields(raw []byte) responseRequestMetadata {
+	var fields responseRequestMetadata
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return fields
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return fields
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return fields
+	}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return fields
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fields
+		}
+		switch normalizeUsageFieldName(key) {
+		case "model":
+			value, err := decodeJSONScalarString(decoder)
+			if err != nil {
+				return fields
+			}
+			fields.model = firstNonEmpty(fields.model, value)
+		case "requestedmodel":
+			value, err := decodeJSONScalarString(decoder)
+			if err != nil {
+				return fields
+			}
+			fields.requestedModel = firstNonEmpty(fields.requestedModel, value)
+		case "servicetier":
+			value, err := decodeJSONScalarString(decoder)
+			if err != nil {
+				return fields
+			}
+			fields.serviceTier = firstNonEmpty(fields.serviceTier, value)
+		default:
+			if err := skipJSONDecoderValue(decoder); err != nil {
+				return fields
+			}
+		}
+		if fields.model != "" && fields.requestedModel != "" && fields.serviceTier != "" {
+			break
+		}
+	}
+	return fields
+}
+
+const maxUsageCorrelationIDLength = 256
+
+func responseCorrelationID(req ResponseInterceptRequest, responseValues []any) string {
+	value := firstNonEmpty(
+		req.correlationID,
+		jsonStringPathFromValues(responseValues, "response_id", "responseId", "response.id", "id"),
+		metadataString(req.Metadata, "response_id", "responseId", "stream_id", "streamId", "request_id", "requestId"),
+	)
+	value = strings.TrimSpace(value)
+	if len(value) > maxUsageCorrelationIDLength {
+		return ""
+	}
+	return value
 }
 
 func responseInterceptEndpoint(req ResponseInterceptRequest) string {
@@ -834,6 +1590,7 @@ func usageDetailHasTokens(detail UsageDetail) bool {
 type usageFallbackCoordinator struct {
 	mu                  sync.Mutex
 	pending             map[string][]*pendingUsageFallback
+	pendingByStream     map[string]*pendingUsageFallback
 	nativeRecent        map[string][]usageFallbackOccurrence
 	fallbackRecent      map[string][]usageFallbackOccurrence
 	deadlines           usageFallbackDeadlineHeap
@@ -844,11 +1601,16 @@ type usageFallbackCoordinator struct {
 	pendingCount        int
 	nativeRecentCount   int
 	fallbackRecentCount int
+	pendingBytes        int
+	nativeRecentBytes   int
+	fallbackRecentBytes int
+	lastCleanup         time.Time
 	closed              bool
 }
 
 type pendingUsageFallback struct {
 	key       string
+	streamKey string
 	record    UsageRecord
 	requestAt time.Time
 	deadline  time.Time
@@ -856,6 +1618,7 @@ type pendingUsageFallback struct {
 	heapIndex int
 	cancelled bool
 	stats     *RequestStatistics
+	bytes     int
 }
 
 type usageFallbackDeadlineHeap []*pendingUsageFallback
@@ -898,16 +1661,18 @@ type usageFallbackOccurrence struct {
 	observedAt time.Time
 	record     UsageRecord
 	stats      *RequestStatistics
+	bytes      int
 }
 
 func newUsageFallbackCoordinator() *usageFallbackCoordinator {
 	coordinator := &usageFallbackCoordinator{
-		pending:        make(map[string][]*pendingUsageFallback),
-		nativeRecent:   make(map[string][]usageFallbackOccurrence),
-		fallbackRecent: make(map[string][]usageFallbackOccurrence),
-		wake:           make(chan struct{}, 1),
-		stop:           make(chan struct{}),
-		done:           make(chan struct{}),
+		pending:         make(map[string][]*pendingUsageFallback),
+		pendingByStream: make(map[string]*pendingUsageFallback),
+		nativeRecent:    make(map[string][]usageFallbackOccurrence),
+		fallbackRecent:  make(map[string][]usageFallbackOccurrence),
+		wake:            make(chan struct{}, 1),
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 	}
 	heap.Init(&coordinator.deadlines)
 	go coordinator.runScheduler()
@@ -936,7 +1701,7 @@ func (c *usageFallbackCoordinator) runScheduler() {
 			return
 		}
 		now := time.Now()
-		c.cleanupLocked(now)
+		c.cleanupMaybeLocked(now)
 		if len(c.deadlines) == 0 {
 			c.mu.Unlock()
 			select {
@@ -1023,20 +1788,23 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 		delay = 0
 	}
 	now := time.Now()
+	recordBytes := usageFallbackRecordBytes(record)
 	pending := &pendingUsageFallback{
 		key:       key,
+		streamKey: usageFallbackStreamKey(record),
 		record:    record,
 		requestAt: requestAt,
 		deadline:  now.Add(delay),
 		heapIndex: -1,
 		stats:     usageFallbackStats(statistics),
+		bytes:     recordBytes,
 	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return
 	}
-	c.cleanupLocked(now)
+	c.cleanupMaybeLocked(now)
 	if nativeRecord, nativeStats, ok := c.consumeNativeRecentLocked(key, record, requestAt, now); ok {
 		c.mu.Unlock()
 		if nativeStats == nil {
@@ -1047,8 +1815,31 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 		}
 		return
 	}
+	if pending.streamKey != "" {
+		if previous := c.pendingByStream[pending.streamKey]; previous != nil && !previous.cancelled {
+			previous.cancelled = true
+			c.removePendingLocked(previous)
+		}
+	}
 	if c.pendingCount >= maxUsageFallbackPending {
 		c.evictOldestPendingLocked()
+	}
+	for c.retainedBytesLocked()+recordBytes > maxUsageFallbackRetainedBytes {
+		if c.pendingCount > 0 {
+			c.evictOldestPendingLocked()
+			continue
+		}
+		if c.nativeRecentCount > 0 {
+			c.evictOldestNativeRecentLocked()
+			continue
+		}
+		if c.fallbackRecentCount > 0 {
+			c.evictOldestFallbackRecentLocked()
+			continue
+		}
+		break
+	}
+	if c.retainedBytesLocked()+recordBytes > maxUsageFallbackRetainedBytes {
 		c.mu.Unlock()
 		if pending.stats != nil {
 			pending.stats.recordUsageCallbackDrop()
@@ -1056,7 +1847,11 @@ func (c *usageFallbackCoordinator) scheduleForStats(statistics *RequestStatistic
 		return
 	}
 	c.pending[key] = append(c.pending[key], pending)
+	if pending.streamKey != "" {
+		c.pendingByStream[pending.streamKey] = pending
+	}
 	c.pendingCount++
+	c.pendingBytes += recordBytes
 	c.sequence++
 	pending.sequence = c.sequence
 	wasHead := len(c.deadlines) == 0 || pending.deadline.Before(c.deadlines[0].deadline)
@@ -1086,7 +1881,7 @@ func (c *usageFallbackCoordinator) HandleNativeForStats(statistics *RequestStati
 	}
 	c.mu.Lock()
 	now := time.Now()
-	c.cleanupLocked(now)
+	c.cleanupMaybeLocked(now)
 	if pending := c.popPendingLocked(key, record); pending != nil {
 		pending.cancelled = true
 		c.mu.Unlock()
@@ -1108,13 +1903,35 @@ func (c *usageFallbackCoordinator) HandleNativeForStats(statistics *RequestStati
 	if c.nativeRecentCount >= maxUsageFallbackRecent {
 		c.evictOldestNativeRecentLocked()
 	}
+	for c.retainedBytesLocked()+usageFallbackRecordBytes(record) > maxUsageFallbackRetainedBytes {
+		if c.pendingCount > 0 {
+			c.evictOldestPendingLocked()
+			continue
+		}
+		if c.nativeRecentCount > 0 {
+			c.evictOldestNativeRecentLocked()
+			continue
+		}
+		if c.fallbackRecentCount > 0 {
+			c.evictOldestFallbackRecentLocked()
+			continue
+		}
+		break
+	}
+	recordBytes := usageFallbackRecordBytes(record)
+	if c.retainedBytesLocked()+recordBytes > maxUsageFallbackRetainedBytes {
+		c.mu.Unlock()
+		return record, true
+	}
 	c.nativeRecent[key] = append(c.nativeRecent[key], usageFallbackOccurrence{
 		requestAt:  requestAt,
 		observedAt: now,
 		record:     record,
 		stats:      usageFallbackStats(statistics),
+		bytes:      recordBytes,
 	})
 	c.nativeRecentCount++
+	c.nativeRecentBytes += recordBytes
 	c.mu.Unlock()
 	return record, true
 }
@@ -1146,8 +1963,8 @@ func enrichUsageRecord(record UsageRecord, enrichment UsageRecord) UsageRecord {
 // earlier usage-bearing chunks of the same stream; the caller schedules a
 // fresher snapshot right after. Fallbacks already committed cannot be
 // retracted — late native records still reconcile through fallbackRecent.
-func (c *usageFallbackCoordinator) Supersede(keys []string) {
-	if c == nil || len(keys) == 0 {
+func (c *usageFallbackCoordinator) Supersede(entries []usageFallbackSupersession) {
+	if c == nil || len(entries) == 0 {
 		return
 	}
 	c.mu.Lock()
@@ -1155,11 +1972,11 @@ func (c *usageFallbackCoordinator) Supersede(keys []string) {
 		c.mu.Unlock()
 		return
 	}
-	for _, key := range keys {
-		if key == "" {
+	for _, entry := range entries {
+		if entry.key == "" {
 			continue
 		}
-		if pending := c.popPendingLocked(key, UsageRecord{}); pending != nil {
+		if pending := c.popPendingLocked(entry.key, UsageRecord{correlationID: entry.correlationID}); pending != nil {
 			pending.cancelled = true
 		}
 	}
@@ -1189,6 +2006,7 @@ func (c *usageFallbackCoordinator) Flush() {
 		delete(c.pending, key)
 	}
 	c.pendingCount = 0
+	c.pendingBytes = 0
 	c.mu.Unlock()
 	if c.done != nil {
 		<-c.done
@@ -1220,14 +2038,32 @@ func (c *usageFallbackCoordinator) commit(pending *pendingUsageFallback) {
 	if c.fallbackRecentCount >= maxUsageFallbackRecent {
 		c.evictOldestFallbackRecentLocked()
 	}
+	recordBytes := usageFallbackRecordBytes(pending.record)
+	for c.retainedBytesLocked()+recordBytes > maxUsageFallbackRetainedBytes {
+		switch {
+		case c.pendingCount > 0:
+			c.evictOldestPendingLocked()
+		case c.nativeRecentCount > 0:
+			c.evictOldestNativeRecentLocked()
+		case c.fallbackRecentCount > 0:
+			c.evictOldestFallbackRecentLocked()
+		default:
+			break
+		}
+		if c.pendingCount == 0 && c.nativeRecentCount == 0 && c.fallbackRecentCount == 0 {
+			break
+		}
+	}
 	c.fallbackRecent[pending.key] = append(c.fallbackRecent[pending.key], usageFallbackOccurrence{
 		requestAt:  pending.requestAt,
 		observedAt: now,
 		record:     pending.record,
 		stats:      pending.stats,
+		bytes:      recordBytes,
 	})
 	c.fallbackRecentCount++
-	c.cleanupLocked(now)
+	c.fallbackRecentBytes += recordBytes
+	c.cleanupMaybeLocked(now)
 	record := pending.record
 	c.mu.Unlock()
 	// A native record for the same credential may have arrived while this
@@ -1265,6 +2101,9 @@ func (c *usageFallbackCoordinator) removePendingLocked(pending *pendingUsageFall
 	if pending == nil {
 		return
 	}
+	if pending.streamKey != "" && c.pendingByStream[pending.streamKey] == pending {
+		delete(c.pendingByStream, pending.streamKey)
+	}
 	c.removePendingHeapLocked(pending)
 	items := c.pending[pending.key]
 	for i, item := range items {
@@ -1275,6 +2114,10 @@ func (c *usageFallbackCoordinator) removePendingLocked(pending *pendingUsageFall
 			}
 			if c.pendingCount > 0 {
 				c.pendingCount--
+			}
+			c.pendingBytes -= pending.bytes
+			if c.pendingBytes < 0 {
+				c.pendingBytes = 0
 			}
 			return
 		}
@@ -1309,6 +2152,10 @@ func (c *usageFallbackCoordinator) consumeNativeRecentLocked(key string, record 
 		if c.nativeRecentCount > 0 {
 			c.nativeRecentCount--
 		}
+		c.nativeRecentBytes -= item.bytes
+		if c.nativeRecentBytes < 0 {
+			c.nativeRecentBytes = 0
+		}
 		return item.record, item.stats, true
 	}
 	return UsageRecord{}, nil, false
@@ -1328,6 +2175,10 @@ func (c *usageFallbackCoordinator) matchesFallbackRecentLocked(key string, recor
 			}
 			if c.fallbackRecentCount > 0 {
 				c.fallbackRecentCount--
+			}
+			c.fallbackRecentBytes -= item.bytes
+			if c.fallbackRecentBytes < 0 {
+				c.fallbackRecentBytes = 0
 			}
 			return item.record, item.stats, true
 		}
@@ -1368,10 +2219,29 @@ func usageFallbackClientAPIKey(record UsageRecord) string {
 	}
 }
 
+func usageFallbackStreamKey(record UsageRecord) string {
+	correlationID := strings.TrimSpace(record.correlationID)
+	if correlationID == "" || len(correlationID) > maxUsageCorrelationIDLength {
+		return ""
+	}
+	return strings.Join([]string{
+		"stream",
+		strings.ToLower(strings.TrimSpace(usageProviderFamily(record.Provider))),
+		strings.ToLower(strings.TrimSpace(record.AuthID)),
+		usageFallbackClientAPIKey(record),
+		correlationID,
+	}, "\x00")
+}
+
 // usageFallbackRecordsCompatible keeps the client API key as a strict
 // discriminator when both callbacks provide it, while treating a missing key
 // on either side as unknown metadata that can be enriched later.
 func usageFallbackRecordsCompatible(left, right UsageRecord) bool {
+	leftCorrelationID := strings.TrimSpace(left.correlationID)
+	rightCorrelationID := strings.TrimSpace(right.correlationID)
+	if leftCorrelationID != "" && rightCorrelationID != "" && leftCorrelationID != rightCorrelationID {
+		return false
+	}
 	if !usageDetailHasTokens(left.Detail) || !usageDetailHasTokens(right.Detail) {
 		return true
 	}
@@ -1425,6 +2295,10 @@ func (c *usageFallbackCoordinator) evictOldestNativeRecentLocked() {
 		if c.nativeRecentCount > 0 {
 			c.nativeRecentCount--
 		}
+		c.nativeRecentBytes -= items[0].bytes
+		if c.nativeRecentBytes < 0 {
+			c.nativeRecentBytes = 0
+		}
 		return
 	}
 }
@@ -1446,16 +2320,60 @@ func (c *usageFallbackCoordinator) evictOldestFallbackRecentLocked() {
 		if c.fallbackRecentCount > 0 {
 			c.fallbackRecentCount--
 		}
+		c.fallbackRecentBytes -= items[0].bytes
+		if c.fallbackRecentBytes < 0 {
+			c.fallbackRecentBytes = 0
+		}
 		return
 	}
+}
+
+const usageFallbackCleanupInterval = time.Second
+
+func (c *usageFallbackCoordinator) retainedBytesLocked() int {
+	if c == nil {
+		return 0
+	}
+	return c.pendingBytes + c.nativeRecentBytes + c.fallbackRecentBytes
+}
+
+func usageFallbackRecordBytes(record UsageRecord) int {
+	bytes := 256 + len(record.Provider) + len(record.ExecutorType) + len(record.Model) +
+		len(record.Alias) + len(record.APIKey) + len(record.AuthID) + len(record.AuthIndex) +
+		len(record.AuthType) + len(record.Endpoint) + len(record.BaseURL) + len(record.Source) +
+		len(record.ReasoningEffort) + len(record.ServiceTier) + len(record.correlationID)
+	for key, values := range record.ResponseHeaders {
+		bytes += len(key) + 32
+		for _, value := range values {
+			bytes += len(value)
+		}
+	}
+	if bytes < 256 {
+		return 256
+	}
+	return bytes
+}
+
+func (c *usageFallbackCoordinator) cleanupMaybeLocked(now time.Time) {
+	if c == nil {
+		return
+	}
+	if !c.lastCleanup.IsZero() && now.Sub(c.lastCleanup) < usageFallbackCleanupInterval {
+		return
+	}
+	c.cleanupLocked(now)
+	c.lastCleanup = now
 }
 
 func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 	for key, items := range c.nativeRecent {
 		kept := items[:0]
+		removedBytes := 0
 		for _, item := range items {
 			if now.Sub(item.observedAt) <= usageFallbackNativeRecentWindow {
 				kept = append(kept, item)
+			} else {
+				removedBytes += item.bytes
 			}
 		}
 		if len(kept) == 0 {
@@ -1464,12 +2382,16 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 			c.nativeRecent[key] = kept
 		}
 		c.nativeRecentCount -= len(items) - len(kept)
+		c.nativeRecentBytes -= removedBytes
 	}
 	for key, items := range c.fallbackRecent {
 		kept := items[:0]
+		removedBytes := 0
 		for _, item := range items {
 			if now.Sub(item.observedAt) <= usageFallbackLateNativeWindow {
 				kept = append(kept, item)
+			} else {
+				removedBytes += item.bytes
 			}
 		}
 		if len(kept) == 0 {
@@ -1478,16 +2400,19 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 			c.fallbackRecent[key] = kept
 		}
 		c.fallbackRecentCount -= len(items) - len(kept)
+		c.fallbackRecentBytes -= removedBytes
 	}
 	for key, items := range c.pending {
 		kept := items[:0]
 		removed := 0
+		removedBytes := 0
 		for _, item := range items {
 			if item != nil && !item.cancelled {
 				kept = append(kept, item)
 			} else if item != nil {
 				c.removePendingHeapLocked(item)
 				removed++
+				removedBytes += item.bytes
 			}
 		}
 		if len(kept) == 0 {
@@ -1496,6 +2421,7 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 			c.pending[key] = kept
 		}
 		c.pendingCount -= removed
+		c.pendingBytes -= removedBytes
 	}
 	if c.nativeRecentCount < 0 {
 		c.nativeRecentCount = 0
@@ -1505,6 +2431,15 @@ func (c *usageFallbackCoordinator) cleanupLocked(now time.Time) {
 	}
 	if c.pendingCount < 0 {
 		c.pendingCount = 0
+	}
+	if c.nativeRecentBytes < 0 {
+		c.nativeRecentBytes = 0
+	}
+	if c.fallbackRecentBytes < 0 {
+		c.fallbackRecentBytes = 0
+	}
+	if c.pendingBytes < 0 {
+		c.pendingBytes = 0
 	}
 }
 

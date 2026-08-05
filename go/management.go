@@ -38,6 +38,7 @@ func processUsageRecord(statistics *RequestStatistics, fallbacks *usageFallbackC
 	authIndexes.Learn(record.AuthID, record.AuthIndex)
 	accepted := true
 	if fallbacks != nil {
+		sanitizeUsageRecordForStats(statistics, &record)
 		record, accepted = fallbacks.HandleNativeForStats(statistics, record)
 	}
 	if accepted {

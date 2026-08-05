@@ -227,7 +227,7 @@ func openEventStore(path string, temporary bool) (*eventStore, error) {
 		"PRAGMA synchronous = NORMAL",
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
-		"PRAGMA cache_size = -4096",
+		"PRAGMA cache_size = -2048",
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			db.Close()
@@ -269,13 +269,13 @@ func openEventStore(path string, temporary bool) (*eventStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open event store reader: %w", err)
 	}
-	readDB.SetMaxOpenConns(4)
-	readDB.SetMaxIdleConns(4)
+	readDB.SetMaxOpenConns(2)
+	readDB.SetMaxIdleConns(2)
 	for _, statement := range []string{
 		"PRAGMA synchronous = NORMAL",
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
-		"PRAGMA cache_size = -4096",
+		"PRAGMA cache_size = -2048",
 	} {
 		if _, err := readDB.ExecContext(ctx, statement); err != nil {
 			_ = readDB.Close()
@@ -291,7 +291,7 @@ func sqliteEventStoreDSN(path string) string {
 	if strings.Contains(path, "?") {
 		separator = "&"
 	}
-	return path + separator + "_pragma=busy_timeout%3d5000&_pragma=cache_size%3d-4096&_pragma=foreign_keys%3d1&_pragma=journal_mode%3dWAL&_pragma=synchronous%3d1"
+	return path + separator + "_pragma=busy_timeout%3d5000&_pragma=cache_size%3d-2048&_pragma=foreign_keys%3d1&_pragma=journal_mode%3dWAL&_pragma=synchronous%3d1"
 }
 
 func eventStoreContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -568,7 +568,33 @@ func (s *eventStore) queryEvents(ctx context.Context, q EventsQuery, now time.Ti
 	return s.queryEventsPage(ctx, q, now, q.Limit, q.Offset)
 }
 
+func (s *eventStore) countEvents(ctx context.Context, q EventsQuery, now time.Time) (int, error) {
+	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
+	defer cancel()
+	db, err := s.readDatabase()
+	if err != nil {
+		return 0, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	where, args := eventQueryWhere(q, now)
+	var total int64
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM request_events"+where, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count export events: %w", err)
+	}
+	return nonNegativeIntFromInt64(total), nil
+}
+
 func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now time.Time, limit, offset int) (EventsResult, error) {
+	return s.queryEventsPageCursor(ctx, q, now, limit, offset, eventQueryCursor{})
+}
+
+func (s *eventStore) queryEventsCursorPage(ctx context.Context, q EventsQuery, now time.Time, limit int, cursor eventQueryCursor) (EventsResult, error) {
+	return s.queryEventsPageCursor(ctx, q, now, limit, 0, cursor)
+}
+
+func (s *eventStore) queryEventsPageCursor(ctx context.Context, q EventsQuery, now time.Time, limit, offset int, cursor eventQueryCursor) (EventsResult, error) {
 	ctx, cancel := eventStoreContext(ctx, eventStoreReadTimeout)
 	defer cancel()
 	db, err := s.readDatabase()
@@ -586,6 +612,7 @@ func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now tim
 		offset = 0
 	}
 	where, args := eventQueryWhere(q, now)
+	where, args = appendEventCursorWhere(where, args, cursor)
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return EventsResult{}, fmt.Errorf("begin event query: %w", err)
@@ -604,7 +631,11 @@ func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now tim
 	}
 	defer rows.Close()
 
-	events := make([]RequestDetail, 0, q.Limit)
+	capacity := limit
+	if capacity < 0 {
+		capacity = 0
+	}
+	events := make([]RequestDetail, 0, capacity)
 	for rows.Next() {
 		detail, err := scanEvent(rows)
 		if err != nil {
@@ -615,13 +646,46 @@ func (s *eventStore) queryEventsPage(ctx context.Context, q EventsQuery, now tim
 	if err := rows.Err(); err != nil {
 		return EventsResult{}, fmt.Errorf("iterate events: %w", err)
 	}
-	return EventsResult{
+	result := EventsResult{
 		Events:      events,
 		Total:       nonNegativeIntFromInt64(total),
 		Limit:       limit,
 		Offset:      offset,
 		GeneratedAt: now.UTC().Format(time.RFC3339),
-	}, nil
+	}
+	if len(events) > 0 {
+		result.nextCursor = eventCursorFromDetail(events[len(events)-1])
+	}
+	return result, nil
+}
+
+type eventQueryCursor struct {
+	TimestampNS  int64
+	ID           int64
+	MemoryOffset int
+	Valid        bool
+}
+
+func eventCursorFromDetail(detail RequestDetail) eventQueryCursor {
+	if detail.eventID <= 0 {
+		return eventQueryCursor{}
+	}
+	timestampNS, _ := eventTimestampColumns(detail.Timestamp)
+	return eventQueryCursor{TimestampNS: timestampNS, ID: detail.eventID, Valid: true}
+}
+
+func appendEventCursorWhere(where string, args []any, cursor eventQueryCursor) (string, []any) {
+	if !cursor.Valid || cursor.ID <= 0 {
+		return where, args
+	}
+	condition := "(timestamp_ns < ? OR (timestamp_ns = ? AND id < ?))"
+	if where == "" {
+		where = " WHERE " + condition
+	} else {
+		where += " AND " + condition
+	}
+	args = append(args, cursor.TimestampNS, cursor.TimestampNS, cursor.ID)
+	return where, args
 }
 
 // queryDashboardRange performs the range aggregation in SQLite. The SQL
@@ -1868,7 +1932,7 @@ ON CONFLICT(fingerprint, timestamp_ns, timestamp_zero) DO UPDATE SET
 }
 
 const eventSelectColumns = `SELECT
-	timestamp_ns, timestamp_zero, api, model, source, provider, auth_id, auth_index,
+	id, timestamp_ns, timestamp_zero, api, model, source, provider, auth_id, auth_index,
 	auth_type, api_key, api_key_hash, endpoint, base_url, stream, thinking_json,
 	headers_json, input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 	cache_tokens, cache_write_tokens, total_tokens, latency_ms, ttft_ms, failed,
@@ -1932,6 +1996,7 @@ type eventScanner interface {
 
 func scanEvent(scanner eventScanner) (RequestDetail, error) {
 	var (
+		eventID       int64
 		timestampNS   int64
 		timestampZero int64
 		api           string
@@ -1962,7 +2027,7 @@ func scanEvent(scanner eventScanner) (RequestDetail, error) {
 		failure       string
 	)
 	if err := scanner.Scan(
-		&timestampNS, &timestampZero, &api, &model, &source, &provider, &authID, &authIndex,
+		&eventID, &timestampNS, &timestampZero, &api, &model, &source, &provider, &authID, &authIndex,
 		&authType, &apiKey, &apiKeyHash, &endpoint, &baseURL, &stream, &thinking, &headers,
 		&inputTokens, &outputTokens, &reasoning, &cached, &cache, &cacheWrite, &total, &latency,
 		&ttft, &failed, &statusCode, &failure,
@@ -1970,6 +2035,7 @@ func scanEvent(scanner eventScanner) (RequestDetail, error) {
 		return RequestDetail{}, fmt.Errorf("scan event: %w", err)
 	}
 	detail := RequestDetail{
+		eventID:     eventID,
 		UpstreamAPI: api,
 		Model:       model,
 		Timestamp:   eventTimestamp(timestampNS, timestampZero),
@@ -2006,7 +2072,7 @@ func scanEvent(scanner eventScanner) (RequestDetail, error) {
 		return RequestDetail{}, err
 	}
 	detail.Headers = headersValue
-	return detail, nil
+	return normalizeStoredClientAPIIdentity(detail), nil
 }
 
 func eventQueryWhere(q EventsQuery, now time.Time) (string, []any) {
@@ -2045,14 +2111,14 @@ func eventQueryWhere(q EventsQuery, now time.Time) (string, []any) {
 			case 'u':
 				conditions = append(conditions, "api_key_hash = '' AND api_key = ''")
 			case 'm':
-				conditions = append(conditions, "api_key_label_hash = ?")
+				conditions = append(conditions, "api_key <> '' AND api_key_label_hash = ?")
 				args = append(args, selector.labelHash)
 			case 'h':
 				if selector.labelHash == "" {
-					conditions = append(conditions, "api_key_hash = ?")
+					conditions = append(conditions, "api_key <> '' AND api_key_hash = ?")
 					args = append(args, selector.hash)
 				} else {
-					conditions = append(conditions, "(api_key_hash = ? OR (api_key_hash = '' AND api_key_label_hash = ?))")
+					conditions = append(conditions, "api_key <> '' AND (api_key_hash = ? OR (api_key_hash = '' AND api_key_label_hash = ?))")
 					args = append(args, selector.hash, selector.labelHash)
 				}
 			}

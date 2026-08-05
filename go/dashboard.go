@@ -48,6 +48,7 @@ const (
 	dashboardAPIDetailDefaultErrorLimit  = 20
 	dashboardAPIDetailMaxErrorLimit      = 100
 	dashboardAPIKeyOutputVersion         = "api-key-output-v2"
+	dashboardSynchronousExportMaxRecords = 10000
 )
 
 func init() {
@@ -73,6 +74,9 @@ func handleDashboardSummary(query map[string][]string, headers map[string][]stri
 		return dashboardNotModified(etag)
 	}
 	summary := stats.SummaryWithoutDetailsForRangeAndClientAPIAt(rangeKey, clientAPI, now)
+	if summary.queryError != nil {
+		return dashboardStorageQueryErrorResponse()
+	}
 	etag = dashboardSummaryETagForClientAPIVersion(now, rangeKey, clientAPI, summary.Meta.SummaryVersion)
 	sanitizeDashboardSummaryAPIKeysForOutput(&summary)
 	localizeDashboardSummaryForResource(&summary)
@@ -161,6 +165,9 @@ func handleDashboardEvents(query map[string][]string, headers map[string][]strin
 		return dashboardNotModified(etag)
 	}
 	result := stats.QueryEventsAt(params, now)
+	if result.queryError != nil {
+		return dashboardStorageQueryErrorResponse()
+	}
 	etag = dashboardEventsETagForVersion(params, now, result.dashboardVersion)
 	sanitizeEventsAPIKeysForOutput(&result)
 	localizeEventsResultForResource(&result)
@@ -268,8 +275,24 @@ func handleDashboardEventsExport(query map[string][]string, headers map[string][
 	if dashboardConditionalMatch("dashboard-events-export", headers, etag) {
 		return dashboardNotModifiedWithHeaders(dashboardExportHeaders(etag, dashboardExportContentType(opts.Format), opts.Gzip))
 	}
+	if opts.Limit > dashboardSynchronousExportMaxRecords {
+		total, countErr := stats.CountExportEventsAt(params, now)
+		if countErr != nil {
+			return dashboardStorageQueryErrorResponse()
+		}
+		if total > dashboardSynchronousExportMaxRecords {
+			job, statusCode, message := dashboardExportJobs.create(params, opts)
+			if message != "" {
+				return dashboardExportJobJSON(statusCode, dashboardExportJobErrorResponse{Error: message})
+			}
+			return dashboardExportJobJSON(statusCode, dashboardExportJobSnapshot(job))
+		}
+	}
 	startedAt := time.Now()
 	result := stats.QueryExportEventsAt(params, opts.Limit, now)
+	if result.queryError != nil {
+		return dashboardStorageQueryErrorResponse()
+	}
 	etag = dashboardEventsExportETagForVersion(params, opts, now, result.dashboardVersion)
 	localizeEventsResultForResource(&result)
 	body, contentType, err := encodeDashboardEventsExport(result, opts)
@@ -504,6 +527,9 @@ func handleDashboardAPIDetail(query map[string][]string, headers map[string][]st
 		return dashboardNotModified(etag)
 	}
 	result := stats.QueryAPIDetailPageAt(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now)
+	if result.queryError != nil {
+		return dashboardStorageQueryErrorResponse()
+	}
 	etag = dashboardAPIDetailETagForClientAPIVersionPage(api, rangeKey, clientAPI, recentLimit, recentOffset, errorLimit, now, result.dashboardVersion)
 	sanitizeAPIDetailAPIKeysForOutput(&result)
 	localizeAPIDetailForResource(&result)
@@ -590,6 +616,25 @@ func dashboardNotModifiedWithHeaders(headers map[string][]string) ([]byte, error
 	resp := ManagementResponse{
 		StatusCode: http.StatusNotModified,
 		Headers:    headers,
+	}
+	return okEnvelopeJSON(string(mustMarshal(resp)))
+}
+
+func dashboardStorageQueryErrorResponse() ([]byte, error) {
+	body, err := json.Marshal(map[string]string{
+		"error":   "storage_query_failed",
+		"message": "dashboard storage query failed",
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp := ManagementResponse{
+		StatusCode: http.StatusServiceUnavailable,
+		Headers: map[string][]string{
+			"Content-Type":  {"application/json; charset=utf-8"},
+			"Cache-Control": {"no-store"},
+		},
+		Body: body,
 	}
 	return okEnvelopeJSON(string(mustMarshal(resp)))
 }
